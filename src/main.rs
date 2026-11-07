@@ -332,7 +332,7 @@ async fn cmd_connect(
     for addr in &addrs {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => {
-                serves.spawn(socks5::serve_mixed(l, tunnel.clone(), timeout));
+                serves.spawn(socks5::serve_mixed(l, tunnel.clone(), timeout, None));
             }
             Err(e) => {
                 eprintln!(

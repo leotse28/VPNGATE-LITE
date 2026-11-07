@@ -163,6 +163,7 @@ async fn gui_connect_flow_against_mock() {
         listener,
         tunnel.clone(),
         timeout,
+        None,
     ));
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -279,6 +280,7 @@ async fn mixed_proxy_http_methods_against_mock() {
         listener,
         tunnel.clone(),
         timeout,
+        None,
     ));
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -338,6 +340,169 @@ async fn mixed_proxy_http_methods_against_mock() {
     drop(tunnel);
 }
 
+/// HTTP CONNECT really is a byte pipe after the 200 — not just for
+/// ASCII: a binary TLS ClientHello (0x00 bytes included) sent through
+/// a CONNECT tunnel comes back byte-for-byte from the mock's echo
+/// mode, which is what a TLS handshake inside the tunnel needs. The
+/// server is bound the LAN way (0.0.0.0:0, reached via 127.0.0.1),
+/// so the wildcard-bind path is covered too, and the connection log
+/// lines name the peer and the CONNECT target host.
+#[tokio::test]
+async fn connect_relay_carries_tls_client_hello_against_mock() {
+    let Some((_guard, _mock, tunnel)) = setup_mock_tunnel().await else {
+        return;
+    };
+    let timeout = Duration::from_secs(10);
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let serve = tokio::spawn(vpngate_client::socks5::serve_mixed(
+        listener,
+        tunnel.clone(),
+        timeout,
+        Some(log_tx),
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A minimal (fake) TLS 1.2 ClientHello record: 5-byte record
+    // header + 4-byte handshake header + version + 32 random bytes
+    // + session/cipher/compression/extensions. Binary on purpose,
+    // so any text-oriented handling in the relay would corrupt it.
+    let client_hello: [u8; 52] = [
+        0x16, 0x03, 0x01, 0x00, 0x2f, // record: handshake, TLS 1.0, len 47
+        0x01, 0x00, 0x00, 0x2b, // handshake: client_hello, len 43
+        0x03, 0x03, // client version TLS 1.2
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+        0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, // 32 random bytes
+        0x00, // session id length 0
+        0x00, 0x02, 0x13, 0x01, // cipher suites: len 2, TLS_AES_128_GCM_SHA256
+        0x01, 0x00, // compression methods: len 1, null
+        0x00, 0x00, // extensions length 0
+    ];
+
+    // SOCKS5 through the wildcard bind: greeting, CONNECT
+    // example.com:443, then ECHO bytes come back verbatim.
+    let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut resp = [0u8; 2];
+    tokio::time::timeout(timeout, c.read_exact(&mut resp))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp, [0x05, 0x00], "SOCKS5 greeting must be accepted");
+    let mut req = vec![0x05, 0x01, 0x00, 0x03, 11];
+    req.extend_from_slice(b"example.com");
+    req.extend_from_slice(&443u16.to_be_bytes());
+    c.write_all(&req).await.unwrap();
+    let mut rep = [0u8; 10];
+    tokio::time::timeout(timeout, c.read_exact(&mut rep))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        &rep[..2],
+        &[0x05, 0x00],
+        "SOCKS5 CONNECT must succeed, got: {:?}",
+        rep
+    );
+    c.write_all(b"ECHO:socks5-echo").await.unwrap();
+    let mut echo = [0u8; 11];
+    tokio::time::timeout(timeout, c.read_exact(&mut echo))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        &echo, b"socks5-echo",
+        "bytes through the SOCKS5 tunnel must come back verbatim"
+    );
+    drop(c);
+
+    // HTTP CONNECT: 200, then the ClientHello goes through the
+    // tunnel and comes back byte-for-byte.
+    let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    c.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+        .await
+        .unwrap();
+    let head = read_until(&mut c, "\r\n\r\n", timeout).await;
+    assert!(
+        head.contains("200"),
+        "CONNECT should answer 200, got: {}",
+        head
+    );
+    let mut payload = b"ECHO:".to_vec();
+    payload.extend_from_slice(&client_hello);
+    c.write_all(&payload).await.unwrap();
+    let mut back = [0u8; 52];
+    tokio::time::timeout(timeout, c.read_exact(&mut back))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        back, client_hello,
+        "the ClientHello must survive the CONNECT relay byte-for-byte"
+    );
+    drop(c);
+
+    // A raw TLS byte (0x16) sent straight at the proxy port, with no
+    // CONNECT: not a protocol we serve, closed silently.
+    let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    c.write_all(&[0x16]).await.unwrap();
+    let mut one = [0u8; 1];
+    // The server peeked the byte (peek does not consume it) and then
+    // closed with it still unread in the receive buffer, so the
+    // kernel answers with RST rather than a clean FIN — either way
+    // the connection is dead, which is the point.
+    match tokio::time::timeout(timeout, c.read(&mut one)).await {
+        Ok(Ok(0)) => {}
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!(
+            "an unknown first byte must close the connection, got: {:?}",
+            other
+        ),
+    }
+    drop(c);
+
+    // Drain the connection log: the SOCKS5 + CONNECT lines name the
+    // peer (127.0.0.1 — this connection came from loopback, not LAN)
+    // and the target host, and the unknown byte is logged too.
+    let mut lines = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), log_rx.recv()).await {
+            Ok(Some(line)) => lines.push(line),
+            _ => break,
+        }
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("127.0.0.1") && l.contains("SOCKS5 → example.com:443")),
+        "the SOCKS5 connection line must name the peer and target, got: {:?}",
+        lines
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("127.0.0.1")
+            && l.contains("HTTP CONNECT → example.com:443")),
+        "the CONNECT line must name the peer and target host, got: {:?}",
+        lines
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("未知协议")),
+        "the unknown first byte must be logged, got: {:?}",
+        lines
+    );
+
+    serve.abort();
+    drop(tunnel);
+}
+
 /// LAN sharing binds the same mixed port on all interfaces: one
 /// 0.0.0.0 bind serves loopback too, so a client connecting via
 /// 127.0.0.1 reaches the mixed server (SOCKS5 greeting answered).
@@ -353,6 +518,7 @@ async fn wildcard_bind_serves_loopback_against_mock() {
         listener,
         tunnel.clone(),
         timeout,
+        None,
     ));
     tokio::time::sleep(Duration::from_millis(100)).await;
 

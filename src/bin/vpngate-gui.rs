@@ -209,6 +209,11 @@ enum GuiEvent {
     },
     Connected(Box<ActiveConnection>),
     ConnectFailed(String),
+    /// One line from the mixed proxy about an accepted connection
+    /// (source address, protocol, target host — see `ConnLog` in
+    /// `socks5.rs`). The UI writes it to the log panel + file log,
+    /// so a LAN device that never reaches the proxy leaves no line.
+    ConnLog(String),
     TestResult {
         gen204: bool,
         google: bool,
@@ -404,6 +409,7 @@ async fn connect_flow(
     timeout: Duration,
     system_proxy: bool,
     service: Option<String>,
+    conn_log: Option<vpngate_client::socks5::ConnLog>,
 ) -> Result<ActiveConnection, String> {
     let candidates = vpngate::resolve_target(&target);
     // One race over all candidate ports (first success wins); a dead
@@ -428,6 +434,7 @@ async fn connect_flow(
             listener,
             tunnel.clone(),
             timeout,
+            conn_log.clone(),
         )));
     }
     let listen_addr = listen_display;
@@ -724,6 +731,13 @@ struct GuiApp {
     /// turns the gesture into a scroll drag — so the row loop also
     /// accepts a press-and-release on the same row within 12 px.
     row_press_pos: Option<egui::Pos2>,
+    /// The modifier keys held when the row press started, latched
+    /// next to `row_press_pos`. The row click reads its modifiers
+    /// on the *release* frame (see `effective_click_mods`), and a
+    /// user who lets go of Shift/Ctrl a beat before the mouse
+    /// button would lose the gesture there — the press-time latch
+    /// is what makes Shift+click select a range reliably.
+    row_press_mods: Option<egui::Modifiers>,
     /// One-shot request from the arrow keys: after ↑/↓ moves the
     /// selection, the row loop scrolls the selected row into view
     /// (see the row loop). Only set when the selection actually
@@ -797,6 +811,7 @@ impl Default for GuiApp {
             col_widths: vpngate_client::config::UiSettings::default().node_col_widths,
             sort: None,
             row_press_pos: None,
+            row_press_mods: None,
             scroll_to_selected: false,
             node_list_scroll_y: 0.0,
             selected_row_in_view: false,
@@ -1405,6 +1420,13 @@ impl GuiApp {
         let system_proxy = self.system_proxy;
         let service = self.config.system_proxy.service.clone();
         Self::spawn_task(async move {
+            // Per-connection lines from the mixed proxy go through
+            // this channel into the GUI log (GuiEvent::ConnLog);
+            // the forwarder joins the connection's serve tasks, so
+            // disconnecting aborts it too.
+            let (conn_tx, mut conn_rx) =
+                tokio::sync::mpsc::unbounded_channel::<String>();
+            let tx2 = tx.clone();
             match connect_flow(
                 connector,
                 target.clone(),
@@ -1413,10 +1435,16 @@ impl GuiApp {
                 timeout,
                 system_proxy,
                 service,
+                Some(conn_tx),
             )
             .await
             {
-                Ok(c) => {
+                Ok(mut c) => {
+                    c.serve.push(tokio::spawn(async move {
+                        while let Some(line) = conn_rx.recv().await {
+                            let _ = tx2.send(GuiEvent::ConnLog(line));
+                        }
+                    }));
                     let _ = tx.send(GuiEvent::Connected(Box::new(c)));
                 }
                 Err(e) => {
@@ -1740,6 +1768,9 @@ impl GuiApp {
                 self.status = "连接失败。".to_string();
                 self.set_error(format!("连接失败：{}。换一个节点，或检查前置 SOCKS5 设置。", e));
             }
+            GuiEvent::ConnLog(line) => {
+                self.log_line(line);
+            }
             GuiEvent::TestResult {
                 gen204,
                 google,
@@ -1982,6 +2013,27 @@ impl GuiApp {
     fn clear_selection(&mut self) {
         self.selected = None;
         self.selected_set.clear();
+    }
+
+    /// The modifiers a row click counts with: the ones held when
+    /// the press started (`press_mods`, latched in `row_press_mods`)
+    /// OR the ones held now (the release frame). A press and a
+    /// release usually land in different frames, and a user who
+    /// lets go of Shift/Ctrl a beat before the mouse button would
+    /// lose the gesture if only the release frame were read — that
+    /// is exactly the v3.7 Shift+click failure (the range came out
+    /// as a plain single-row click). The OR also covers Shift
+    /// pressed mid-click and a press+release that land in one
+    /// frame. `command` counts as Ctrl (Cmd on macOS, Ctrl
+    /// elsewhere), like the row code before it.
+    fn effective_click_mods(
+        press_mods: Option<egui::Modifiers>,
+        current: egui::Modifiers,
+    ) -> (bool, bool) {
+        let press = press_mods.unwrap_or_default();
+        let ctrl = press.ctrl || press.command || current.ctrl || current.command;
+        let shift = press.shift || current.shift;
+        (ctrl, shift)
     }
 
     /// Click selection for a row (`node_idx` is an index into
@@ -2466,15 +2518,27 @@ impl eframe::App for GuiApp {
                                 i.pointer.interact_pos(),
                             )
                         });
-                        // Modifier keys on this frame, for the row
-                        // clicks below: Ctrl/Cmd+click toggles a row
-                        // in the multi-select set, Shift+click selects
-                        // a range from the anchor. `command` is Cmd on
+                        // Modifier keys for the row clicks below:
+                        // Ctrl/Cmd+click toggles a row in the
+                        // multi-select set, Shift+click selects a
+                        // range from the anchor. `command` is Cmd on
                         // macOS and Ctrl elsewhere, so Ctrl+click works
-                        // on both.
+                        // on both. The press-time modifiers are latched
+                        // next to the press position (see
+                        // `row_press_mods`): the click is completed on
+                        // the release frame, and reading the modifiers
+                        // only there loses the gesture when the user
+                        // lets go of Shift/Ctrl a beat before the mouse
+                        // button (the v3.7 Shift+click failure).
                         let click_mods = ui.input(|i| i.modifiers);
-                        let click_ctrl = click_mods.ctrl || click_mods.command;
-                        let click_shift = click_mods.shift;
+                        if pressed {
+                            self.row_press_pos = ptr_pos;
+                            self.row_press_mods = Some(click_mods);
+                        }
+                        let (click_ctrl, click_shift) = Self::effective_click_mods(
+                            self.row_press_mods,
+                            click_mods,
+                        );
                         if pressed {
                             self.row_press_pos = ptr_pos;
                         }
@@ -2754,18 +2818,20 @@ impl eframe::App for GuiApp {
                             // click selects only this row, Ctrl/Cmd
                             // toggles it in the multi-select set,
                             // Shift selects a range from the anchor.
-                            if row_resp.clicked() {
+                            // The two paths below are exclusive: egui's
+                            // own click and the tolerant click below
+                            // both fire on the release frame for a
+                            // press that barely moved, and calling
+                            // `click_row` twice would undo the gesture
+                            // (a Shift range would collapse back to the
+                            // clicked row, a Ctrl toggle would toggle
+                            // back out). `clicked()` wins when it fires;
+                            // the tolerant path covers the 6–12 px drift
+                            // egui's click misses.
+                            let clicked = row_resp.clicked();
+                            if clicked {
                                 self.click_row(*node_idx, click_ctrl, click_shift);
-                            }
-                            // Tolerant click: egui only counts a click
-                            // when the pointer moves under 6 px, and a
-                            // press that drifts further becomes a scroll
-                            // drag instead — so a press and a release on
-                            // the same row within 12 px also selects it.
-                            // (The press position was recorded above the
-                            // row loop, on the press frame; the
-                            // modifiers are this frame's, like clicked.)
-                            if released {
+                            } else if released {
                                 if let (Some(origin), Some(pos)) =
                                     (self.row_press_pos, ptr_pos)
                                 {
@@ -2780,6 +2846,7 @@ impl eframe::App for GuiApp {
                         }
                         if released {
                             self.row_press_pos = None;
+                            self.row_press_mods = None;
                         }
                     });
                 // The list's current scroll offset (the arrow-key
@@ -3209,6 +3276,76 @@ mod tests {
         n
     }
 
+    /// Plain-click a row by its cell label in a kittest harness.
+    fn click_row_label(harness: &mut egui_kittest::Harness<'_, GuiApp>, label: &str) {
+        use egui_kittest::kittest::Queryable;
+        let cell = harness.get_by_label(label);
+        let center = cell.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+    }
+
+    /// Shift+click a row by its cell label in a kittest harness:
+    /// ModifiersChanged(shift) before the press and again before the
+    /// release (egui only tracks modifiers from ModifiersChanged
+    /// events; the row code latches them at press time).
+    fn shift_click_row_label(
+        harness: &mut egui_kittest::Harness<'_, GuiApp>,
+        label: &str,
+    ) {
+        use egui_kittest::kittest::Queryable;
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let cell = harness.get_by_label(label);
+        let center = cell.rect().center();
+        harness.event(egui::Event::ModifiersChanged(shift));
+        harness.drag_at(center);
+        harness.run();
+        harness.event(egui::Event::ModifiersChanged(shift));
+        harness.drop_at(center);
+        harness.run();
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+        harness.run();
+    }
+
+    /// Shift+click a row by its cell label, releasing Shift before
+    /// the mouse button — the exact gesture Leo reported as broken
+    /// (the modifiers must be latched at press time, or the range
+    /// is lost and delete has nothing to remove).
+    fn shift_click_row_label_early_release(
+        harness: &mut egui_kittest::Harness<'_, GuiApp>,
+        label: &str,
+    ) {
+        use egui_kittest::kittest::Queryable;
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let cell = harness.get_by_label(label);
+        let center = cell.rect().center();
+        harness.event(egui::Event::ModifiersChanged(shift));
+        harness.drag_at(center);
+        harness.run();
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+        harness.drop_at(center);
+        harness.run();
+    }
+
+    /// Click a button by its label in a kittest harness.
+    fn click_button_label(harness: &mut egui_kittest::Harness<'_, GuiApp>, label: &str) {
+        use egui_kittest::kittest::Queryable;
+        let btn = harness.get_by_label(label);
+        let center = btn.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+    }
+
     /// Node with explicit listed stats (sessions / speed / ping).
     /// All three zero = no data (the curated 28); any nonzero =
     /// has data.
@@ -3625,6 +3762,75 @@ mod tests {
         app.click_row(1, false, true);
         assert_eq!(app.selected, Some(1));
         assert_eq!(app.selected_set, BTreeSet::from([0, 1, 2, 3]));
+    }
+
+    /// The click modifiers are the press-time latch OR the release
+    /// frame's: releasing Shift/Ctrl a beat before the mouse button
+    /// must not lose the gesture (the v3.7 Shift+click failure),
+    /// Shift pressed mid-click counts too, and Cmd counts as Ctrl.
+    #[test]
+    fn effective_click_mods_latches_press_time_modifiers() {
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let command = egui::Modifiers {
+            command: true,
+            ..Default::default()
+        };
+        let none = egui::Modifiers::default();
+        // Shift held at press, released before the mouse button.
+        assert_eq!(
+            GuiApp::effective_click_mods(Some(shift), none),
+            (false, true)
+        );
+        // Shift pressed mid-click (after the press, before release).
+        assert_eq!(
+            GuiApp::effective_click_mods(Some(none), shift),
+            (false, true)
+        );
+        // Held through the whole click.
+        assert_eq!(
+            GuiApp::effective_click_mods(Some(shift), shift),
+            (false, true)
+        );
+        // No modifiers at either end: a plain click.
+        assert_eq!(
+            GuiApp::effective_click_mods(Some(none), none),
+            (false, false)
+        );
+        // No press latch at all (a press+release in one frame
+        // before the latch was recorded): fall back to the current
+        // frame's modifiers.
+        assert_eq!(GuiApp::effective_click_mods(None, shift), (false, true));
+        assert_eq!(GuiApp::effective_click_mods(None, none), (false, false));
+        // Ctrl at press time only, and Cmd counts as Ctrl.
+        assert_eq!(
+            GuiApp::effective_click_mods(Some(ctrl), none),
+            (true, false)
+        );
+        assert_eq!(
+            GuiApp::effective_click_mods(Some(command), none),
+            (true, false)
+        );
+        assert_eq!(
+            GuiApp::effective_click_mods(Some(none), command),
+            (true, false)
+        );
+        // Ctrl+Shift together survive.
+        let both = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            GuiApp::effective_click_mods(Some(both), none),
+            (true, true)
+        );
     }
 
     /// Arrow keys keep the v3.4 behaviour and collapse the
@@ -5078,6 +5284,355 @@ mod tests {
         harness.run();
         assert_eq!(harness.state().nodes.len(), 3);
         assert!(harness.state().blocked_hosts.is_empty());
+    }
+
+    /// Shift+click selects the whole range from the anchor to the
+    /// clicked row (display order), and arrow keys still collapse
+    /// the multi-select to the row the anchor moved to. Needs a
+    /// graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn shift_click_selects_range() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                    node_in("d.opengw.net", "法国"),
+                    node_in("e.opengw.net", "英国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        // Shift+click helper: queue ModifiersChanged(shift) before
+        // the press and again before the release, mirroring the
+        // Ctrl+click test (the row code reads the modifiers on the
+        // release frame).
+        let shift_click = |harness: &mut egui_kittest::Harness<'_, GuiApp>, label: &str| {
+            let cell = harness.get_by_label(label);
+            let center = cell.rect().center();
+            harness.event(egui::Event::ModifiersChanged(shift));
+            harness.drag_at(center);
+            harness.run();
+            harness.event(egui::Event::ModifiersChanged(shift));
+            harness.drop_at(center);
+            harness.run();
+            harness.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+            harness.run();
+        };
+        // Plain click on the 日本 row: anchor 0, set {0}.
+        let cell = harness.get_by_label("日本");
+        let center = cell.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(harness.state().selected, Some(0));
+        assert_eq!(harness.state().selected_set, BTreeSet::from([0]));
+        // Shift+click on the 德国 row: the range 0..=2.
+        shift_click(&mut harness, "德国");
+        assert_eq!(harness.state().selected, Some(2));
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0, 1, 2]),
+            "Shift+click must select the range from the anchor"
+        );
+        // Shift+click on the 英国 row: the anchor moved to 德国 on
+        // the previous click, so the range is 2..=4 — every click
+        // moves the anchor (see `click_row`), a second Shift+click
+        // re-anchors rather than extending from the first one.
+        shift_click(&mut harness, "英国");
+        assert_eq!(harness.state().selected, Some(4));
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([2, 3, 4]),
+            "Shift+click selects the range from the current anchor"
+        );
+        // Plain click on the 美国 row collapses to one row.
+        let cell = harness.get_by_label("美国");
+        let center = cell.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(harness.state().selected_set, BTreeSet::from([1]));
+        // Shift+click on the 法国 row: the range 1..=3.
+        shift_click(&mut harness, "法国");
+        assert_eq!(harness.state().selected, Some(3));
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([1, 2, 3]),
+            "Shift+click after a plain click starts from the new anchor"
+        );
+        // Arrow key ↓ moves the anchor and collapses the set to it.
+        harness.key_press(egui::Key::ArrowDown);
+        harness.run();
+        assert_eq!(harness.state().selected, Some(4));
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([4]),
+            "arrow keys must still collapse the multi-select to one row"
+        );
+    }
+
+    /// Shift+click with no anchor yet (the selection was cleared by
+    /// a delete) selects just that row and makes it the anchor.
+    /// Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn shift_click_without_anchor_selects_single_row() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        // Plain click on 日本, then delete it: the selection (and
+        // the anchor) is cleared, leaving [美国， 德国].
+        let cell = harness.get_by_label("日本");
+        let center = cell.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        let btn = harness.get_by_label("删除选中 (1)");
+        let center = btn.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(harness.state().nodes.len(), 2);
+        assert_eq!(harness.state().selected, None);
+        assert!(harness.state().selected_set.is_empty());
+        // Shift+click on the first remaining row (美国） with no
+        // anchor: just that row, and it becomes the anchor.
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let cell = harness.get_by_label("美国");
+        let center = cell.rect().center();
+        harness.event(egui::Event::ModifiersChanged(shift));
+        harness.drag_at(center);
+        harness.run();
+        harness.event(egui::Event::ModifiersChanged(shift));
+        harness.drop_at(center);
+        harness.run();
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+        harness.run();
+        assert_eq!(harness.state().selected, Some(0));
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0]),
+            "Shift+click with no anchor must fall back to a plain click"
+        );
+    }
+
+    /// Shift+click still selects the range even when the user lets
+    /// go of Shift before releasing the mouse button — the
+    /// modifiers are latched at press time. Needs a graphics
+    /// adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn shift_click_survives_early_shift_release() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        // Plain click on 日本: anchor 0, set {0}.
+        let cell = harness.get_by_label("日本");
+        let center = cell.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(harness.state().selected_set, BTreeSet::from([0]));
+        // Shift+click on 德国， but release Shift before the mouse
+        // button: ModifiersChanged(shift) only before the press,
+        // ModifiersChanged(default) before the release.
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let cell = harness.get_by_label("德国");
+        let center = cell.rect().center();
+        harness.event(egui::Event::ModifiersChanged(shift));
+        harness.drag_at(center);
+        harness.run();
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(harness.state().selected, Some(2));
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0, 1, 2]),
+            "releasing Shift before the mouse button must not lose the range"
+        );
+    }
+
+    /// End-to-end: Shift+click a range, then "删除选中" removes
+    /// exactly those rows and records their hosts on the blocklist.
+    /// This is the flow Leo reported as broken in v3.7 (Shift+click
+    /// selected a range, but delete removed nothing): it covers both
+    /// halves — the range must actually be selected (anchor +
+    /// modifiers), and the delete button must read the same set the
+    /// highlight shows. Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn shift_click_then_delete_removes_range() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                    node_in("d.opengw.net", "法国"),
+                    node_in("e.opengw.net", "英国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        // Plain click on 日本 sets the anchor; Shift+click on 法国
+        // selects the range 0..=3.
+        click_row_label(&mut harness, "日本");
+        assert_eq!(harness.state().selected, Some(0));
+        shift_click_row_label(&mut harness, "法国");
+        assert_eq!(harness.state().selected, Some(3));
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0, 1, 2, 3]),
+            "Shift+click must select the range from the anchor"
+        );
+        // The delete button carries the count of the same set the
+        // highlight shows — if it read a different state, the count
+        // here would be wrong.
+        let _btn = harness.get_by_label("删除选中 (4)");
+        // Delete: the four rows go, their hosts land on the
+        // blocklist, the selection is cleared, and only 英国 is left.
+        click_button_label(&mut harness, "删除选中 (4)");
+        assert_eq!(harness.state().nodes.len(), 1);
+        assert_eq!(harness.state().nodes[0].host, "e.opengw.net");
+        assert_eq!(
+            harness.state().blocked_hosts.len(),
+            4,
+            "all four deleted hosts must be blocked, got: {:?}",
+            harness.state().blocked_hosts
+        );
+        for host in ["a.opengw.net", "b.opengw.net", "c.opengw.net", "d.opengw.net"] {
+            assert!(
+                harness.state().blocked_hosts.contains(host),
+                "blocked_hosts must contain {}, got: {:?}",
+                host,
+                harness.state().blocked_hosts
+            );
+        }
+        assert!(harness.state().selected_set.is_empty());
+        assert_eq!(harness.state().selected, None);
+    }
+
+    /// End-to-end, no-anchor variant: Shift+click as the very first
+    /// click selects just that row, and "删除选中" removes it.
+    /// Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn shift_click_first_then_delete_removes_single_row() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        // No anchor yet: Shift+click on 德国 falls back to that row.
+        shift_click_row_label(&mut harness, "德国");
+        assert_eq!(harness.state().selected, Some(2));
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([2]),
+            "Shift+click with no anchor must select just that row"
+        );
+        let _btn = harness.get_by_label("删除选中 (1)");
+        click_button_label(&mut harness, "删除选中 (1)");
+        assert_eq!(harness.state().nodes.len(), 2);
+        assert_eq!(harness.state().nodes[0].host, "a.opengw.net");
+        assert_eq!(harness.state().nodes[1].host, "b.opengw.net");
+        assert!(harness.state().blocked_hosts.contains("c.opengw.net"));
+        assert!(harness.state().selected_set.is_empty());
+        assert_eq!(harness.state().selected, None);
+    }
+
+    /// End-to-end, early-release variant: the same range-select +
+    /// delete flow, but Shift is released before the mouse button
+    /// on the Shift+click — the gesture Leo actually makes. Without
+    /// the press-time modifier latch the range would be lost here
+    /// and delete would have nothing to remove. Needs a graphics
+    /// adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn shift_click_early_release_then_delete_removes_range() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                    node_in("d.opengw.net", "法国"),
+                    node_in("e.opengw.net", "英国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        click_row_label(&mut harness, "日本");
+        shift_click_row_label_early_release(&mut harness, "法国");
+        assert_eq!(harness.state().selected, Some(3));
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0, 1, 2, 3]),
+            "the range must survive Shift being released before the mouse button"
+        );
+        let _btn = harness.get_by_label("删除选中 (4)");
+        click_button_label(&mut harness, "删除选中 (4)");
+        assert_eq!(harness.state().nodes.len(), 1);
+        assert_eq!(harness.state().nodes[0].host, "e.opengw.net");
+        assert_eq!(harness.state().blocked_hosts.len(), 4);
+        assert!(harness.state().selected_set.is_empty());
+        assert_eq!(harness.state().selected, None);
     }
 
     /// Clicking the 国家/地区 header toggles the sort A-Z / Z-A.

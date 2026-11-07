@@ -19,6 +19,15 @@
 //! keep-alive reuse). No HTTP authentication: `Proxy-Authorization`
 //! is ignored. The tunnel is IPv4-only, so IPv6 targets are refused,
 //! same as the SOCKS5 path.
+//!
+//! Every accepted connection is logged once (`ConnLog`): source
+//! address (127.0.0.1 vs a LAN address), sniffed protocol, and the
+//! CONNECT / SOCKS5 target host — never a path, a body, or
+//! credentials — plus a failure line when the connection dies. The
+//! GUI feeds these lines into its log panel + `vpngate-gui.log`, so
+//! a LAN device that cannot reach the proxy leaves no line at all
+//! (blocked before us, e.g. by the Windows firewall), while a
+//! connection that arrives but fails names the step it died on.
 
 use crate::sstp::SstpTunnel;
 use std::sync::Arc;
@@ -107,7 +116,37 @@ pub async fn socks5_connect(
 /// forwarding connections through `tunnel`. Runs until the listener
 /// errors or the task is aborted. Each connection gets its own
 /// userspace TCP session.
-pub async fn serve_mixed(listener: TcpListener, tunnel: Arc<SstpTunnel>, timeout: Duration) {
+/// Where per-connection lines from the mixed proxy go. The GUI
+/// passes a sender that feeds its log panel + file log
+/// (`GuiEvent::ConnLog`); `None` logs to stderr (the CLI). One line
+/// per accepted connection — source address, sniffed protocol, and
+/// the CONNECT / SOCKS5 target host — plus a second line only when
+/// the connection fails, carrying the reason. Never a path, a body,
+/// or credentials: a CONNECT line names the host, nothing else.
+pub type ConnLog = tokio::sync::mpsc::UnboundedSender<String>;
+
+fn emit_conn_log(sink: &Option<ConnLog>, line: String) {
+    match sink {
+        Some(tx) => {
+            let _ = tx.send(line);
+        }
+        None => eprintln!("{}", line),
+    }
+}
+
+fn peer_of(socket: &TcpStream) -> String {
+    socket
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "?".to_string())
+}
+
+pub async fn serve_mixed(
+    listener: TcpListener,
+    tunnel: Arc<SstpTunnel>,
+    timeout: Duration,
+    conn_log: Option<ConnLog>,
+) {
     println!(
         "混合代理（SOCKS5+HTTP）listening on {}",
         listener.local_addr().unwrap()
@@ -122,9 +161,10 @@ pub async fn serve_mixed(listener: TcpListener, tunnel: Arc<SstpTunnel>, timeout
             }
         };
         let t = tunnel.clone();
+        let log = conn_log.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_mixed_conn(socket, t, timeout).await {
-                eprintln!("mixed proxy conn from {} failed: {}", peer, e);
+            if let Err(e) = handle_mixed_conn(socket, t, timeout, &log).await {
+                emit_conn_log(&log, format!("混合代理连接 {} 失败：{}", peer, e));
             }
         });
     }
@@ -158,16 +198,31 @@ async fn handle_mixed_conn(
     local: TcpStream,
     tunnel: Arc<SstpTunnel>,
     timeout: Duration,
+    conn_log: &Option<ConnLog>,
 ) -> Result<(), String> {
+    let peer = peer_of(&local);
     let mut first = [0u8; 1];
     let n = local.peek(&mut first).await.map_err(|e| e.to_string())?;
     if n == 0 {
+        emit_conn_log(
+            conn_log,
+            format!("混合代理连接 {}：未发送数据，已关闭", peer),
+        );
         return Ok(()); // client closed immediately
     }
     match classify_first_byte(first[0]) {
-        FirstByte::Socks5 => handle_socks5_conn(local, tunnel, timeout).await,
-        FirstByte::Http => handle_http_conn(local, tunnel, timeout).await,
-        FirstByte::Unknown => Ok(()), // silently close, nothing to do
+        FirstByte::Socks5 => handle_socks5_conn(local, tunnel, timeout, conn_log).await,
+        FirstByte::Http => handle_http_conn(local, tunnel, timeout, conn_log).await,
+        FirstByte::Unknown => {
+            emit_conn_log(
+                conn_log,
+                format!(
+                    "混合代理连接 {}：未知协议（首字节 0x{:02x}），已关闭",
+                    peer, first[0]
+                ),
+            );
+            Ok(())
+        }
     }
 }
 
@@ -175,6 +230,7 @@ async fn handle_socks5_conn(
     mut local: TcpStream,
     tunnel: Arc<SstpTunnel>,
     timeout: Duration,
+    conn_log: &Option<ConnLog>,
 ) -> Result<(), String> {
     // Greeting.
     let mut hdr = [0u8; 2];
@@ -245,6 +301,15 @@ async fn handle_socks5_conn(
             return Err(format!("unsupported SOCKS5 address type {}", t));
         }
     };
+    emit_conn_log(
+        conn_log,
+        format!(
+            "混合代理连接 {}：SOCKS5 → {}:{}",
+            peer_of(&local),
+            host,
+            port
+        ),
+    );
     if tunnel.is_dead() {
         let _ = local
             .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
@@ -630,11 +695,17 @@ async fn handle_http_conn(
     mut local: TcpStream,
     tunnel: Arc<SstpTunnel>,
     timeout: Duration,
+    conn_log: &Option<ConnLog>,
 ) -> Result<(), String> {
+    let peer = peer_of(&local);
     let (head_bytes, leftover) = match read_http_headers(&mut local).await {
         Ok(v) => v,
         Err(_) => {
             // Malformed / empty request: close without a reply.
+            emit_conn_log(
+                conn_log,
+                format!("混合代理连接 {}：HTTP 请求头未读完，已关闭", peer),
+            );
             return Ok(());
         }
     };
@@ -642,6 +713,10 @@ async fn handle_http_conn(
         let _ = local
             .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .await;
+        emit_conn_log(
+            conn_log,
+            format!("混合代理连接 {}：HTTP 请求行畸形，已回 400", peer),
+        );
         return Ok(());
     };
     let host_header = req.get("host").map(|s| s.to_string());
@@ -649,8 +724,31 @@ async fn handle_http_conn(
         let _ = local
             .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .await;
+        emit_conn_log(
+            conn_log,
+            format!("混合代理连接 {}：HTTP 请求目标无法解析，已回 400", peer),
+        );
         return Ok(());
     };
+    // The connection line: source, protocol, target host only —
+    // never the path or the body (see `ConnLog`).
+    if req.method.eq_ignore_ascii_case("CONNECT") {
+        emit_conn_log(
+            conn_log,
+            format!("混合代理连接 {}：HTTP CONNECT → {}:{}", peer, host, port),
+        );
+    } else {
+        emit_conn_log(
+            conn_log,
+            format!(
+                "混合代理连接 {}：HTTP {} → {}:{}",
+                peer,
+                req.method.to_ascii_uppercase(),
+                host,
+                port
+            ),
+        );
+    }
     let mut remote = match tunnel.open_stream(&host, port, timeout).await {
         Ok(s) => s,
         Err(e) => {

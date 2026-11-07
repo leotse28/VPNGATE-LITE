@@ -113,15 +113,28 @@ def handle(conn):
             doff = (ip[ihl+12] >> 4) * 4
             payload = ip[ihl+doff:struct.unpack(">H", ip[2:4])[0]]
             key = (src, sport)
-            st = conns.setdefault(key, {"srv_seq": 5000, "est": False})
+            st = conns.setdefault(key, {"srv_seq": 5000, "est": False, "echo": False})
             print(f"  [mock] TCP {src}:{sport} -> {dst}:{dport} flags={hex(flags)} seq={seq} paylen={len(payload)}", flush=True)
             if flags & 0x02:  # SYN
                 conn.sendall(tcp_reply(vip, dst, sport, dport, st["srv_seq"], seq+1, 0x12))
                 st["srv_seq"] += 1
             elif flags & 0x10 and payload:
-                # data: ACK + canned 204 reply
+                # data: ACK + a reply. Normally the canned 204, but a
+                # stream that starts with b"ECHO:" switches this
+                # connection to echo mode: the payload (minus the
+                # marker) comes back byte-for-byte, so a test can prove
+                # a relay passes binary data through unmodified (a
+                # canned 204 would not catch mangling). Later segments
+                # of the same stream echo too, in case the sender's
+                # bytes were split across packets.
                 conn.sendall(tcp_reply(vip, dst, sport, dport, st["srv_seq"], seq+len(payload), 0x10))
-                resp = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                if payload.startswith(b"ECHO:"):
+                    st["echo"] = True
+                    resp = payload[5:]
+                elif st["echo"]:
+                    resp = payload
+                else:
+                    resp = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 conn.sendall(tcp_reply(vip, dst, sport, dport, st["srv_seq"], seq+len(payload), 0x18, resp))
                 st["srv_seq"] += len(resp)
                 st["est"] = True
