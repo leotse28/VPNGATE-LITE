@@ -237,3 +237,18 @@ cargo run --release --bin vpngate-gui
 渲染检查：`cargo test --bin vpngate-gui -- --ignored render_for_review render_infinity_glyph` 通过，截图 10 张（项目根目录 `ui-review-*.png`，PNG 不进 snapshot 推送）：560×420 与 800×600 双主题各 2 张、150% 缩放 1 张、滚到底 2 张、选中行 1 张（`ui-review-selected-row.png`：德国行靛蓝满宽底 + 白字，清晰可辨）、∞ 字形 2 张。目视结论：深色深 slate 底 + 暖白字、浅色暖灰白底 + 墨色字、“连接”按钮靛蓝白字、行高 30 px、条纹铺满整宽、800×600 时五列全显（560×420 时延迟/状态列要横向滚动一下，与 v3.2 相同）；∞ 在深/浅两主题都是正常字形（青色/深青色），不是方框。`cargo build --release` 与 `cargo build --release --target x86_64-pc-windows-gnu` 均通过；Windows 版 `vpngate-gui.exe`（PE32+ GUI，39,375,906 字节）、`vpngate-client.exe`（PE32+ console，10,641,425 字节），图标仍在（两 exe 都有 `.rsrc` 段，10,376 字节，与 v3.2 相同）。Linux 版 `vpngate-client` 实测：`--version` 打印 0.3.3，无参数打印中文说明并等按回车退出；`list` 在 0.17 秒内完成，API 与抓取都以 `received corrupt message of type InvalidContentType` 失败后正确落到内嵌 28 节点（VM 出口中间件根本不完成 TLS 握手，和 v3.2 时一样）。
 **仍未在真节点上验证（实话）**：本 VM 出口拦截 vpngate.net / *.opengw.net 的 TLS，真实节点连接、抓取、双端口同时监听都须 Leo 在 Windows 机器上试；新加的启动行为（不自动刷新 + 无 config 提示）、国家排序、回车/Ctrl+R、∞ 标记、并行探测的提速（死节点 ~20 秒 → 约 10 秒）也要在他机器上确认——先试 `public-vpn-192`（v3.2 已验证能连）。
 
+---
+
+## 10. 2026-11-07 晚 v3.4 这一批改动（上下方向键切换选中 + 跟随滚动）
+
+背景：Leo 在 v3.3 的基础上只提了一个新需求：节点列表里用上下方向键切换选中行。范围就这一件，没扩。
+
+33. **上下键切换选中（新增 `move_selection` + `ui()` 顶部的方向键处理，`GuiApp` 新增 `scroll_to_selected` / `node_list_scroll_y` / `selected_row_in_view` 三个字段）。** ↑ 把选中行往上移一行，↓ 往下移一行；到顶/到底停住，不循环。没有选中时 ↓ 选第一行、↑ 选最后一行。移动按显示顺序走（`display_indices()`，排序后按排好的顺序），`selected` 仍存节点下标，不错位。守卫与回车/Ctrl+R 同一套思路（没有文本框获得焦点——↑/↓ 在输入框里是移动光标、About 窗口没开），但**不**要求不忙/未连接：移选中行只动选中、不触发任何动作，所以忙碌（探测/连接中）时也能移。按住方向键会连续移动（egui `key_pressed` 包含按键重复事件）。实现上方向键处理放在 `ui()` 顶部、回车/Ctrl+R 处理的后面；egui 的 ScrollArea 本身不消费方向键（源码里没有 ArrowUp/ArrowDown 的处理），所以不会双重滚动。新增单元测试 `move_selection_follows_display_order_and_stops_at_ends`（无选中时 ↓/↑ 的落点、上下步进、到顶/到底停住且不请求滚动、排序后按显示顺序走、空列表不动）。
+
+34. **跟随滚动（`scroll_to_selected` 一次性请求 + 行循环里的 `ui.scroll_to_rect(row_rect, None)`）。** 方向键移选中后，行循环在渲染选中行时调 `scroll_to_rect`（对齐参数 None：只滚到刚好能看见整行为止，已经在可视区内的行不移动列表——如果用居中对齐，每按一下可见行列表都会跳一下）。目标由最内层的节点列表 ScrollArea 消费（egui 的保存/恢复机制：内层先取走目标，外层中央滚动区看不到它），所以只滚列表、不滚整个主面板。鼠标点击不设这个请求（点的行本来就可见）。`scroll_to_selected` 只在选中真正变化时才置位，到顶/到底按方向键不动选中、也不请求滚动；列表为空时没有行消费它，无害。新增字段 `node_list_scroll_y`（每帧从 ScrollArea 输出的 `state.offset.y` 取，测试用它证明列表真的滚了）与 `selected_row_in_view`（行循环里用 clip rect——即列表的可视区——判断选中行纵向是否完全可见，每帧重算；只看纵向：行是铺满整宽的，560 px 宽时行会横向超出 clip rect，那与是否在屏上无关）。新增 kittest `arrow_keys_move_selection_and_follow_scroll`（560×420、10 个节点，列表约 120 px 高、只放得下约 3 行）：无选中时 ↓ 选第一行、↑ 到顶不动、↓↓↑ 走到第 2 行、连按 8 次 ↓ 走到底（断言 `node_list_scroll_y > 0` 且 `selected_row_in_view` 为真）、到底再按 ↓ 不动、忙碌时 ↑ 仍能移选中、回车在新选中的行上照常触发连接、Ctrl+R 照常触发探测；滚动动画（默认 0.1–0.3 秒）走完才断言，用 `run()` 等它 settle，忙碌段用 `run_steps(3)`（spinner 一直请求重绘，`run()` 不会停）。
+
+35. **版本 0.3.3 → 0.3.4**（`Cargo.toml`；User-Agent 与关于窗口仍读 `CARGO_PKG_VERSION`）。README / WINDOWS.md 同步更新（方向键导航与跟随滚动）。
+
+本批测试（本 VM，`cargo test`，CARGO_EXIT=0）：lib 30 项、GUI 23 项（原 22 + 方向键移动单元测试 1 项）、集成 3 项、CLI 0 项，全过，共 56 项。8 个忽略的测试用 `cargo test --bins -- --ignored <名字>` 逐个跑过，全过（新增 `arrow_keys_move_selection_and_follow_scroll` 一次通过；其余 7 个与 v3.3 相同，无回归）。
+**仍未在真节点上验证（实话）**：与 v3.3 相同，本 VM 出口拦截 vpngate.net / *.opengw.net 的 TLS；新加的方向键导航与跟随滚动须 Leo 在 Windows 机器上确认——打开新版，点一行后按 ↓/↑ 试切换，确认选中行跟随滚动、回车仍能连接。
+

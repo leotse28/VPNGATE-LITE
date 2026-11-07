@@ -504,6 +504,21 @@ struct GuiApp {
     /// turns the gesture into a scroll drag — so the row loop also
     /// accepts a press-and-release on the same row within 12 px.
     row_press_pos: Option<egui::Pos2>,
+    /// One-shot request from the arrow keys: after ↑/↓ moves the
+    /// selection, the row loop scrolls the selected row into view
+    /// (see the row loop). Only set when the selection actually
+    /// changes; cleared when the row loop consumes it. Mouse clicks
+    /// never set it — a clicked row is already visible.
+    scroll_to_selected: bool,
+    /// The node list's current vertical scroll offset (pixels, from
+    /// the ScrollArea output each frame). The arrow-key test reads
+    /// it to prove the list actually scrolled.
+    node_list_scroll_y: f32,
+    /// Whether the selected row is fully inside the node list's
+    /// visible area vertically this frame (recomputed in the row
+    /// loop from the clip rect; `false` when nothing is selected).
+    /// The arrow-key test reads it to prove the follow-scroll works.
+    selected_row_in_view: bool,
     /// Whether 高级设置 starts open. Production default is closed;
     /// the render test opens it so the review screenshots show the
     /// front-proxy section and the log.
@@ -554,6 +569,9 @@ impl Default for GuiApp {
             col_widths: vpngate_client::config::UiSettings::default().node_col_widths,
             country_sort: None,
             row_press_pos: None,
+            scroll_to_selected: false,
+            node_list_scroll_y: 0.0,
+            selected_row_in_view: false,
             advanced_open: false,
             render_scroll_bottom: false,
             manual_host: String::new(),
@@ -1417,6 +1435,39 @@ impl GuiApp {
         Some(host)
     }
 
+    /// Move the selection one row up (`delta < 0`) or down
+    /// (`delta > 0`) in display order (see `display_indices`, so a
+    /// sorted list moves in the shown order). Stops at the ends —
+    /// no wrap-around. With no selection yet, ↓ picks the first row
+    /// and ↑ picks the last. Sets `scroll_to_selected` when the
+    /// selection actually changes, so the row loop scrolls it into
+    /// view; pressing ↑ at the top (or ↓ at the bottom) changes
+    /// nothing and requests no scroll. Moving the selection starts
+    /// nothing, so callers may move it while busy or connected.
+    fn move_selection(&mut self, delta: isize) {
+        let order = self.display_indices();
+        if order.is_empty() {
+            return;
+        }
+        let pos = self
+            .selected
+            .and_then(|s| order.iter().position(|&i| i == s));
+        let new_pos = match pos {
+            Some(p) => (p as isize + delta).clamp(0, order.len() as isize - 1) as usize,
+            None => {
+                if delta > 0 {
+                    0
+                } else {
+                    order.len() - 1
+                }
+            }
+        };
+        if Some(order[new_pos]) != self.selected {
+            self.selected = Some(order[new_pos]);
+            self.scroll_to_selected = true;
+        }
+    }
+
     /// Keyboard shortcuts (Enter = connect, Ctrl+R = probe): the pure
     /// guard half, unit-testable. `enter` / `ctrl_r` are whether the
     /// key was pressed this frame; `text_edit_focused` is whether a
@@ -1482,10 +1533,27 @@ impl eframe::App for GuiApp {
                 egui::Key::R,
             ))
         });
-        match self.shortcut_action(enter, ctrl_r, ctx.text_edit_focused()) {
-            Some(ShortcutAction::Connect) => self.start_connect(ctx),
-            Some(ShortcutAction::Probe) => self.start_probe(ctx),
+        let text_focused = ctx.text_edit_focused();
+        match self.shortcut_action(enter, ctrl_r, text_focused) {
+            Some(ShortcutAction::Connect) => self.start_connect(ctx.clone()),
+            Some(ShortcutAction::Probe) => self.start_probe(ctx.clone()),
             None => {}
+        }
+        // Arrow keys move the selection in the node list (same guard
+        // family as the shortcuts above: no text field focused —
+        // ↑/↓ there move the cursor — and the About window closed).
+        // Unlike Enter/Ctrl+R, moving the selection is allowed while
+        // busy or connected: it only changes which row is selected,
+        // it starts nothing. Holding a key repeats (egui
+        // `key_pressed` includes repeat events). The row loop
+        // scrolls the newly selected row into view (one-shot
+        // `scroll_to_selected`).
+        if !text_focused && !self.show_about {
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                self.move_selection(-1);
+            } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                self.move_selection(1);
+            }
         }
         // Quitting while connected disconnects first (no confirm needed).
         if ui.ctx().input(|i| i.viewport().close_requested()) {
@@ -1641,10 +1709,13 @@ impl eframe::App for GuiApp {
                     })
                     .collect();
             let list_h = (panel_h - 250.0).max(120.0);
+            // Recomputed in the row loop below; false when there is
+            // no list or no selection (see the row loop).
+            self.selected_row_in_view = false;
             if rows.is_empty() {
                 ui.label("还没有节点。点右上角“刷新节点”，或在下面“高级设置”里手动添加。");
             } else {
-                egui::ScrollArea::both()
+                let list_out = egui::ScrollArea::both()
                     .id_salt("node_list")
                     .max_height(list_h)
                     .auto_shrink([false, false])
@@ -1820,6 +1891,31 @@ impl eframe::App for GuiApp {
                                 egui::Sense::click(),
                             );
                             let selected = self.selected == Some(*node_idx);
+                            // Arrow-key follow-scroll: a one-shot
+                            // request from move_selection. Align None
+                            // scrolls only as far as needed to bring
+                            // the row into view (already-visible rows
+                            // don't move the list). The target is
+                            // consumed by this (innermost) ScrollArea.
+                            if self.scroll_to_selected && selected {
+                                ui.scroll_to_rect(row_rect, None);
+                                self.scroll_to_selected = false;
+                            }
+                            // Visibility bookkeeping for the arrow-key
+                            // test: the clip rect is this list's
+                            // viewport. Vertical only — rows span the
+                            // full width and can run past the clip
+                            // rect horizontally (the list scrolls
+                            // sideways at 560 px), which says nothing
+                            // about whether the row is on screen.
+                            // Recomputed every frame (the scroll
+                            // target above only takes effect after
+                            // this frame's show).
+                            if selected {
+                                let clip = ui.clip_rect();
+                                self.selected_row_in_view = row_rect.top() >= clip.top()
+                                    && row_rect.bottom() <= clip.bottom();
+                            }
                             let fill = if selected {
                                 ui.visuals().selection.bg_fill
                             } else if row_resp.hovered() {
@@ -1912,6 +2008,9 @@ impl eframe::App for GuiApp {
                             self.row_press_pos = None;
                         }
                     });
+                // The list's current scroll offset (the arrow-key
+                // test reads it to prove the list actually scrolled).
+                self.node_list_scroll_y = list_out.state.offset.y;
             }
 
             // Primary action row (roomy buttons: 96x34).
@@ -2336,6 +2435,63 @@ mod tests {
         app.show_about = true;
         assert_eq!(app.shortcut_action(true, false, false), None);
         assert_eq!(app.shortcut_action(false, true, false), None);
+    }
+
+    #[test]
+    fn move_selection_follows_display_order_and_stops_at_ends() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_in("b.opengw.net", "美国"),
+            node_in("a.opengw.net", "日本"),
+            node_in("c.opengw.net", "德国"),
+        ];
+        // No selection yet: ↓ picks the first row, ↑ picks the last.
+        app.move_selection(1);
+        assert_eq!(app.selected, Some(0));
+        assert!(app.scroll_to_selected, "moving must request a follow-scroll");
+        app.scroll_to_selected = false;
+        app.selected = None;
+        app.move_selection(-1);
+        assert_eq!(app.selected, Some(2));
+        app.scroll_to_selected = false;
+        // Step down, up, and stop at the top (no change, no scroll).
+        app.move_selection(-1);
+        assert_eq!(app.selected, Some(1));
+        app.scroll_to_selected = false;
+        app.move_selection(-1);
+        assert_eq!(app.selected, Some(0));
+        app.scroll_to_selected = false;
+        app.move_selection(-1);
+        assert_eq!(app.selected, Some(0), "↑ at the top must not move");
+        assert!(
+            !app.scroll_to_selected,
+            "no movement means no follow-scroll request"
+        );
+        // Walk to the bottom and stop there too.
+        app.move_selection(1);
+        app.move_selection(1);
+        assert_eq!(app.selected, Some(2));
+        app.scroll_to_selected = false;
+        app.move_selection(1);
+        assert_eq!(app.selected, Some(2), "↓ at the bottom must not move");
+        assert!(!app.scroll_to_selected);
+        // Sorted list: movement follows the shown order (德国 <
+        // 日本 < 美国 in A-Z, i.e. display [2, 1, 0]).
+        app.country_sort = Some(SortDir::Asc);
+        app.selected = None;
+        app.move_selection(1);
+        assert_eq!(app.selected, Some(2), "first in A-Z order is 德国");
+        app.move_selection(1);
+        assert_eq!(app.selected, Some(1), "second is 日本");
+        app.move_selection(1);
+        assert_eq!(app.selected, Some(0), "third is 美国");
+        // Empty list: nothing to move to.
+        app.nodes = vec![];
+        app.selected = None;
+        app.move_selection(1);
+        assert_eq!(app.selected, None);
+        app.move_selection(-1);
+        assert_eq!(app.selected, None);
     }
 
     #[test]
@@ -3199,6 +3355,100 @@ mod tests {
         assert!(
             matches!(harness.state().busy, Some(Busy::Probing)),
             "Ctrl+R must start a probe, busy={:?}",
+            harness.state().busy
+        );
+    }
+
+    /// ↑/↓ move the selection in display order, stop at the ends,
+    /// and scroll the newly selected row into view; Enter/Ctrl+R
+    /// still act on the arrow-selected row, and moving works while
+    /// busy. Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn arrow_keys_move_selection_and_follow_scroll() {
+        use egui_kittest::Harness;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 420.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                // Ten rows overflow the ~120 px list at 560x420
+                // (about three rows fit), so walking to the bottom
+                // must scroll.
+                app.nodes = (0..10)
+                    .map(|i| node_in(&format!("n{i}.opengw.net"), "日本"))
+                    .collect();
+                app
+            });
+        harness.run_steps(10);
+        assert_eq!(harness.state().selected, None);
+        // ↓ with no selection picks the first row; ↑ at the top
+        // stays put.
+        harness.key_press(egui::Key::ArrowDown);
+        harness.run();
+        assert_eq!(harness.state().selected, Some(0));
+        harness.key_press(egui::Key::ArrowUp);
+        harness.run();
+        assert_eq!(
+            harness.state().selected,
+            Some(0),
+            "↑ at the top must not move"
+        );
+        // ↓ twice, ↑ once.
+        harness.key_press(egui::Key::ArrowDown);
+        harness.run();
+        harness.key_press(egui::Key::ArrowDown);
+        harness.run();
+        assert_eq!(harness.state().selected, Some(2));
+        harness.key_press(egui::Key::ArrowUp);
+        harness.run();
+        assert_eq!(harness.state().selected, Some(1));
+        // Walk to the bottom: the list must scroll and the last row
+        // must end up on screen.
+        for _ in 0..8 {
+            harness.key_press(egui::Key::ArrowDown);
+            harness.run();
+        }
+        assert_eq!(harness.state().selected, Some(9));
+        assert!(
+            harness.state().node_list_scroll_y > 0.0,
+            "the list must have scrolled, scroll_y={}",
+            harness.state().node_list_scroll_y
+        );
+        assert!(
+            harness.state().selected_row_in_view,
+            "the selected last row must be in view after arrowing down"
+        );
+        // ↓ at the bottom stays put.
+        harness.key_press(egui::Key::ArrowDown);
+        harness.run();
+        assert_eq!(harness.state().selected, Some(9));
+        // Moving the selection still works while busy (it starts
+        // nothing). run_steps, not run(): the busy spinner requests
+        // a repaint every frame, so run() never settles.
+        harness.state_mut().busy = Some(Busy::Fetching);
+        harness.key_press(egui::Key::ArrowUp);
+        harness.run_steps(5);
+        assert_eq!(
+            harness.state().selected,
+            Some(8),
+            "↑ must move the selection even while busy"
+        );
+        harness.state_mut().busy = None;
+        // Enter still connects the arrow-selected row, Ctrl+R still
+        // probes it (same busy-flag proof as the shortcut test).
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(3);
+        assert!(
+            matches!(harness.state().busy, Some(Busy::Connecting)),
+            "Enter must start a connect on the arrow-selected row, busy={:?}",
+            harness.state().busy
+        );
+        harness.state_mut().busy = None;
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::R);
+        harness.run_steps(3);
+        assert!(
+            matches!(harness.state().busy, Some(Busy::Probing)),
+            "Ctrl+R must start a probe on the arrow-selected row, busy={:?}",
             harness.state().busy
         );
     }
