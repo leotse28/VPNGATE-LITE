@@ -22,6 +22,10 @@ tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["tls12"] }
 webpki-roots = "0.26"
+# System certificate store (Windows: the Windows certificate store;
+# Linux/macOS: the usual system bundle). Loaded in addition to the
+# Mozilla roots in verified_tls_config(); see src/net.rs.
+rustls-native-certs = "0.8"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

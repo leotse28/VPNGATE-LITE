@@ -17,7 +17,7 @@
 //!
 //! [listen]
 //! addr = "127.0.0.1"
-//! local_port = 10808
+//! local_port = 10818
 //! lan_port = 10809
 //! allow_lan = false
 //!
@@ -27,6 +27,9 @@
 //!
 //! [tunnel]
 //! timeout_secs = 10
+//!
+//! [ui]
+//! node_col_widths = [90, 130, 190, 90]
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -42,6 +45,8 @@ pub struct Config {
     pub system_proxy: SystemProxy,
     #[serde(default)]
     pub tunnel: Tunnel,
+    #[serde(default)]
+    pub ui: UiSettings,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -103,7 +108,7 @@ fn default_listen_addr() -> String {
 }
 
 fn default_local_port() -> u16 {
-    10808
+    10818
 }
 
 fn default_lan_port() -> u16 {
@@ -145,13 +150,37 @@ fn default_timeout() -> u64 {
     10
 }
 
+/// GUI-only settings: no effect on the CLI.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UiSettings {
+    /// Node-list column widths in pixels (country, ISP, host:port,
+    /// latency/status). Draggable at the header separators in the GUI;
+    /// persisted with the rest of the settings via auto-save.
+    #[serde(default = "default_col_widths")]
+    pub node_col_widths: [u16; 4],
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            node_col_widths: default_col_widths(),
+        }
+    }
+}
+
+fn default_col_widths() -> [u16; 4] {
+    [90, 130, 190, 90]
+}
+
 impl Config {
     /// Directory holding this executable — the portable home for
     /// `config.toml` and `nodes_cache.json`. `None` when the exe path
     /// cannot be determined (rare; then only the working directory
     /// is used).
     pub fn portable_dir() -> Option<PathBuf> {
-        std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
     }
 
     /// `config.toml` next to the executable (portable location), whether
@@ -197,8 +226,7 @@ impl Config {
     /// Write this config as TOML to `path` (creates parent dirs if
     /// needed). Used by the GUI's "保存设置".
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let text = toml::to_string(self)
-            .map_err(|e| format!("cannot encode config: {}", e))?;
+        let text = toml::to_string(self).map_err(|e| format!("cannot encode config: {}", e))?;
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
@@ -236,7 +264,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp_path(name: &str) -> PathBuf {
-        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         std::env::temp_dir().join(format!("vpngate-cfg-test-{}-{}.toml", n, name))
     }
 
@@ -271,16 +302,20 @@ mod tests {
         let mut l = Listen::default();
         assert_eq!(
             l.listen_addrs().unwrap(),
-            vec!["127.0.0.1:10808".to_string()]
+            vec!["127.0.0.1:10818".to_string()]
         );
         l.allow_lan = true;
         assert_eq!(
             l.listen_addrs().unwrap(),
-            vec!["127.0.0.1:10808".to_string(), "0.0.0.0:10809".to_string()]
+            vec!["127.0.0.1:10818".to_string(), "0.0.0.0:10809".to_string()]
         );
-        l.lan_port = 10808;
+        l.lan_port = 10818;
         let err = l.listen_addrs().unwrap_err();
-        assert!(err.contains("不能设成一样"), "equal ports must fail loudly: {}", err);
+        assert!(
+            err.contains("不能设成一样"),
+            "equal ports must fail loudly: {}",
+            err
+        );
     }
 
     #[test]
@@ -288,6 +323,24 @@ mod tests {
         let cfg: Config = toml::from_str("[listen]\nport = 10811\n").unwrap();
         assert_eq!(cfg.listen.local_port, 10811);
         assert_eq!(cfg.listen.lan_port, 10809, "lan_port keeps its default");
+    }
+
+    #[test]
+    fn ui_col_widths_default_and_roundtrip() {
+        let cfg = Config::default();
+        assert_eq!(cfg.ui.node_col_widths, [90, 130, 190, 90]);
+        let parsed: Config =
+            toml::from_str("[ui]\nnode_col_widths = [120, 140, 200, 100]\n").unwrap();
+        assert_eq!(parsed.ui.node_col_widths, [120, 140, 200, 100]);
+        // A config file without [ui] keeps the defaults.
+        let parsed2: Config = toml::from_str("[listen]\nlocal_port = 10818\n").unwrap();
+        assert_eq!(parsed2.ui.node_col_widths, [90, 130, 190, 90]);
+        assert_eq!(parsed2.listen.local_port, 10818);
+        let path = tmp_path("ui-widths");
+        parsed.save(&path).expect("save works");
+        let back = Config::load(Some(&path)).expect("load works");
+        assert_eq!(back.ui.node_col_widths, [120, 140, 200, 100]);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -25,7 +25,11 @@ impl Drop for MockServer {
 }
 
 fn tool_exists(name: &str) -> bool {
-    Command::new("which").arg(name).output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("which")
+        .arg(name)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn ensure_cert() {
@@ -36,8 +40,19 @@ fn ensure_cert() {
     }
     let _ = Command::new("openssl")
         .args([
-            "req", "-x509", "-newkey", "rsa:2048", "-keyout", key, "-out", cert,
-            "-days", "1", "-nodes", "-subj", "/CN=localhost",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            key,
+            "-out",
+            cert,
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -63,7 +78,10 @@ fn start_mock() -> Option<MockServer> {
 
 async fn wait_for_port() -> bool {
     for _ in 0..50 {
-        if tokio::net::TcpStream::connect("127.0.0.1:8443").await.is_ok() {
+        if tokio::net::TcpStream::connect("127.0.0.1:8443")
+            .await
+            .is_ok()
+        {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -84,7 +102,10 @@ async fn gui_connect_flow_against_mock() {
             return;
         }
     };
-    assert!(wait_for_port().await, "mock SSTP server did not listen on 8443");
+    assert!(
+        wait_for_port().await,
+        "mock SSTP server did not listen on 8443"
+    );
 
     let connector = Connector::new(None);
     let timeout = Duration::from_secs(10);
@@ -102,14 +123,25 @@ async fn gui_connect_flow_against_mock() {
         .await
         .unwrap();
     let mut buf = vec![0u8; 4096];
-    let n = tokio::time::timeout(timeout, s.read(&mut buf)).await.unwrap().unwrap();
+    let n = tokio::time::timeout(timeout, s.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
     let head = String::from_utf8_lossy(&buf[..n]).to_string();
-    assert!(head.contains("204"), "generate_204 should return 204, got: {}", head);
+    assert!(
+        head.contains("204"),
+        "generate_204 should return 204, got: {}",
+        head
+    );
 
     // Local SOCKS5 server through the tunnel (the GUI's connect path).
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let socks_addr = listener.local_addr().unwrap();
-    let serve = tokio::spawn(vpngate_client::socks5::serve_socks5(listener, tunnel.clone(), timeout));
+    let serve = tokio::spawn(vpngate_client::socks5::serve_socks5(
+        listener,
+        tunnel.clone(),
+        timeout,
+    ));
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let mut client = tokio::net::TcpStream::connect(socks_addr).await.unwrap();
@@ -130,9 +162,16 @@ async fn gui_connect_flow_against_mock() {
         .await
         .unwrap();
     let mut buf2 = vec![0u8; 4096];
-    let n2 = tokio::time::timeout(timeout, client.read(&mut buf2)).await.unwrap().unwrap();
+    let n2 = tokio::time::timeout(timeout, client.read(&mut buf2))
+        .await
+        .unwrap()
+        .unwrap();
     let body = String::from_utf8_lossy(&buf2[..n2]).to_string();
-    assert!(body.contains("204"), "SOCKS5-through-tunnel should return the mock 204, got: {}", body);
+    assert!(
+        body.contains("204"),
+        "SOCKS5-through-tunnel should return the mock 204, got: {}",
+        body
+    );
 
     serve.abort();
     drop(tunnel); // last tunnel ref: writer task shuts TLS down

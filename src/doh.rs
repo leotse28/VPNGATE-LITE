@@ -16,7 +16,10 @@ const STATIC: &[(&str, &str)] = &[
 ];
 
 fn is_ipv4(s: &str) -> bool {
-    s.split('.').count() == 4 && s.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && p.parse::<u8>().is_ok())
+    s.split('.').count() == 4
+        && s.split('.').all(|p| {
+            !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && p.parse::<u8>().is_ok()
+        })
 }
 
 /// Resolve `host` to an IPv4 string.
@@ -27,7 +30,10 @@ pub async fn resolve_ipv4(connector: &Connector, host: &str) -> Result<String, S
     if let Some((_, ip)) = STATIC.iter().find(|(h, _)| *h == host) {
         return Ok(ip.to_string());
     }
-    for base in ["https://1.1.1.1/dns-query", "https://cloudflare-dns.com/dns-query"] {
+    for base in [
+        "https://1.1.1.1/dns-query",
+        "https://cloudflare-dns.com/dns-query",
+    ] {
         let url = format!("{}?name={}&type=A", base, host);
         match https_get(connector, &url, &[("Accept", "application/dns-json")], true).await {
             Ok((200, body)) => {

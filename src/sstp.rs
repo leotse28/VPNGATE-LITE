@@ -47,7 +47,14 @@ const MAX_PACKETS_ESTABLISH: usize = 200;
 fn sstp_data(ppp: &[u8]) -> Vec<u8> {
     let l = ppp.len() + 6;
     let mut f = Vec::with_capacity(l);
-    f.extend_from_slice(&[0x10, 0x00, (((l >> 8) & 0x0F) | 0x80) as u8, (l & 0xFF) as u8, 0xFF, 0x03]);
+    f.extend_from_slice(&[
+        0x10,
+        0x00,
+        (((l >> 8) & 0x0F) | 0x80) as u8,
+        (l & 0xFF) as u8,
+        0xFF,
+        0x03,
+    ]);
     f.extend_from_slice(ppp);
     f
 }
@@ -125,7 +132,11 @@ fn find_opt<'a>(d: &'a [u8], t: u8) -> Option<&'a [u8]> {
 /// Parse a PPP payload (after the SSTP data header).
 /// Returns (protocol, code, id, payload, raw_frame).
 fn parse_link(d: &[u8]) -> Option<(u16, u8, u8, &[u8], &[u8])> {
-    let o = if d.len() >= 2 && d[0] == 0xFF && d[1] == 0x03 { 2 } else { 0 };
+    let o = if d.len() >= 2 && d[0] == 0xFF && d[1] == 0x03 {
+        2
+    } else {
+        0
+    };
     if d.len() - o < 4 {
         return None;
     }
@@ -161,7 +172,10 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             let mut tmp = [0u8; 4096];
             let r = self.inner.read(&mut tmp).await?;
             if r == 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "SSTP stream closed"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "SSTP stream closed",
+                ));
             }
             self.buf.extend_from_slice(&tmp[..r]);
         }
@@ -173,7 +187,10 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
         let hd = self.read_exact_buf(4).await?;
         let total = (u16be(&hd, 2) & 0x0FFF) as usize;
         if total < 4 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad SSTP length"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad SSTP length",
+            ));
         }
         let body = self.read_exact_buf(total - 4).await?;
         Ok(((hd[1] & 1) == 1, body))
@@ -183,13 +200,18 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
         loop {
             if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = self.buf.drain(..=pos).collect();
-                let s = String::from_utf8_lossy(&line).trim_end_matches(|c| c == '\r' || c == '\n').to_string();
+                let s = String::from_utf8_lossy(&line)
+                    .trim_end_matches(|c| c == '\r' || c == '\n')
+                    .to_string();
                 return Ok(s);
             }
             let mut tmp = [0u8; 4096];
             let r = self.inner.read(&mut tmp).await?;
             if r == 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "SSTP stream closed while reading line"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "SSTP stream closed while reading line",
+                ));
             }
             self.buf.extend_from_slice(&tmp[..r]);
         }
@@ -200,7 +222,11 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
 // PPP establish (port of JS `establish`).
 // ---------------------------------------------------------------------------
 
-async fn ppp_establish<R, W>(reader: &mut PacketReader<R>, writer: &mut W, host: &str) -> Result<Ipv4Addr, String>
+async fn ppp_establish<R, W>(
+    reader: &mut PacketReader<R>,
+    writer: &mut W,
+    host: &str,
+) -> Result<Ipv4Addr, String>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -226,12 +252,18 @@ where
         .await
         .map_err(|e| format!("SSTP write failed: {}", e))?;
 
-    let status = reader.read_line().await.map_err(|e| format!("SSTP status read failed: {}", e))?;
+    let status = reader
+        .read_line()
+        .await
+        .map_err(|e| format!("SSTP status read failed: {}", e))?;
     if !status.contains("200") {
         return Err(format!("SSTP server did not return 200 (got: {})", status));
     }
     loop {
-        let line = reader.read_line().await.map_err(|e| format!("SSTP header read failed: {}", e))?;
+        let line = reader
+            .read_line()
+            .await
+            .map_err(|e| format!("SSTP header read failed: {}", e))?;
         if line.is_empty() {
             break;
         }
@@ -239,7 +271,10 @@ where
 
     let mut authed = false;
     for _ in 0..MAX_PACKETS_ESTABLISH {
-        let (ctrl, body) = reader.read_packet().await.map_err(|e| format!("SSTP packet read failed: {}", e))?;
+        let (ctrl, body) = reader
+            .read_packet()
+            .await
+            .map_err(|e| format!("SSTP packet read failed: {}", e))?;
         if ctrl {
             if body.len() >= 2 && u16be(&body, 0) == 0x0008 {
                 // Echo request -> echo reply.
@@ -265,7 +300,10 @@ where
                     out.extend_from_slice(&sstp_data(&pap_frame(next_id(), "vpn", "vpn")));
                     authed = true;
                 }
-                writer.write_all(&out).await.map_err(|e| format!("LCP ack failed: {}", e))?;
+                writer
+                    .write_all(&out)
+                    .await
+                    .map_err(|e| format!("LCP ack failed: {}", e))?;
             } else if code == 2 {
                 if !authed {
                     writer
@@ -277,21 +315,33 @@ where
             } else if code == 9 {
                 let mut rep = raw.to_vec();
                 rep[2] = 10;
-                writer.write_all(&sstp_data(&rep)).await.map_err(|e| format!("LCP reply failed: {}", e))?;
+                writer
+                    .write_all(&sstp_data(&rep))
+                    .await
+                    .map_err(|e| format!("LCP reply failed: {}", e))?;
             }
         } else if proto == PPP_PAP && code == 2 {
             // Authenticate-Ack -> ask for an IP (IPCP Configure-Request).
             let req = link_frame(PPP_IPCP, 1, next_id(), &[(3, &[0, 0, 0, 0])]);
-            writer.write_all(&sstp_data(&req)).await.map_err(|e| format!("IPCP request failed: {}", e))?;
+            writer
+                .write_all(&sstp_data(&req))
+                .await
+                .map_err(|e| format!("IPCP request failed: {}", e))?;
         } else if proto == PPP_IPCP {
             if code == 1 {
                 let mut ack = raw.to_vec();
                 ack[2] = 2;
-                writer.write_all(&sstp_data(&ack)).await.map_err(|e| format!("IPCP ack failed: {}", e))?;
+                writer
+                    .write_all(&sstp_data(&ack))
+                    .await
+                    .map_err(|e| format!("IPCP ack failed: {}", e))?;
             } else if code == 3 {
                 if let Some(o) = find_opt(payload, 3) {
                     let req = link_frame(PPP_IPCP, 1, next_id(), &[(3, o)]);
-                    writer.write_all(&sstp_data(&req)).await.map_err(|e| format!("IPCP retry failed: {}", e))?;
+                    writer
+                        .write_all(&sstp_data(&req))
+                        .await
+                        .map_err(|e| format!("IPCP retry failed: {}", e))?;
                 }
             } else if code == 2 {
                 if let Some(o) = find_opt(payload, 3) {
@@ -395,7 +445,16 @@ struct Session {
 impl Session {
     fn send_ack(&self, tx: &mpsc::UnboundedSender<Vec<u8>>, vip: Ipv4Addr) {
         if let Ok(st) = self.state.try_lock() {
-            let frame = tcp_frame(vip, self.dst_ip, self.src_port, self.dst_port, st.seq, st.ack, 0x10, &[]);
+            let frame = tcp_frame(
+                vip,
+                self.dst_ip,
+                self.src_port,
+                self.dst_port,
+                st.seq,
+                st.ack,
+                0x10,
+                &[],
+            );
             let _ = tx.send(frame);
         }
     }
@@ -468,7 +527,13 @@ impl AsyncRead for TunnelStream {
                 }
                 Poll::Ready(None) => return Poll::Ready(Ok(())), // EOF
                 Poll::Pending => {
-                    if self.session.state.try_lock().map(|s| s.closed).unwrap_or(false) {
+                    if self
+                        .session
+                        .state
+                        .try_lock()
+                        .map(|s| s.closed)
+                        .unwrap_or(false)
+                    {
                         return Poll::Ready(Ok(()));
                     }
                     return Poll::Pending;
@@ -525,11 +590,17 @@ impl AsyncWrite for TunnelStream {
         Poll::Ready(Ok(sent))
     }
 
-    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         let already = {
             let mut st = match self.session.state.try_lock() {
                 Ok(g) => g,
@@ -810,7 +881,9 @@ impl SstpTunnel {
             return Err("tunnel is dead".to_string());
         }
         let dst_ip_str = resolve_ipv4(&self.connector, dst_host).await?;
-        let dst_ip: Ipv4Addr = dst_ip_str.parse().map_err(|_| format!("bad resolved IP {}", dst_ip_str))?;
+        let dst_ip: Ipv4Addr = dst_ip_str
+            .parse()
+            .map_err(|_| format!("bad resolved IP {}", dst_ip_str))?;
         // Allocate a unique source port.
         let src_port = loop {
             let rb = random_bytes(2);
@@ -883,7 +956,10 @@ impl SstpTunnel {
             }
             if waited.is_err() && attempts >= 4 {
                 self.remove_session(src_port);
-                return Err(format!("TCP handshake to {}:{} timed out after {} attempts", dst_host, dst_port, attempts));
+                return Err(format!(
+                    "TCP handshake to {}:{} timed out after {} attempts",
+                    dst_host, dst_port, attempts
+                ));
             }
             if waited.is_err() {
                 continue; // retransmit SYN

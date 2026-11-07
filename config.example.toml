@@ -12,7 +12,7 @@ addr = "127.0.0.1:1080"
 # 本地 SOCKS5 监听（隧道起来后，浏览器/应用连这里）。
 [listen]
 addr = "127.0.0.1"
-local_port = 10808
+local_port = 10818
 # lan_port 是局域网分享的端口：allow_lan = true 时额外绑 0.0.0.0:lan_port，
 # 和本地端口可以设成不一样的（默认 10809）；两个端口不能设成一样。
 lan_port = 10809

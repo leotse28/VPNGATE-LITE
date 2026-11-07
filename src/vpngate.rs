@@ -233,9 +233,7 @@ fn valid_ddns_host(host: &str) -> bool {
     }
     base.split('.').all(|label| {
         !label.is_empty()
-            && label
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
             && !label.starts_with('-')
             && !label.ends_with('-')
     })
@@ -251,7 +249,7 @@ fn extract_hosts(row: &str) -> Vec<(String, Option<u16>)> {
     let mut search_from = 0usize;
     while let Some(rel) = row[search_from..].find(".opengw.net") {
         let end = search_from + rel; // index just past the hostname
-        // Walk back over hostname characters.
+                                     // Walk back over hostname characters.
         let mut start = end;
         while start > 0 {
             let c = bytes[start - 1] as char;
@@ -496,7 +494,10 @@ struct CachedList {
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// `nodes_cache.json` next to the executable (portable location).
@@ -516,7 +517,10 @@ pub fn save_cached_nodes(nodes: &[Node]) -> Result<(), String> {
 
 /// Path-taking core of `save_cached_nodes` (tests use a temp path).
 pub fn save_cached_nodes_to(path: &std::path::Path, nodes: &[Node]) -> Result<(), String> {
-    let payload = CachedList { fetched_at: now_unix(), nodes: nodes.to_vec() };
+    let payload = CachedList {
+        fetched_at: now_unix(),
+        nodes: nodes.to_vec(),
+    };
     let text = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
     std::fs::write(path, text).map_err(|e| format!("cannot write {}: {}", path.display(), e))
 }
@@ -569,13 +573,18 @@ mod tests {
         let nodes = curated_nodes();
         assert_eq!(nodes.len(), 28);
         assert!(nodes.iter().all(|n| n.port.is_some()));
-        assert!(nodes.iter().any(|n| n.host == "kanratown.opengw.net" && n.port == Some(992)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.host == "kanratown.opengw.net" && n.port == Some(992)));
     }
 
     #[test]
     fn node_cache_roundtrip() {
         let dir = std::env::temp_dir();
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = dir.join(format!("vpngate-cache-test-{}.json", stamp));
         let mut nodes = curated_nodes();
         nodes.truncate(3);
@@ -622,10 +631,18 @@ mod tests {
         assert_eq!(nodes[0].source, "web-scrape");
         assert_eq!(nodes[1].host, "vpn678091301.opengw.net");
         assert_eq!(nodes[1].country, "United States");
-        assert_eq!(nodes[1].port, Some(1427), "explicit SSTP port from the MS-SSTP cell");
+        assert_eq!(
+            nodes[1].port,
+            Some(1427),
+            "explicit SSTP port from the MS-SSTP cell"
+        );
         // kanratown is in the curated table with known port 992.
         assert_eq!(nodes[2].host, "kanratown.opengw.net");
-        assert_eq!(nodes[2].port, Some(992), "curated port beats the scraped default");
+        assert_eq!(
+            nodes[2].port,
+            Some(992),
+            "curated port beats the scraped default"
+        );
         assert_eq!(nodes[2].port_source, "curated");
         // Row with an empty MS-SSTP cell still yields a node on port 443.
         assert_eq!(nodes[3].host, "vpn395062778.opengw.net");
@@ -688,11 +705,8 @@ mod tests {
         assert_eq!(src, NodeListSource::WebScrape);
         assert_eq!(nodes[0].host, "web.opengw.net");
         // Both empty -> cache, with its age.
-        let (nodes, src, age) = pick_node_list(
-            None,
-            None,
-            Some((vec![one("cache.opengw.net")], 7200)),
-        );
+        let (nodes, src, age) =
+            pick_node_list(None, None, Some((vec![one("cache.opengw.net")], 7200)));
         assert_eq!(src, NodeListSource::Cache);
         assert_eq!(nodes[0].host, "cache.opengw.net");
         assert_eq!(age, Some(7200));
@@ -750,4 +764,3 @@ pub fn resolve_target(target: &str) -> Vec<(String, u16)> {
         .map(|p| (target.to_string(), *p))
         .collect()
 }
-

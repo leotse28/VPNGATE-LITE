@@ -41,7 +41,7 @@ fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
 }
 
 impl SystemProxyGuard {
-    /// Set the system proxy to `listen` (e.g. "127.0.0.1:10808").
+    /// Set the system proxy to `listen` (e.g. "127.0.0.1:10818").
     /// Returns a guard; dropping the guard does NOT unset — call
     /// [`SystemProxyGuard::unset`] explicitly on clean shutdown.
     pub fn set(listen: &str, service: Option<&str>) -> Result<Self, String> {
@@ -67,15 +67,54 @@ impl SystemProxyGuard {
 #[cfg(target_os = "windows")]
 fn set_impl(listen: &str, _service: Option<&str>) -> Result<String, String> {
     let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-    run("reg", &["add", key, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f"])?;
-    run("reg", &["add", key, "/v", "ProxyServer", "/t", "REG_SZ", "/d", listen, "/f"])?;
+    run(
+        "reg",
+        &[
+            "add",
+            key,
+            "/v",
+            "ProxyEnable",
+            "/t",
+            "REG_DWORD",
+            "/d",
+            "1",
+            "/f",
+        ],
+    )?;
+    run(
+        "reg",
+        &[
+            "add",
+            key,
+            "/v",
+            "ProxyServer",
+            "/t",
+            "REG_SZ",
+            "/d",
+            listen,
+            "/f",
+        ],
+    )?;
     Ok(format!("Windows system proxy -> {}", listen))
 }
 
 #[cfg(target_os = "windows")]
 fn unset_impl(_listen: &str, _service: Option<&str>) -> Result<String, String> {
     let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-    run("reg", &["add", key, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f"])?;
+    run(
+        "reg",
+        &[
+            "add",
+            key,
+            "/v",
+            "ProxyEnable",
+            "/t",
+            "REG_DWORD",
+            "/d",
+            "0",
+            "/f",
+        ],
+    )?;
     Ok("Windows system proxy disabled".to_string())
 }
 
@@ -103,9 +142,21 @@ fn set_impl(listen: &str, _service: Option<&str>) -> Result<String, String> {
     // GNOME gsettings, if present and usable.
     if Command::new("gsettings").arg("--version").output().is_ok() {
         let (host, port) = listen.split_once(':').ok_or("bad listen addr")?;
-        let ok = run("gsettings", &["set", "org.gnome.system.proxy", "mode", "manual"]).is_ok()
-            && run("gsettings", &["set", "org.gnome.system.proxy.socks", "host", host]).is_ok()
-            && run("gsettings", &["set", "org.gnome.system.proxy.socks", "port", port]).is_ok();
+        let ok = run(
+            "gsettings",
+            &["set", "org.gnome.system.proxy", "mode", "manual"],
+        )
+        .is_ok()
+            && run(
+                "gsettings",
+                &["set", "org.gnome.system.proxy.socks", "host", host],
+            )
+            .is_ok()
+            && run(
+                "gsettings",
+                &["set", "org.gnome.system.proxy.socks", "port", port],
+            )
+            .is_ok();
         if ok {
             return Ok(format!("GNOME system proxy (SOCKS) -> {}", listen));
         }
@@ -122,9 +173,17 @@ fn set_impl(listen: &str, _service: Option<&str>) -> Result<String, String> {
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn unset_impl(_listen: &str, _service: Option<&str>) -> Result<String, String> {
     if Command::new("gsettings").arg("--version").output().is_ok() {
-        if run("gsettings", &["set", "org.gnome.system.proxy", "mode", "auto"]).is_ok() {
+        if run(
+            "gsettings",
+            &["set", "org.gnome.system.proxy", "mode", "auto"],
+        )
+        .is_ok()
+        {
             return Ok("GNOME system proxy set back to auto".to_string());
         }
     }
-    Ok("nothing to restore (no usable gsettings); unset the exported variables yourself".to_string())
+    Ok(
+        "nothing to restore (no usable gsettings); unset the exported variables yourself"
+            .to_string(),
+    )
 }

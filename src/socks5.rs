@@ -3,7 +3,7 @@
 //!   configured — the TCP connection to the VPNGate node (and to
 //!   vpngate.net / DoH) goes through it.
 //! * **Server** (`serve_socks5`): after the tunnel is up, a local
-//!   SOCKS5 listener (default 127.0.0.1:10808) forwards each accepted
+//!   SOCKS5 listener (default 127.0.0.1:10818) forwards each accepted
 //!   TCP connection through the tunnel as its own userspace TCP session.
 
 use crate::sstp::SstpTunnel;
@@ -27,7 +27,10 @@ pub async fn socks5_connect(
         let mut resp = [0u8; 2];
         s.read_exact(&mut resp).await?;
         if resp != [0x05, 0x02] {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "SOCKS5 proxy rejected username/password auth"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "SOCKS5 proxy rejected username/password auth",
+            ));
         }
         let mut auth = vec![0x01, u.len() as u8];
         auth.extend_from_slice(u.as_bytes());
@@ -37,14 +40,20 @@ pub async fn socks5_connect(
         let mut aresp = [0u8; 2];
         s.read_exact(&mut aresp).await?;
         if aresp != [0x01, 0x00] {
-            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "SOCKS5 proxy authentication failed"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "SOCKS5 proxy authentication failed",
+            ));
         }
     } else {
         s.write_all(&[0x05, 0x01, 0x00]).await?;
         let mut resp = [0u8; 2];
         s.read_exact(&mut resp).await?;
         if resp != [0x05, 0x00] {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "SOCKS5 proxy rejected no-auth"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "SOCKS5 proxy rejected no-auth",
+            ));
         }
     }
     // CONNECT, address type 3 (domain).
@@ -69,7 +78,10 @@ pub async fn socks5_connect(
         }
         0x04 => 16,
         _ => {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad SOCKS5 reply address type"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad SOCKS5 reply address type",
+            ));
         }
     };
     let mut rest = vec![0u8; skip + 2];
@@ -107,23 +119,40 @@ async fn handle_socks5_conn(
 ) -> Result<(), String> {
     // Greeting.
     let mut hdr = [0u8; 2];
-    local.read_exact(&mut hdr).await.map_err(|e| e.to_string())?;
+    local
+        .read_exact(&mut hdr)
+        .await
+        .map_err(|e| e.to_string())?;
     if hdr[0] != 0x05 {
         return Err("not a SOCKS5 client".to_string());
     }
     let n = hdr[1] as usize;
     let mut methods = vec![0u8; n];
-    local.read_exact(&mut methods).await.map_err(|e| e.to_string())?;
+    local
+        .read_exact(&mut methods)
+        .await
+        .map_err(|e| e.to_string())?;
     if !methods.contains(&0x00) {
-        local.write_all(&[0x05, 0xFF]).await.map_err(|e| e.to_string())?;
+        local
+            .write_all(&[0x05, 0xFF])
+            .await
+            .map_err(|e| e.to_string())?;
         return Err("SOCKS5 client offered no no-auth method".to_string());
     }
-    local.write_all(&[0x05, 0x00]).await.map_err(|e| e.to_string())?;
+    local
+        .write_all(&[0x05, 0x00])
+        .await
+        .map_err(|e| e.to_string())?;
     // Request.
     let mut rhdr = [0u8; 4];
-    local.read_exact(&mut rhdr).await.map_err(|e| e.to_string())?;
+    local
+        .read_exact(&mut rhdr)
+        .await
+        .map_err(|e| e.to_string())?;
     if rhdr[0] != 0x05 || rhdr[1] != 0x01 {
-        let _ = local.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+        let _ = local
+            .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
         return Err(format!("unsupported SOCKS5 command {}", rhdr[1]));
     }
     let (host, port) = match rhdr[3] {
@@ -145,22 +174,30 @@ async fn handle_socks5_conn(
             (name, p)
         }
         0x04 => {
-            let _ = local.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+            let _ = local
+                .write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
             return Err("IPv6 targets are not supported by the tunnel (IPv4 only)".to_string());
         }
         t => {
-            let _ = local.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+            let _ = local
+                .write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
             return Err(format!("unsupported SOCKS5 address type {}", t));
         }
     };
     if tunnel.is_dead() {
-        let _ = local.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+        let _ = local
+            .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
         return Err("tunnel is dead".to_string());
     }
     let mut remote = match tunnel.open_stream(&host, port, timeout).await {
         Ok(s) => s,
         Err(e) => {
-            let _ = local.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+            let _ = local
+                .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
             return Err(format!("tunnel TCP to {}:{} failed: {}", host, port, e));
         }
     };

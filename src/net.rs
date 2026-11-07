@@ -2,13 +2,18 @@
 //! and a minimal HTTPS GET client built on tokio-rustls.
 //!
 //! Two TLS modes exist on purpose:
-//! * **Verified** (Mozilla roots) for `vpngate.net` and DoH endpoints.
+//! * **Verified** (Mozilla roots **plus the OS system certificate
+//!   store**) for `vpngate.net` and DoH endpoints. The system store
+//!   matters because a network that intercepts TLS with a locally
+//!   trusted CA (browsers trust it — they read the system store)
+//!   would otherwise fail Mozilla-roots-only verification.
 //! * **Accept-any** for VPNGate nodes: SoftEther nodes use self-signed
 //!   certificates, so verification would always fail (the Python reference
 //!   probe also disables verification). This is documented in the README.
 
 use crate::config::FrontProxy;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -39,20 +44,56 @@ impl Connector {
     /// TCP connect to `host:port`, direct or via the front SOCKS5 proxy.
     pub async fn connect_tcp(&self, host: &str, port: u16) -> std::io::Result<TcpStream> {
         match &self.front {
-            Some(fp) => crate::socks5::socks5_connect(&fp.addr, host, port, fp.username.as_deref(), fp.password.as_deref()).await,
+            Some(fp) => {
+                crate::socks5::socks5_connect(
+                    &fp.addr,
+                    host,
+                    port,
+                    fp.username.as_deref(),
+                    fp.password.as_deref(),
+                )
+                .await
+            }
             None => TcpStream::connect((host, port)).await,
         }
     }
 }
 
-/// Build a verified rustls client config (Mozilla roots).
+/// Build a verified rustls client config: Mozilla roots **plus** the OS
+/// system certificate store (Windows: the Windows certificate store;
+/// other platforms: the usual system bundle, when one exists).
+///
+/// Why the system store: Leo's network path intercepts TLS with a CA
+/// that is trusted by the OS — Chrome trusts it because browsers read
+/// the system store — while Mozilla-roots-only verification rejected
+/// it, so both refresh tiers failed even though the same URLs open
+/// fine in the browser through the same front proxy. Adding the
+/// system store makes the program trust what the browser trusts.
+/// When no system store is available (or it loads nothing), the
+/// Mozilla roots still apply, so verification is never weakened — it
+/// only gains roots the OS already trusts. The accept-any config used
+/// for VPNGate nodes is untouched by this change.
 pub fn verified_tls_config() -> Arc<ClientConfig> {
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let cfg = ClientConfig::builder()
-        .with_root_certificates(roots)
+        .with_root_certificates(verified_roots())
         .with_no_client_auth();
     Arc::new(cfg)
+}
+
+/// The root store behind [`verified_tls_config`]: the Mozilla roots,
+/// then every certificate the OS system store provides. Duplicates
+/// (a root in both sets) are ignored — `add` fails on them and the
+/// error is dropped on purpose.
+fn verified_roots() -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // load_native_certs() never fails outright: it returns whatever
+    // the store gave plus a list of per-cert errors (empty store →
+    // empty list, and the Mozilla roots above still apply).
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(cert);
+    }
+    roots
 }
 
 /// Build an accept-any rustls client config (self-signed VPNGate nodes).
@@ -76,7 +117,8 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for AcceptAnyVerif
         _server_name: &tokio_rustls::rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         _now: tokio_rustls::rustls::pki_types::UnixTime,
-    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error> {
+    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error>
+    {
         Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -85,7 +127,10 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for AcceptAnyVerif
         _message: &[u8],
         _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
         _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
         Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -94,7 +139,10 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for AcceptAnyVerif
         _message: &[u8],
         _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
         _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
         Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -122,15 +170,20 @@ pub async fn https_get(
     extra_headers: &[(&str, &str)],
     verify: bool,
 ) -> Result<(u16, Vec<u8>), String> {
-    let rest = url.strip_prefix("https://").ok_or("https_get: only https:// URLs supported")?;
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or("https_get: only https:// URLs supported")?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
     let (host, port) = match authority.rfind(':') {
-        Some(i) if authority[i + 1..].chars().all(|c| c.is_ascii_digit()) => {
-            (&authority[..i], authority[i + 1..].parse::<u16>().map_err(|_| "bad port in URL")?)
-        }
+        Some(i) if authority[i + 1..].chars().all(|c| c.is_ascii_digit()) => (
+            &authority[..i],
+            authority[i + 1..]
+                .parse::<u16>()
+                .map_err(|_| "bad port in URL")?,
+        ),
         _ => (authority, 443),
     };
     let tcp = connector
@@ -148,7 +201,10 @@ pub async fn https_get(
         .connect(server_name, tcp)
         .await
         .map_err(|e| format!("TLS handshake to {} failed: {}", host, e))?;
-    let mut req = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: vpngate-client/0.1\r\n", path, authority);
+    let mut req = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: vpngate-client/0.1\r\n",
+        path, authority
+    );
     for (k, v) in extra_headers {
         req.push_str(&format!("{}: {}\r\n", k, v));
     }
@@ -161,7 +217,8 @@ pub async fn https_get(
         .await
         .map_err(|e| format!("HTTPS read failed: {}", e))?;
     // Split headers / body.
-    let split = find_subslice(&raw, b"\r\n\r\n").ok_or("HTTPS response has no header terminator")?;
+    let split =
+        find_subslice(&raw, b"\r\n\r\n").ok_or("HTTPS response has no header terminator")?;
     let head = String::from_utf8_lossy(&raw[..split]).to_string();
     let status: u16 = head
         .lines()
@@ -179,6 +236,308 @@ pub async fn https_get(
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+// ---------------------------------------------------------------------------
+// Front-proxy diagnostics: is the proxy itself up, and can the target
+// be reached through it? The two questions have different fixes, so the
+// test reports them separately instead of one generic "failed".
+// ---------------------------------------------------------------------------
+
+/// Outcome of testing one HTTPS URL through the (optional) front proxy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontProxyCheck {
+    /// The URL answered (HTTP status + round-trip time).
+    Reachable { status: u16, ms: u128 },
+    /// The front proxy itself is unreachable (its port does not answer,
+    /// or the SOCKS5 handshake / auth was rejected). `String` is the
+    /// underlying error, already worded for the log.
+    ProxyUnreachable(String),
+    /// The proxy is up, but the target did not answer through it.
+    TargetUnreachable(String),
+}
+
+/// Direct TCP connect to the front proxy (no SOCKS5 handshake): proves
+/// the proxy port is listening. Returns `None` when no front proxy is
+/// configured, `Some(true)` when the port answers, `Some(false)` when
+/// it does not (down, wrong address, LAN not reachable).
+pub async fn check_front_proxy_tcp(connector: &Connector, timeout: Duration) -> Option<bool> {
+    let fp = connector.front.as_ref()?;
+    let res = tokio::time::timeout(timeout, TcpStream::connect(&fp.addr)).await;
+    Some(matches!(res, Ok(Ok(_))))
+}
+
+/// Classify an `https_get` failure. `proxy_tcp` is the result of
+/// `check_front_proxy_tcp`: `None` when no front proxy is configured
+/// (then every failure is the target's), `Some(true/false)` when one
+/// is configured and its port did/did not answer.
+pub fn classify_https_get_error(err: &str, proxy_tcp: Option<bool>) -> FrontProxyCheck {
+    // The proxy answered and tried, but could not reach the target
+    // (connection refused / host unreachable / network unreachable
+    // on the proxy's side): the proxy is up, the target is the problem.
+    if err.contains("SOCKS5 proxy CONNECT failed") {
+        return FrontProxyCheck::TargetUnreachable(format!(
+            "代理已接受请求，但连不上目标站：{}",
+            err
+        ));
+    }
+    // Auth / method rejection happens at the proxy itself.
+    if err.contains("SOCKS5 proxy rejected") || err.contains("SOCKS5 proxy authentication failed") {
+        return FrontProxyCheck::ProxyUnreachable(format!(
+            "代理拒绝了连接（认证/方式不对）：{}",
+            err
+        ));
+    }
+    if err.starts_with("TCP connect to ") {
+        return match proxy_tcp {
+            // No proxy configured: the direct connect to the target failed.
+            None => FrontProxyCheck::TargetUnreachable(format!("直连目标站失败：{}", err)),
+            // Proxy port answers, but the SOCKS5 handshake broke
+            // mid-flight: the proxy is the problem, not the target.
+            Some(true) => FrontProxyCheck::ProxyUnreachable(format!(
+                "代理端口能连上，但 SOCKS5 握手失败：{}",
+                err
+            )),
+            // Proxy port does not answer at all.
+            Some(false) => {
+                FrontProxyCheck::ProxyUnreachable(format!("连前置代理端口失败：{}", err))
+            }
+        };
+    }
+    // TLS handshake / HTTP write / read / parse: the TCP pipe through
+    // the proxy was established, so the target is at fault.
+    FrontProxyCheck::TargetUnreachable(format!("代理建好连接后目标站无响应：{}", err))
+}
+
+/// Test one HTTPS URL through `connector`, distinguishing "the front
+/// proxy itself is down" from "the proxy is up but the target does not
+/// answer through it". This is SOCKS5-proxy connectivity, not ICMP ping.
+pub async fn test_url_through_proxy(
+    connector: &Connector,
+    url: &str,
+    timeout: Duration,
+) -> FrontProxyCheck {
+    let start = Instant::now();
+    let proxy_tcp = check_front_proxy_tcp(connector, timeout).await;
+    match tokio::time::timeout(timeout, https_get(connector, url, &[], true)).await {
+        Ok(Ok((status, _))) => FrontProxyCheck::Reachable {
+            status,
+            ms: start.elapsed().as_millis(),
+        },
+        Ok(Err(e)) => classify_https_get_error(&e, proxy_tcp),
+        Err(_) => {
+            // The whole request timed out: blame the proxy only when a
+            // direct TCP connect to it also failed/timed out; otherwise
+            // the target (or the proxy's path to it) is slow/dead.
+            if proxy_tcp == Some(false) {
+                FrontProxyCheck::ProxyUnreachable("连接前置代理超时".to_string())
+            } else {
+                FrontProxyCheck::TargetUnreachable("请求超时，目标站无响应".to_string())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    fn connector_with_proxy(addr: &str) -> Connector {
+        let mut fp = FrontProxy::default();
+        fp.enabled = true;
+        fp.addr = addr.to_string();
+        Connector::new(Some(fp))
+    }
+
+    /// A port that (almost certainly) has nothing listening: bind an
+    /// ephemeral port, then drop the listener.
+    fn closed_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    /// Fake SOCKS5 proxy: accepts connections (a real proxy serves many;
+    /// the test below also opens a TCP pre-check connection first), then
+    /// per connection either refuses the CONNECT (`"refuse"`) or drops
+    /// the connection mid-handshake (`"hangup"`). Returns its port.
+    async fn fake_socks5(mode: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(handle_fake_conn(s, mode));
+            }
+        });
+        port
+    }
+
+    async fn handle_fake_conn(mut s: tokio::net::TcpStream, mode: &'static str) {
+        if mode == "hangup" {
+            return; // drop: the client's handshake read fails
+        }
+        let mut g = [0u8; 3];
+        if s.read_exact(&mut g).await.is_err() {
+            return;
+        }
+        if s.write_all(&[0x05, 0x00]).await.is_err() {
+            return;
+        }
+        let mut h = [0u8; 4];
+        if s.read_exact(&mut h).await.is_err() {
+            return;
+        }
+        let skip = match h[3] {
+            0x01 => 4,
+            0x03 => {
+                let mut l = [0u8; 1];
+                if s.read_exact(&mut l).await.is_err() {
+                    return;
+                }
+                l[0] as usize
+            }
+            0x04 => 16,
+            _ => return,
+        };
+        let mut rest = vec![0u8; skip + 2];
+        if s.read_exact(&mut rest).await.is_err() {
+            return;
+        }
+        // CONNECT refused (0x05): the proxy is up, the target is not.
+        let _ = s
+            .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    #[test]
+    fn verified_roots_add_system_store_on_top_of_mozilla() {
+        let mozilla = webpki_roots::TLS_SERVER_ROOTS.len();
+        let roots = verified_roots();
+        // Never fewer than the Mozilla set: a missing/empty system
+        // store must fall back to Mozilla roots only, not break the
+        // verified config.
+        assert!(
+            roots.len() >= mozilla,
+            "verified roots {} < Mozilla roots {}",
+            roots.len(),
+            mozilla
+        );
+        // Report the split for diagnosis; the system store usually
+        // overlaps the Mozilla set, so no assertion on the extra count.
+        let native = rustls_native_certs::load_native_certs();
+        eprintln!(
+            "Mozilla roots: {}, system certs: {} ({} load errors), verified roots total: {}",
+            mozilla,
+            native.certs.len(),
+            native.errors.len(),
+            roots.len()
+        );
+    }
+
+    #[test]
+    fn classify_https_errors_split_proxy_from_target() {
+        // No proxy configured: a TCP failure is the target's fault.
+        assert!(matches!(
+            classify_https_get_error(
+                "TCP connect to www.google.com:443 failed: connection refused",
+                None
+            ),
+            FrontProxyCheck::TargetUnreachable(_)
+        ));
+        // Proxy port does not answer: the proxy is the problem.
+        assert!(matches!(
+            classify_https_get_error(
+                "TCP connect to www.google.com:443 failed: connection refused",
+                Some(false)
+            ),
+            FrontProxyCheck::ProxyUnreachable(_)
+        ));
+        // Proxy port answers but the SOCKS5 handshake breaks: proxy-side.
+        assert!(matches!(
+            classify_https_get_error(
+                "TCP connect to www.google.com:443 failed: unexpected end of file",
+                Some(true)
+            ),
+            FrontProxyCheck::ProxyUnreachable(_)
+        ));
+        // Proxy refused the CONNECT: proxy up, target down.
+        assert!(matches!(
+            classify_https_get_error(
+                "TCP connect to www.google.com:443 failed: SOCKS5 proxy CONNECT failed, reply code 0x05",
+                Some(true)
+            ),
+            FrontProxyCheck::TargetUnreachable(_)
+        ));
+        // Auth rejected at the proxy: proxy-side.
+        assert!(matches!(
+            classify_https_get_error(
+                "TCP connect to www.google.com:443 failed: SOCKS5 proxy authentication failed",
+                Some(true)
+            ),
+            FrontProxyCheck::ProxyUnreachable(_)
+        ));
+        // TLS / HTTP stages: the pipe through the proxy was up.
+        assert!(matches!(
+            classify_https_get_error(
+                "TLS handshake to www.google.com failed: bad cert",
+                Some(true)
+            ),
+            FrontProxyCheck::TargetUnreachable(_)
+        ));
+        assert!(matches!(
+            classify_https_get_error("HTTPS read failed: connection reset", Some(true)),
+            FrontProxyCheck::TargetUnreachable(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_front_proxy_tcp_detects_dead_and_live_ports() {
+        let dead = connector_with_proxy(&format!("127.0.0.1:{}", closed_port()));
+        assert_eq!(
+            check_front_proxy_tcp(&dead, Duration::from_secs(3)).await,
+            Some(false),
+            "nothing listens on the dead port"
+        );
+        let live_port = fake_socks5("hangup").await;
+        let live = connector_with_proxy(&format!("127.0.0.1:{}", live_port));
+        assert_eq!(
+            check_front_proxy_tcp(&live, Duration::from_secs(3)).await,
+            Some(true),
+            "the fake proxy accepts TCP"
+        );
+        assert_eq!(
+            check_front_proxy_tcp(&Connector::new(None), Duration::from_secs(3)).await,
+            None,
+            "no proxy configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_url_through_proxy_classifies_mock_proxies() {
+        let timeout = Duration::from_secs(5);
+        // Dead proxy: proxy itself unreachable.
+        let dead = connector_with_proxy(&format!("127.0.0.1:{}", closed_port()));
+        assert!(matches!(
+            test_url_through_proxy(&dead, "https://www.google.com", timeout).await,
+            FrontProxyCheck::ProxyUnreachable(_)
+        ));
+        // Proxy accepts TCP but hangs up mid-handshake: proxy-side.
+        let hangup = connector_with_proxy(&format!("127.0.0.1:{}", fake_socks5("hangup").await));
+        assert!(matches!(
+            test_url_through_proxy(&hangup, "https://www.google.com", timeout).await,
+            FrontProxyCheck::ProxyUnreachable(_)
+        ));
+        // Proxy refuses the CONNECT: proxy up, target unreachable.
+        let refusing = connector_with_proxy(&format!("127.0.0.1:{}", fake_socks5("refuse").await));
+        assert!(matches!(
+            test_url_through_proxy(&refusing, "https://www.google.com", timeout).await,
+            FrontProxyCheck::TargetUnreachable(_)
+        ));
+    }
 }
 
 fn dechunk(body: &[u8]) -> Result<Vec<u8>, String> {

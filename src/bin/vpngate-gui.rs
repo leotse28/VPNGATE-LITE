@@ -7,12 +7,12 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use eframe::egui;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
-use eframe::egui;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vpngate_client::config::Config;
 use vpngate_client::net::{self, Connector};
@@ -31,6 +31,7 @@ enum Busy {
     Probing,
     Connecting,
     Testing,
+    TestingFrontProxy,
 }
 
 impl Busy {
@@ -40,8 +41,20 @@ impl Busy {
             Busy::Probing => "正在探测节点…",
             Busy::Connecting => "正在连接…",
             Busy::Testing => "正在测试隧道…",
+            Busy::TestingFrontProxy => "正在测试前置代理…",
         }
     }
+}
+
+/// Why a probe failed: the front proxy itself is down, or the proxy
+/// is up but the node did not answer. The distinction matters because
+/// refresh / probe / connect all share the front proxy — when the
+/// proxy is down they fail together for one reason, and swapping
+/// nodes will not help.
+#[derive(Debug, Clone)]
+enum ProbeFailure {
+    ProxyDown(String),
+    NodeDown(String),
 }
 
 /// A live connection: tunnel + the SOCKS5 server task(s) + the optional
@@ -53,8 +66,8 @@ struct ActiveConnection {
     tunnel: Arc<SstpTunnel>,
     serve: Vec<tokio::task::JoinHandle<()>>,
     proxy_guard: Option<SystemProxyGuard>,
-    /// Display label, e.g. "127.0.0.1:10808" or
-    /// "127.0.0.1:10808 ＋ 0.0.0.0:10809".
+    /// Display label, e.g. "127.0.0.1:10818" or
+    /// "127.0.0.1:10818 ＋ 0.0.0.0:10809".
     listen_addr: String,
     node_label: String,
     vip: Ipv4Addr,
@@ -64,7 +77,7 @@ enum GuiEvent {
     Nodes(vpngate::NodeListUpdate),
     Probe {
         host: String,
-        result: Result<(Ipv4Addr, Duration), String>,
+        result: Result<(Ipv4Addr, Duration), ProbeFailure>,
     },
     Connected(Box<ActiveConnection>),
     ConnectFailed(String),
@@ -72,6 +85,10 @@ enum GuiEvent {
         gen204: bool,
         google: bool,
         detail: String,
+    },
+    FrontProxyTest {
+        google: net::FrontProxyCheck,
+        vpngate: net::FrontProxyCheck,
     },
 }
 
@@ -81,8 +98,16 @@ fn connector_for(front_enabled: bool, front_addr: &str, user: &str, pass: &str) 
         let mut fp = vpngate_client::config::FrontProxy::default();
         fp.enabled = true;
         fp.addr = front_addr.to_string();
-        fp.username = if user.is_empty() { None } else { Some(user.to_string()) };
-        fp.password = if pass.is_empty() { None } else { Some(pass.to_string()) };
+        fp.username = if user.is_empty() {
+            None
+        } else {
+            Some(user.to_string())
+        };
+        fp.password = if pass.is_empty() {
+            None
+        } else {
+            Some(pass.to_string())
+        };
         Connector::new(Some(fp))
     } else {
         Connector::new(None)
@@ -93,7 +118,11 @@ async fn fetch_flow(connector: &Connector) -> vpngate::NodeListUpdate {
     vpngate::fetch_nodes_with_fallback(connector).await
 }
 
-async fn probe_flow(connector: &Connector, target: &str, timeout: Duration) -> Result<(Ipv4Addr, Duration), String> {
+async fn probe_flow(
+    connector: &Connector,
+    target: &str,
+    timeout: Duration,
+) -> Result<(Ipv4Addr, Duration), ProbeFailure> {
     let candidates = vpngate::resolve_target(target);
     let mut last_err = String::new();
     for (host, port) in &candidates {
@@ -102,7 +131,34 @@ async fn probe_flow(connector: &Connector, target: &str, timeout: Duration) -> R
             Err(e) => last_err = e,
         }
     }
-    Err(format!("{} 个候选均失败；最后一次：{}", candidates.len(), last_err))
+    // All candidates failed. If a front proxy is configured, find out
+    // whether the proxy itself is the problem: a direct TCP connect to
+    // the proxy separates "proxy down" from "node down".
+    let proxy_tcp = net::check_front_proxy_tcp(connector, Duration::from_secs(3)).await;
+    Err(classify_probe_failure(last_err, proxy_tcp))
+}
+
+/// Pure half of `probe_flow`'s failure handling, so the split is
+/// unit-testable: only a failed direct TCP connect to a configured
+/// front proxy blames the proxy; anything else blames the node.
+fn classify_probe_failure(last_err: String, proxy_tcp: Option<bool>) -> ProbeFailure {
+    match proxy_tcp {
+        Some(false) => ProbeFailure::ProxyDown(last_err),
+        _ => ProbeFailure::NodeDown(last_err),
+    }
+}
+
+/// Test the front proxy itself: HTTPS GET to Google and to vpngate.net
+/// through it (SOCKS5 connectivity, not ICMP ping). Runs on a
+/// background task; the result distinguishes "the proxy is down" from
+/// "the proxy is up but the target does not answer through it".
+async fn front_proxy_test_flow(
+    connector: &Connector,
+    timeout: Duration,
+) -> (net::FrontProxyCheck, net::FrontProxyCheck) {
+    let google = net::test_url_through_proxy(connector, "https://www.google.com", timeout).await;
+    let vpngate = net::test_url_through_proxy(connector, "https://www.vpngate.net", timeout).await;
+    (google, vpngate)
 }
 
 /// Connect the tunnel, start the local SOCKS5 server(s), optionally set
@@ -130,13 +186,17 @@ async fn connect_flow(
             Err(e) => last_err = e,
         }
     }
-    let tunnel = tunnel.ok_or_else(|| format!("{} 个候选均失败；最后一次：{}", candidates.len(), last_err))?;
+    let tunnel = tunnel
+        .ok_or_else(|| format!("{} 个候选均失败；最后一次：{}", candidates.len(), last_err))?;
     let vip = tunnel.vip;
     let mut listeners = Vec::new();
     for addr in &listen_addrs {
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| format!("本地 SOCKS5 无法监听 {}：{}（端口可能被占用，换一个端口再试）", addr, e))?;
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+            format!(
+                "本地 SOCKS5 无法监听 {}：{}（端口可能被占用，换一个端口再试）",
+                addr, e
+            )
+        })?;
         listeners.push(listener);
     }
     let mut serve = Vec::new();
@@ -200,8 +260,9 @@ async fn test_flow(tunnel: &Arc<SstpTunnel>, timeout: Duration) -> (bool, bool, 
     }
     match tunnel.open_stream("www.google.com", 443, timeout).await {
         Ok(stream) => {
-            let name = tokio_rustls::rustls::pki_types::ServerName::try_from("www.google.com".to_string())
-                .expect("valid server name");
+            let name =
+                tokio_rustls::rustls::pki_types::ServerName::try_from("www.google.com".to_string())
+                    .expect("valid server name");
             let tls = tokio_rustls::TlsConnector::from(net::verified_tls_config());
             match tokio::time::timeout(timeout, tls.connect(name, stream)).await {
                 Ok(Ok(mut tls)) => {
@@ -231,16 +292,33 @@ async fn test_flow(tunnel: &Arc<SstpTunnel>, timeout: Duration) -> (bool, bool, 
     (gen204, google, detail)
 }
 
-/// Truncate a string to at most `max` characters, adding "…" when cut.
-/// Used for the ISP column so the node grid fits small windows.
-fn truncate_str(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max).collect();
-        out.push('…');
-        out
+/// Place a truncating label at the left of an exact cell rect.
+/// (`Ui::put` centres the widget, which would centre every column's
+/// text; a node list reads better left-aligned, like the old Grid.)
+fn put_cell_label(ui: &mut egui::Ui, rect: egui::Rect, text: impl Into<egui::WidgetText>) {
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            ui.add(egui::Label::new(text).truncate());
+        },
+    );
+}
+
+/// One line for one front-proxy test target: reachable + ms, or which
+/// side failed (proxy down vs target unreachable through a working proxy).
+fn front_proxy_check_line(label: &str, check: &net::FrontProxyCheck) -> String {
+    match check {
+        net::FrontProxyCheck::Reachable { status, ms } => {
+            format!("{}：通（HTTP {}，{} ms）", label, status, ms)
+        }
+        net::FrontProxyCheck::ProxyUnreachable(detail) => {
+            format!("{}：前置代理连不上（{}）", label, detail)
+        }
+        net::FrontProxyCheck::TargetUnreachable(detail) => {
+            format!("{}：代理通、目标站不通（{}）", label, detail)
+        }
     }
 }
 
@@ -267,7 +345,10 @@ fn parse_manual_target(text: &str, curated_len: usize) -> Result<String, String>
         return Err(format!("序号超出范围（内嵌列表共 {} 个）", curated_len));
     }
     // Bare hostname: resolve_target will try the candidate SSTP ports.
-    if t.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') && t.contains('.') {
+    if t.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        && t.contains('.')
+    {
         return Ok(t.to_string());
     }
     Err("格式不对：主机名:端口，例如 kanratown.opengw.net:992".to_string())
@@ -306,7 +387,8 @@ fn find_cjk_font() -> Option<Vec<u8>> {
                     if path.is_dir() {
                         stack.push((path, depth + 1));
                     } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.contains("NotoSansCJK") && name.contains("Regular")
+                        if name.contains("NotoSansCJK")
+                            && name.contains("Regular")
                             && (name.ends_with(".ttf") || name.ends_with(".ttc"))
                         {
                             candidates.push(path);
@@ -355,6 +437,17 @@ struct GuiApp {
     lan_port: u16,
     allow_lan: bool,
     system_proxy: bool,
+    /// Node-list column widths in pixels (country, ISP, host:port,
+    /// latency/status). Draggable at the header separators; persisted
+    /// to config.toml with the rest of the settings via auto-save.
+    col_widths: [u16; 4],
+    /// Whether 高级设置 starts open. Production default is closed;
+    /// the render test opens it so the review screenshots show the
+    /// front-proxy section and the log.
+    advanced_open: bool,
+    /// Render-test aid: start the outer scroll area at the bottom, so
+    /// the review screenshots show the log instead of the node list.
+    render_scroll_bottom: bool,
     manual_host: String,
     manual_error: String,
     show_about: bool,
@@ -384,10 +477,13 @@ impl Default for GuiApp {
             front_addr: "127.0.0.1:1080".to_string(),
             front_user: String::new(),
             front_pass: String::new(),
-            local_port: 10808,
+            local_port: 10818,
             lan_port: 10809,
             allow_lan: false,
             system_proxy: false,
+            col_widths: vpngate_client::config::UiSettings::default().node_col_widths,
+            advanced_open: false,
+            render_scroll_bottom: false,
             manual_host: String::new(),
             manual_error: String::new(),
             show_about: false,
@@ -406,11 +502,26 @@ impl GuiApp {
         cc.egui_ctx.set_theme(egui::ThemePreference::System);
         cc.egui_ctx.all_styles_mut(|style| {
             style.text_styles = [
-                (egui::TextStyle::Heading, egui::FontId::new(20.0, egui::FontFamily::Proportional)),
-                (egui::TextStyle::Body, egui::FontId::new(15.0, egui::FontFamily::Proportional)),
-                (egui::TextStyle::Button, egui::FontId::new(15.0, egui::FontFamily::Proportional)),
-                (egui::TextStyle::Monospace, egui::FontId::new(13.0, egui::FontFamily::Monospace)),
-                (egui::TextStyle::Small, egui::FontId::new(12.0, egui::FontFamily::Proportional)),
+                (
+                    egui::TextStyle::Heading,
+                    egui::FontId::new(20.0, egui::FontFamily::Proportional),
+                ),
+                (
+                    egui::TextStyle::Body,
+                    egui::FontId::new(15.0, egui::FontFamily::Proportional),
+                ),
+                (
+                    egui::TextStyle::Button,
+                    egui::FontId::new(15.0, egui::FontFamily::Proportional),
+                ),
+                (
+                    egui::TextStyle::Monospace,
+                    egui::FontId::new(13.0, egui::FontFamily::Monospace),
+                ),
+                (
+                    egui::TextStyle::Small,
+                    egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                ),
             ]
             .into();
             // Roomier controls: the default 8x4 spacing makes the
@@ -441,7 +552,8 @@ impl GuiApp {
         let mut app = Self::default();
         app.font_ok = Self::setup_visuals(cc);
         if !app.font_ok {
-            app.log.push("未找到系统里的中文字体，中文可能显示为方框。".to_string());
+            app.log
+                .push("未找到系统里的中文字体，中文可能显示为方框。".to_string());
         }
         // Portable config: config.toml next to the exe first, then
         // ./config.toml in the working directory, else defaults.
@@ -470,8 +582,20 @@ impl GuiApp {
     fn for_render_tests(cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::default();
         app.font_ok = Self::setup_visuals(cc);
+        // 高级设置 open: the review shots must show the front-proxy
+        // section and its test button, not just the collapsed header.
+        app.advanced_open = true;
         // No fetch runs in the harness; don't claim one is starting.
         app.log = vec!["就绪。".to_string()];
+        app
+    }
+
+    /// Render-test constructor with the outer scroll area at the bottom
+    /// (shows the end of 高级设置 and the log).
+    #[cfg(test)]
+    fn for_render_tests_scrolled(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut app = Self::for_render_tests(cc);
+        app.render_scroll_bottom = true;
         app
     }
 
@@ -485,6 +609,7 @@ impl GuiApp {
         self.lan_port = cfg.listen.lan_port;
         self.allow_lan = cfg.listen.allow_lan;
         self.system_proxy = cfg.system_proxy.enabled;
+        self.col_widths = cfg.ui.node_col_widths;
     }
 
     /// Build the current settings as a Config (for saving).
@@ -506,6 +631,7 @@ impl GuiApp {
         cfg.listen.lan_port = self.lan_port;
         cfg.listen.allow_lan = self.allow_lan;
         cfg.system_proxy.enabled = self.system_proxy;
+        cfg.ui.node_col_widths = self.col_widths;
         cfg
     }
 
@@ -576,7 +702,12 @@ impl GuiApp {
     }
 
     fn connector(&self) -> Connector {
-        connector_for(self.front_enabled, &self.front_addr, &self.front_user, &self.front_pass)
+        connector_for(
+            self.front_enabled,
+            &self.front_addr,
+            &self.front_user,
+            &self.front_pass,
+        )
     }
 
     fn log_line(&mut self, line: String) {
@@ -604,7 +735,9 @@ impl GuiApp {
 
     fn start_probe(&mut self, ctx: egui::Context) {
         let Some(i) = self.selected else { return };
-        let Some(node) = self.nodes.get(i) else { return };
+        let Some(node) = self.nodes.get(i) else {
+            return;
+        };
         if self.busy.is_some() {
             return;
         }
@@ -615,14 +748,28 @@ impl GuiApp {
             None => target.clone(),
         };
         self.busy = Some(Busy::Probing);
-        self.status = format!("正在探测 {}…", target_str);
+        // Probing goes through the front proxy when it is on (same
+        // chain as refresh/connect), so say so: when the proxy is down,
+        // the probe fails for the proxy's sake, not the node's.
+        if self.front_enabled {
+            self.status = format!("正在探测 {}（经前置代理 {}）…", target_str, self.front_addr);
+            self.log_line(format!(
+                "开始探测 {}（经前置代理 {}）。",
+                target_str, self.front_addr
+            ));
+        } else {
+            self.status = format!("正在探测 {}…", target_str);
+        }
         self.probes.insert(target.clone(), "探测中…".to_string());
         let tx = self.event_tx.clone();
         let connector = self.connector();
         let timeout = self.timeout();
         tokio::spawn(async move {
             let res = probe_flow(&connector, &target_str, timeout).await;
-            let _ = tx.send(GuiEvent::Probe { host: target, result: res });
+            let _ = tx.send(GuiEvent::Probe {
+                host: target,
+                result: res,
+            });
             ctx.request_repaint();
         });
     }
@@ -637,7 +784,9 @@ impl GuiApp {
 
     fn start_connect(&mut self, ctx: egui::Context) {
         let Some(i) = self.selected else { return };
-        let Some(node) = self.nodes.get(i) else { return };
+        let Some(node) = self.nodes.get(i) else {
+            return;
+        };
         if self.busy.is_some() || self.conn.is_some() {
             return;
         }
@@ -663,7 +812,16 @@ impl GuiApp {
         let system_proxy = self.system_proxy;
         let service = self.config.system_proxy.service.clone();
         tokio::spawn(async move {
-            match connect_flow(connector, target.clone(), listen_addrs, timeout, system_proxy, service).await {
+            match connect_flow(
+                connector,
+                target.clone(),
+                listen_addrs,
+                timeout,
+                system_proxy,
+                service,
+            )
+            .await
+            {
                 Ok(c) => {
                     let _ = tx.send(GuiEvent::Connected(Box::new(c)));
                 }
@@ -687,7 +845,34 @@ impl GuiApp {
         let timeout = self.timeout();
         tokio::spawn(async move {
             let (gen204, google, detail) = test_flow(&tunnel, timeout).await;
-            let _ = tx.send(GuiEvent::TestResult { gen204, google, detail });
+            let _ = tx.send(GuiEvent::TestResult {
+                gen204,
+                google,
+                detail,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Test the front proxy (button next to the front-proxy settings).
+    /// Only runs when the front proxy is on — with it off there is
+    /// nothing to test and a "direct" result would be misleading.
+    fn start_test_front_proxy(&mut self, ctx: egui::Context) {
+        if !self.front_enabled || self.busy.is_some() {
+            return;
+        }
+        self.busy = Some(Busy::TestingFrontProxy);
+        self.status = format!("正在测试前置代理 {}…", self.front_addr);
+        self.log_line(format!(
+            "开始测试前置代理 {}（到 Google 与 vpngate.net）。",
+            self.front_addr
+        ));
+        let tx = self.event_tx.clone();
+        let connector = self.connector();
+        let timeout = self.timeout();
+        tokio::spawn(async move {
+            let (google, vpngate) = front_proxy_test_flow(&connector, timeout).await;
+            let _ = tx.send(GuiEvent::FrontProxyTest { google, vpngate });
             ctx.request_repaint();
         });
     }
@@ -732,8 +917,7 @@ impl GuiApp {
                         self.log_line(format!("节点列表已更新：{} 个节点。", n));
                     }
                     vpngate::NodeListSource::WebScrape => {
-                        self.status =
-                            format!("官方 API 不可用，已从网页抓取 {} 个节点。", n);
+                        self.status = format!("官方 API 不可用，已从网页抓取 {} 个节点。", n);
                         self.log_line(format!(
                             "官方 API 拉取失败：{}；已改用网页抓取（{} 个节点）。",
                             upd.api_error.as_deref().unwrap_or("未知原因"),
@@ -741,10 +925,8 @@ impl GuiApp {
                         ));
                     }
                     vpngate::NodeListSource::Cache => {
-                        self.status = format!(
-                            "官方 API 与网页都不可用，已显示缓存列表（{} 个）。",
-                            n
-                        );
+                        self.status =
+                            format!("官方 API 与网页都不可用，已显示缓存列表（{} 个）。", n);
                         self.log_line(format!(
                             "官方 API 拉取失败：{}；网页抓取失败：{}；已改用缓存列表（{} 个）。",
                             upd.api_error.as_deref().unwrap_or("未知原因"),
@@ -767,15 +949,45 @@ impl GuiApp {
                 self.busy = None;
                 match result {
                     Ok((vip, ms)) => {
-                        self.probes.insert(host.clone(), format!("{} ms", ms.as_millis()));
-                        self.status = format!("{} 可用：虚拟 IP {}，{} ms。", host, vip, ms.as_millis());
-                        self.log_line(format!("探测 {}：可用，虚拟 IP {}，{} ms。", host, vip, ms.as_millis()));
+                        self.probes
+                            .insert(host.clone(), format!("{} ms", ms.as_millis()));
+                        self.status =
+                            format!("{} 可用：虚拟 IP {}，{} ms。", host, vip, ms.as_millis());
+                        self.log_line(format!(
+                            "探测 {}：可用，虚拟 IP {}，{} ms。",
+                            host,
+                            vip,
+                            ms.as_millis()
+                        ));
                     }
-                    Err(e) => {
+                    Err(ProbeFailure::ProxyDown(e)) => {
+                        self.probes.insert(host.clone(), "代理不通".to_string());
+                        self.status = "探测失败：前置代理连不上。".to_string();
+                        self.error = format!(
+                            "探测 {} 失败：前置代理 {} 连不上（{}）。节点还没连上——问题在代理不在节点：刷新、探测、连接都走这条代理，代理不通时会一起失败，换节点没用。先点高级设置里的“测试前置代理”确认。",
+                            host, self.front_addr, e
+                        );
+                        self.log_line(format!(
+                            "探测 {}：失败：前置代理 {} 连不上（{}）。提示：刷新节点、探测、连接都走前置代理，代理不通时它们会一起失败。",
+                            host, self.front_addr, e
+                        ));
+                    }
+                    Err(ProbeFailure::NodeDown(e)) => {
                         self.probes.insert(host.clone(), "失败".to_string());
                         self.status = format!("{} 探测失败。", host);
-                        self.error = format!("探测 {} 失败：{}。换一个节点再试。", host, e);
-                        self.log_line(format!("探测 {}：失败：{}。", host, e));
+                        if self.front_enabled {
+                            self.error = format!(
+                                "探测 {} 失败：前置代理 {} 能连上，但节点不通（{}）。换一个节点再试。",
+                                host, self.front_addr, e
+                            );
+                            self.log_line(format!(
+                                "探测 {}：失败：前置代理 {} 能连上，节点不通（{}）。",
+                                host, self.front_addr, e
+                            ));
+                        } else {
+                            self.error = format!("探测 {} 失败：{}。换一个节点再试。", host, e);
+                            self.log_line(format!("探测 {}：失败：{}。", host, e));
+                        }
                     }
                 }
             }
@@ -795,7 +1007,11 @@ impl GuiApp {
                 self.error = format!("连接失败：{}。换一个节点，或检查前置 SOCKS5 设置。", e);
                 self.log_line(format!("连接失败：{}。", e));
             }
-            GuiEvent::TestResult { gen204, google, detail } => {
+            GuiEvent::TestResult {
+                gen204,
+                google,
+                detail,
+            } => {
                 self.busy = None;
                 self.status = if gen204 && google {
                     "测试通过：generate_204 与 Google 都通了。".to_string()
@@ -804,13 +1020,55 @@ impl GuiApp {
                 } else {
                     "测试未通过：generate_204 不通。".to_string()
                 };
-                self.log_line(format!("隧道测试：{}（generate_204 {}，Google {}）。", detail, gen204, google));
+                self.log_line(format!(
+                    "隧道测试：{}（generate_204 {}，Google {}）。",
+                    detail, gen204, google
+                ));
                 if !gen204 {
                     self.error = format!("测试未通过：{} 换一个节点再试。", detail);
                 } else if !google {
-                    self.error = format!("Google 不通：{} 可能是出口被挡，换一个节点再试。", detail);
+                    self.error =
+                        format!("Google 不通：{} 可能是出口被挡，换一个节点再试。", detail);
                 } else {
                     self.error.clear();
+                }
+            }
+            GuiEvent::FrontProxyTest { google, vpngate } => {
+                self.busy = None;
+                let g = front_proxy_check_line("Google", &google);
+                let v = front_proxy_check_line("vpngate.net", &vpngate);
+                self.log_line(format!("前置代理测试：{}；{}。", g, v));
+                let proxy_detail = match &google {
+                    net::FrontProxyCheck::ProxyUnreachable(d) => Some(d.clone()),
+                    _ => match &vpngate {
+                        net::FrontProxyCheck::ProxyUnreachable(d) => Some(d.clone()),
+                        _ => None,
+                    },
+                };
+                let mut target_down: Vec<(&str, String)> = Vec::new();
+                if let net::FrontProxyCheck::TargetUnreachable(d) = &google {
+                    target_down.push(("Google", d.clone()));
+                }
+                if let net::FrontProxyCheck::TargetUnreachable(d) = &vpngate {
+                    target_down.push(("vpngate.net", d.clone()));
+                }
+                if let Some(d) = proxy_detail {
+                    self.status = "前置代理测试：前置代理连不上。".to_string();
+                    self.error = format!(
+                        "前置代理 {} 连不上（{}）。刷新、探测、连接都走这条代理，代理不通时会一起失败：检查前置代理（NekoBox）开没开、地址对不对。",
+                        self.front_addr, d
+                    );
+                } else if target_down.is_empty() {
+                    self.status = format!("前置代理测试：{}；{}。", g, v);
+                    self.error.clear();
+                } else {
+                    let labels: Vec<&str> = target_down.iter().map(|(l, _)| *l).collect();
+                    self.status = format!("前置代理测试：前置代理通，{}不通。", labels.join("、"));
+                    self.error = format!(
+                        "前置代理能连上，但 {} 通过它打不开（{}）。刷新节点要走 vpngate.net，这个不通就拉不到新节点；Google 不通则是出口的问题。",
+                        labels.join("、"),
+                        target_down[0].1
+                    );
                 }
             }
         }
@@ -892,6 +1150,25 @@ impl eframe::App for GuiApp {
             // Solid bars are always drawn (6 px, full opacity) in both
             // themes, which is what the node list needs.
             ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+            // The panel is only 420 px tall at minimum size while the
+            // content below the node list (advanced settings, log) needs
+            // more room: one outer vertical scroll area wraps everything
+            // so nothing is cut off without a way to reach it. The node
+            // list and the log keep their own fixed-height scroll areas
+            // inside it. `panel_h` is captured before entering the
+            // scroll area (inside it the available height is unbounded).
+            let panel_h = ui.available_height();
+            // Test-only: pin the scroll to the bottom so the render test
+            // can screenshot the end of 高级设置 and the log. (An
+            // explicit scroll_offset(1e6) does NOT clamp — egui applies
+            // it raw and the content scrolls out of view entirely, so
+            // stick_to_bottom is the right tool here.)
+            let outer = egui::ScrollArea::vertical()
+                .id_salt("central")
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .stick_to_bottom(self.render_scroll_bottom);
+            outer.show(ui, |ui| {
             if !self.font_ok {
                 ui.label(
                     egui::RichText::new("未找到系统里的中文字体，中文可能显示为方框。")
@@ -939,13 +1216,12 @@ impl eframe::App for GuiApp {
                         None => n.host.clone(),
                     };
                     (
-                        // Country names can be long ("Korea Republic of");
-                        // cap the displayed text so the grid fits 560 px.
-                        truncate_str(&n.country, 12),
-                        // ISP names can be long ("KDDI Home Fiber"); cap
-                        // the displayed text so the grid fits a 560 px
-                        // window without horizontal scrolling.
-                        truncate_str(if n.isp.is_empty() { &n.name } else { &n.isp }, 14),
+                        // Full text here: the cells truncate with "…" to
+                        // the current column width (see below), so
+                        // widening a column shows more instead of a
+                        // fixed 12/14-character cut.
+                        n.country.clone(),
+                        if n.isp.is_empty() { n.name.clone() } else { n.isp.clone() },
                         // All curated hosts end in .opengw.net; drop the
                         // suffix for display (full host is in the tooltip).
                         match n.port {
@@ -965,7 +1241,7 @@ impl eframe::App for GuiApp {
                     )
                 })
                 .collect();
-            let list_h = (ui.available_height() - 250.0).max(120.0);
+            let list_h = (panel_h - 250.0).max(120.0);
             if rows.is_empty() {
                 ui.label("还没有节点。点右上角“刷新节点”，或在下面“高级设置”里手动添加。");
             } else {
@@ -980,34 +1256,130 @@ impl eframe::App for GuiApp {
                         egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
                     )
                     .show(ui, |ui| {
-                        egui::Grid::new("node_grid")
-                            .num_columns(4)
-                            .striped(true)
-                            .show(ui, |ui| {
-                                ui.label("国家/地区");
-                                ui.label("运营商");
-                                ui.label("主机:端口");
-                                ui.label("延迟/状态");
-                                ui.end_row();
-                                for (i, (country, isp, hostport, status, full)) in rows.iter().enumerate() {
-                                    // No push_id here: a scope would break
-                                    // the grid (it becomes a single cell).
-                                    // Button ids come from next_auto_id(),
-                                    // so identical country labels in
-                                    // different rows still get distinct ids.
-                                    if ui
-                                        .selectable_value(&mut self.selected, Some(i), country)
-                                        .on_hover_text(full)
-                                        .clicked()
-                                    {
-                                        // selection applied by the widget itself
-                                    }
-                                    ui.label(isp);
-                                    ui.label(hostport).on_hover_text(full);
-                                    ui.label(status);
-                                    ui.end_row();
+                        // Tighter gaps so the four columns fit a 560 px
+                        // window at the default widths.
+                        ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                        let widths: [f32; 4] = self.col_widths.map(|w| w as f32);
+                        let row_h = 22.0;
+                        // One row is 4 cells + 3 six-pixel separators +
+                        // the 6 gaps between the 7 items.
+                        let handle_w = 6.0f32;
+                        let gap = ui.spacing().item_spacing.x;
+                        let total_w =
+                            widths.iter().sum::<f32>() + 3.0 * handle_w + 6.0 * gap;
+                        // Header row: labels plus a draggable separator
+                        // after each column but the last. Dragging resizes
+                        // that column (40–400 px); the width is remembered
+                        // in the settings and auto-saved to config.toml.
+                        // NOTE: the cells are placed at exact rects (like
+                        // the data rows below), not via
+                        // allocate_ui_with_layout: that advances the parent
+                        // by the child's *content* size, so a short label
+                        // would pull the separator and the next column left
+                        // of its intended position, and the header would
+                        // drift out of line with the data columns.
+                        // Handles get explicit stable ids (not auto ids).
+                        let (header_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(total_w, row_h),
+                            egui::Sense::hover(),
+                        );
+                        let mut x = header_rect.left();
+                        for (i, label) in ["国家/地区", "运营商", "主机:端口", "延迟/状态"]
+                            .iter()
+                            .enumerate()
+                        {
+                            let cell_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, header_rect.top()),
+                                egui::vec2(widths[i], row_h),
+                            );
+                            put_cell_label(
+                                ui,
+                                cell_rect,
+                                egui::RichText::new(*label).strong(),
+                            );
+                            x += widths[i];
+                            if i < 3 {
+                                x += gap;
+                                let handle_rect = egui::Rect::from_min_size(
+                                    egui::pos2(x, header_rect.top()),
+                                    egui::vec2(handle_w, row_h),
+                                );
+                                let resp = ui.interact(
+                                    handle_rect,
+                                    egui::Id::new(("node_col_sep", i)),
+                                    egui::Sense::drag(),
+                                );
+                                let active = resp.hovered() || resp.dragged();
+                                // Apply the per-frame delta while
+                                // dragging, and also on release: a
+                                // drag whose pointer only moved in the
+                                // release event still carries its delta
+                                // then (kittest teleports this way).
+                                if resp.dragged() || resp.drag_stopped() {
+                                    self.col_widths[i] = (self.col_widths[i] as f32
+                                        + resp.drag_delta().x)
+                                        .clamp(40.0, 400.0)
+                                        as u16;
                                 }
-                            });
+                                let stroke = if active {
+                                    ui.visuals().widgets.active.bg_stroke
+                                } else {
+                                    ui.visuals().widgets.noninteractive.bg_stroke
+                                };
+                                ui.painter().vline(
+                                    handle_rect.center().x,
+                                    handle_rect.y_range(),
+                                    stroke,
+                                );
+                                resp.on_hover_cursor(egui::CursorIcon::ResizeColumn);
+                                x += handle_w + gap;
+                            }
+                        }
+                        // Data rows: whole-row click selects; text
+                        // truncates with "…" to the current column width,
+                        // and widening a column shows more of it (the
+                        // horizontal scroll bar reveals the rest).
+                        for (i, (country, isp, hostport, status, full)) in
+                            rows.iter().enumerate()
+                        {
+                            let (row_rect, row_resp) = ui.allocate_exact_size(
+                                egui::vec2(total_w, row_h),
+                                egui::Sense::click(),
+                            );
+                            let fill = if self.selected == Some(i) {
+                                ui.visuals().selection.bg_fill
+                            } else if i % 2 == 0 {
+                                ui.visuals().faint_bg_color
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            ui.painter().rect_filled(row_rect, 0.0, fill);
+                            // Place each cell label at its exact rect
+                            // (egui 0.36 has no allocate_ui_at_rect).
+                            let cells = [country, isp, hostport, status];
+                            let mut x = row_rect.left();
+                            for (j, text) in cells.iter().enumerate() {
+                                let cell_rect = egui::Rect::from_min_size(
+                                    egui::pos2(x, row_rect.top()),
+                                    egui::vec2(widths[j], row_h),
+                                );
+                                put_cell_label(ui, cell_rect, *text);
+                                x += widths[j];
+                                if j < 3 {
+                                    // Gap, separator, gap — the same
+                                    // symmetric spacing as the header row.
+                                    x += gap + handle_w + gap;
+                                }
+                            }
+                            // Full host:port on hover (the column shows it
+                            // without the .opengw.net suffix).
+                            let row_resp = row_resp
+                                .on_hover_text(full)
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if row_resp.clicked() {
+                                self.selected = Some(i);
+                            }
+                        }
                     });
             }
 
@@ -1110,7 +1482,7 @@ impl eframe::App for GuiApp {
 
             // Advanced settings.
             egui::CollapsingHeader::new("高级设置")
-                .default_open(false)
+                .default_open(self.advanced_open)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("手动添加节点：");
@@ -1175,6 +1547,31 @@ impl eframe::App for GuiApp {
                                 ui.end_row();
                             });
                     });
+                    // Test the front proxy itself: with it off there is
+                    // nothing to test, so the button stays disabled with
+                    // a hint instead of running a misleading "direct" test.
+                    ui.horizontal(|ui| {
+                        let can_test = self.front_enabled
+                            && !self.front_addr.trim().is_empty()
+                            && self.busy.is_none();
+                        if ui
+                            .add_enabled(
+                                can_test,
+                                egui::Button::new("测试前置代理").min_size(egui::vec2(96.0, 32.0)),
+                            )
+                            .on_disabled_hover_text(if !self.front_enabled {
+                                "先勾选“使用前置 SOCKS5 代理”，这个测试需要前置代理开着"
+                            } else if self.front_addr.trim().is_empty() {
+                                "先填代理地址"
+                            } else {
+                                "正在忙，请稍候"
+                            })
+                            .clicked()
+                        {
+                            self.start_test_front_proxy(ui.ctx().clone());
+                        }
+                        ui.label("测代理到 Google、vpngate.net（走 SOCKS5）。");
+                    });
                     ui.separator();
                     ui.separator();
                     // Portable save: settings go to config.toml next to
@@ -1216,6 +1613,7 @@ impl eframe::App for GuiApp {
                             .desired_width(f32::INFINITY),
                     );
                 });
+            });
         });
 
         // Settings auto-save: any change made this frame (front proxy,
@@ -1285,19 +1683,20 @@ mod tests {
     }
 
     #[test]
-    fn truncate_str_caps_long_isp_names() {
-        assert_eq!(truncate_str("SoftBank BB", 14), "SoftBank BB");
-        assert_eq!(truncate_str("KDDI Home Fiber", 14), "KDDI Home Fibe…");
-        assert_eq!(truncate_str("Deutsche Telekom AG", 14), "Deutsche Telek…");
-        assert_eq!(truncate_str("日本电信", 14), "日本电信");
-    }
-
-    #[test]
     fn manual_target_parsing() {
-        assert_eq!(parse_manual_target("kanratown.opengw.net:992", 28).unwrap(), "kanratown.opengw.net:992");
-        assert_eq!(parse_manual_target("  vpn1.opengw.net:443  ", 28).unwrap(), "vpn1.opengw.net:443");
+        assert_eq!(
+            parse_manual_target("kanratown.opengw.net:992", 28).unwrap(),
+            "kanratown.opengw.net:992"
+        );
+        assert_eq!(
+            parse_manual_target("  vpn1.opengw.net:443  ", 28).unwrap(),
+            "vpn1.opengw.net:443"
+        );
         assert_eq!(parse_manual_target("3", 28).unwrap(), "3");
-        assert_eq!(parse_manual_target("kanratown.opengw.net", 28).unwrap(), "kanratown.opengw.net");
+        assert_eq!(
+            parse_manual_target("kanratown.opengw.net", 28).unwrap(),
+            "kanratown.opengw.net"
+        );
         assert!(parse_manual_target("", 28).is_err());
         assert!(parse_manual_target("host:0", 28).is_err());
         assert!(parse_manual_target("host:70000", 28).is_err());
@@ -1360,15 +1759,184 @@ mod tests {
             host: "a.opengw.net".to_string(),
             result: Ok((Ipv4Addr::new(10, 0, 0, 2), Duration::from_millis(128))),
         });
-        assert_eq!(app.probes.get("a.opengw.net").map(|s| s.as_str()), Some("128 ms"));
+        assert_eq!(
+            app.probes.get("a.opengw.net").map(|s| s.as_str()),
+            Some("128 ms")
+        );
         assert!(app.busy.is_none());
         app.busy = Some(Busy::Probing);
         app.apply_event(GuiEvent::Probe {
             host: "b.opengw.net".to_string(),
-            result: Err("timeout".to_string()),
+            result: Err(ProbeFailure::NodeDown("timeout".to_string())),
         });
-        assert_eq!(app.probes.get("b.opengw.net").map(|s| s.as_str()), Some("失败"));
-        assert!(!app.error.is_empty(), "probe failure must set an actionable error");
+        assert_eq!(
+            app.probes.get("b.opengw.net").map(|s| s.as_str()),
+            Some("失败")
+        );
+        assert!(
+            !app.error.is_empty(),
+            "probe failure must set an actionable error"
+        );
+        // Proxy-down failure names the proxy, not the node, and points
+        // at the front-proxy test instead of suggesting another node.
+        app.busy = Some(Busy::Probing);
+        app.front_enabled = true;
+        app.front_addr = "192.168.236.197:10808".to_string();
+        app.apply_event(GuiEvent::Probe {
+            host: "c.opengw.net".to_string(),
+            result: Err(ProbeFailure::ProxyDown("connection refused".to_string())),
+        });
+        assert_eq!(
+            app.probes.get("c.opengw.net").map(|s| s.as_str()),
+            Some("代理不通")
+        );
+        assert!(
+            app.error.contains("192.168.236.197:10808"),
+            "error must name the proxy: {}",
+            app.error
+        );
+        assert!(
+            app.error.contains("测试前置代理"),
+            "error must point at the proxy test: {}",
+            app.error
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("一起失败")),
+            "log must note the shared cause"
+        );
+        // Node-down with the proxy on says the proxy is fine.
+        app.busy = Some(Busy::Probing);
+        app.apply_event(GuiEvent::Probe {
+            host: "d.opengw.net".to_string(),
+            result: Err(ProbeFailure::NodeDown("TLS handshake failed".to_string())),
+        });
+        assert!(
+            app.error.contains("能连上，但节点不通"),
+            "error must clear the proxy: {}",
+            app.error
+        );
+    }
+
+    #[test]
+    fn classify_probe_failure_splits_proxy_from_node() {
+        assert!(matches!(
+            classify_probe_failure("x".to_string(), Some(false)),
+            ProbeFailure::ProxyDown(_)
+        ));
+        assert!(matches!(
+            classify_probe_failure("x".to_string(), Some(true)),
+            ProbeFailure::NodeDown(_)
+        ));
+        assert!(matches!(
+            classify_probe_failure("x".to_string(), None),
+            ProbeFailure::NodeDown(_)
+        ));
+    }
+
+    #[test]
+    fn front_proxy_test_event_reports_both_sides() {
+        use vpngate_client::net::FrontProxyCheck;
+        let mut app = GuiApp::for_tests();
+        app.front_addr = "192.168.236.197:10808".to_string();
+        app.busy = Some(Busy::TestingFrontProxy);
+        // Both reachable: status carries latencies, error clears.
+        app.apply_event(GuiEvent::FrontProxyTest {
+            google: FrontProxyCheck::Reachable {
+                status: 200,
+                ms: 312,
+            },
+            vpngate: FrontProxyCheck::Reachable {
+                status: 200,
+                ms: 405,
+            },
+        });
+        assert!(
+            app.status.contains("312 ms"),
+            "status must show Google latency: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("405 ms"),
+            "status must show vpngate.net latency: {}",
+            app.status
+        );
+        assert!(app.error.is_empty());
+        assert!(app.log.iter().any(|l| l.contains("前置代理测试")));
+        // Proxy down: status + error blame the proxy and its address.
+        app.busy = Some(Busy::TestingFrontProxy);
+        app.apply_event(GuiEvent::FrontProxyTest {
+            google: FrontProxyCheck::ProxyUnreachable("连前置代理端口失败".to_string()),
+            vpngate: FrontProxyCheck::ProxyUnreachable("连前置代理端口失败".to_string()),
+        });
+        assert!(
+            app.status.contains("前置代理连不上"),
+            "status: {}",
+            app.status
+        );
+        assert!(
+            app.error.contains("192.168.236.197:10808"),
+            "error must name the proxy: {}",
+            app.error
+        );
+        assert!(
+            app.error.contains("一起失败"),
+            "error must note the shared cause: {}",
+            app.error
+        );
+        // Proxy up, vpngate.net down through it: distinct wording.
+        app.busy = Some(Busy::TestingFrontProxy);
+        app.apply_event(GuiEvent::FrontProxyTest {
+            google: FrontProxyCheck::Reachable {
+                status: 200,
+                ms: 300,
+            },
+            vpngate: FrontProxyCheck::TargetUnreachable("代理建好连接后目标站无响应".to_string()),
+        });
+        assert!(
+            app.status.contains("vpngate.net不通"),
+            "status: {}",
+            app.status
+        );
+        assert!(app.error.contains("前置代理能连上"), "error: {}", app.error);
+        assert!(
+            app.error.contains("vpngate.net"),
+            "error must name the failing target: {}",
+            app.error
+        );
+        // TLS failure through a working proxy: the log must carry the
+        // raw error (not just "失败") — a firewall blocking the
+        // unsigned exe and a dead target look identical otherwise.
+        app.busy = Some(Busy::TestingFrontProxy);
+        app.apply_event(GuiEvent::FrontProxyTest {
+            google: FrontProxyCheck::TargetUnreachable(
+                "代理建好连接后目标站无响应：TLS handshake to www.google.com failed: invalid peer certificate: UnknownIssuer".to_string(),
+            ),
+            vpngate: FrontProxyCheck::TargetUnreachable(
+                "代理建好连接后目标站无响应：TLS handshake to www.vpngate.net failed: invalid peer certificate: UnknownIssuer".to_string(),
+            ),
+        });
+        assert!(
+            app.log.iter().any(|l| l.contains("UnknownIssuer")),
+            "log must carry the raw TLS error: {:?}",
+            app.log
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("TLS handshake")),
+            "log must name the failing stage: {:?}",
+            app.log
+        );
+    }
+
+    #[test]
+    fn col_widths_roundtrip_through_config() {
+        let mut app = GuiApp::for_tests();
+        assert_eq!(app.col_widths, [90, 130, 190, 90]);
+        app.col_widths = [120, 140, 200, 100];
+        let cfg = app.current_config();
+        assert_eq!(cfg.ui.node_col_widths, [120, 140, 200, 100]);
+        let mut app2 = GuiApp::for_tests();
+        app2.apply_config(&cfg);
+        assert_eq!(app2.col_widths, [120, 140, 200, 100]);
     }
 
     #[test]
@@ -1415,16 +1983,20 @@ mod tests {
         let mut app = GuiApp::for_tests();
         assert_eq!(
             app.listen_addrs().unwrap(),
-            vec!["127.0.0.1:10808".to_string()]
+            vec!["127.0.0.1:10818".to_string()]
         );
         app.allow_lan = true;
         assert_eq!(
             app.listen_addrs().unwrap(),
-            vec!["127.0.0.1:10808".to_string(), "0.0.0.0:10809".to_string()]
+            vec!["127.0.0.1:10818".to_string(), "0.0.0.0:10809".to_string()]
         );
-        app.lan_port = 10808;
+        app.lan_port = 10818;
         let err = app.listen_addrs().unwrap_err();
-        assert!(err.contains("不能设成一样"), "equal ports must fail loudly: {}", err);
+        assert!(
+            err.contains("不能设成一样"),
+            "equal ports must fail loudly: {}",
+            err
+        );
     }
 
     #[test]
@@ -1450,6 +2022,56 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[tokio::test]
+    async fn probe_flow_dead_front_proxy_is_proxy_down() {
+        let connector = connector_for(true, &format!("127.0.0.1:{}", closed_port()), "", "");
+        let res = probe_flow(
+            &connector,
+            "kanratown.opengw.net:992",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(ProbeFailure::ProxyDown(_))),
+            "dead proxy must blame the proxy, got {:?}",
+            res.map(|_| ())
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_flow_node_down_when_proxy_tcp_ok() {
+        // Fake proxy: accepts TCP, then closes. The proxy port answers,
+        // so a probe failure must blame the node, not the proxy.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = listener.accept().await else {
+                    break;
+                };
+                drop(s);
+            }
+        });
+        let connector = connector_for(true, &format!("127.0.0.1:{}", port), "", "");
+        let res = probe_flow(
+            &connector,
+            "kanratown.opengw.net:992",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(ProbeFailure::NodeDown(_))),
+            "live proxy port must blame the node, got {:?}",
+            res.map(|_| ())
+        );
+    }
+
+    /// A port with nothing listening on it.
+    fn closed_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
     #[test]
     fn disconnect_is_a_no_op_when_not_connected() {
         let mut app = GuiApp::for_tests();
@@ -1458,22 +2080,32 @@ mod tests {
     }
 
     /// Render the smallest window (560x420) in both themes for visual
-    /// review, plus a 150% zoom render. Needs a wgpu adapter (software
+    /// review, plus a 150% zoom render and scrolled-to-bottom renders
+    /// (they must show the end of 高级设置 and the log — that is the
+    /// outer-scroll fix being verified). Needs a wgpu adapter (software
     /// lavapipe is enough); on a machine without one this test fails and
     /// must be skipped, not faked.
     #[test]
     #[ignore = "renders PNGs for review; needs a graphics adapter"]
     fn render_for_review() {
-        use egui_kittest::Harness;
-        for (theme, name, zoom) in [
-            (egui::Theme::Dark, "dark", 1.0),
-            (egui::Theme::Light, "light", 1.0),
-            (egui::Theme::Dark, "dark-zoom150", 1.5),
+        use egui_kittest::{kittest::Queryable, Harness};
+        for (theme, name, zoom, scrolled) in [
+            (egui::Theme::Dark, "dark", 1.0, false),
+            (egui::Theme::Light, "light", 1.0, false),
+            (egui::Theme::Dark, "dark-zoom150", 1.5, false),
+            (egui::Theme::Dark, "dark-scrolled", 1.0, true),
+            (egui::Theme::Light, "light-scrolled", 1.0, true),
         ] {
             let mut harness = Harness::builder()
                 .with_size(egui::vec2(560.0, 420.0))
                 .with_theme(theme)
-                .build_eframe(|cc| GuiApp::for_render_tests(cc));
+                .build_eframe(|cc| {
+                    if scrolled {
+                        GuiApp::for_render_tests_scrolled(cc)
+                    } else {
+                        GuiApp::for_render_tests(cc)
+                    }
+                });
             if zoom != 1.0 {
                 harness.ctx.set_zoom_factor(zoom);
             }
@@ -1482,9 +2114,153 @@ mod tests {
             // step a fixed number of frames instead of run() (see
             // egui-kittest skill).
             harness.run_steps(30);
+            if scrolled {
+                // The widgets the scroll must reveal exist in the UI.
+                // (The PNG itself is the proof they are actually in
+                // view — check it, don't trust this assertion alone.)
+                harness.get_by_label("测试前置代理");
+                harness.get_by_label("日志");
+            }
             let path = std::env::temp_dir().join(format!("ui-review-{name}.png"));
-            harness.render().expect("needs a graphics adapter").save(&path).unwrap();
+            harness
+                .render()
+                .expect("needs a graphics adapter")
+                .save(&path)
+                .unwrap();
             eprintln!("{}", path.display());
         }
+    }
+
+    /// Isolation: does a bare Sense::drag handle (no ScrollArea) respond
+    /// to the same kittest drag sequence? Temporary diagnostic for the
+    /// column-separator test.
+    #[test]
+    #[ignore = "diagnostic; needs a graphics adapter"]
+    fn kittest_drag_smoke() {
+        use egui_kittest::Harness;
+        struct DragApp {
+            w: f32,
+        }
+        impl eframe::App for DragApp {
+            fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    // Mirror the real layout: outer vertical ScrollArea,
+                    // inner both-directions ScrollArea, header row in a
+                    // horizontal layout with a 6 px drag separator.
+                    egui::ScrollArea::vertical()
+                        .id_salt("outer")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            egui::ScrollArea::both()
+                                .id_salt("inner")
+                                .max_height(120.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                                    // Fixed layout: cells and separator at
+                                    // exact rects (see the real header — the
+                                    // allocate_ui_with_layout version let the
+                                    // cells shrink to their label width and
+                                    // put the separator in the wrong place).
+                                    let (header_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(238.0, 22.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.put(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(header_rect.left(), header_rect.top()),
+                                            egui::vec2(90.0, 22.0),
+                                        ),
+                                        egui::Label::new("国家/地区"),
+                                    );
+                                    let handle_rect = egui::Rect::from_min_size(
+                                        egui::pos2(header_rect.left() + 96.0, header_rect.top()),
+                                        egui::vec2(6.0, 22.0),
+                                    );
+                                    let resp = ui.interact(
+                                        handle_rect,
+                                        egui::Id::new("smoke_col_sep"),
+                                        egui::Sense::drag(),
+                                    );
+                                    if resp.dragged() || resp.drag_stopped() {
+                                        self.w += resp.drag_delta().x;
+                                    }
+                                    ui.put(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(
+                                                header_rect.left() + 108.0,
+                                                header_rect.top(),
+                                            ),
+                                            egui::vec2(130.0, 22.0),
+                                        ),
+                                        egui::Label::new("运营商"),
+                                    );
+                                    for _ in 0..28 {
+                                        ui.label("row");
+                                    }
+                                });
+                        });
+                });
+            }
+        }
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 420.0))
+            .build_eframe(|_cc| DragApp { w: 90.0 });
+        harness.run_steps(10);
+        // The handle sits after the 90 px first cell: left edge ~8 px,
+        // centre ~(107, 19).
+        let sep = egui::pos2(107.0, 19.0);
+        harness.hover_at(sep);
+        harness.run();
+        harness.drag_at(sep);
+        harness.run();
+        let target = egui::pos2(sep.x + 40.0, sep.y);
+        harness.hover_at(target);
+        harness.run();
+        harness.drop_at(target);
+        harness.run();
+        assert!(
+            harness.state().w >= 120.0,
+            "bare drag handle should widen: w={}",
+            harness.state().w
+        );
+    }
+
+    /// Dragging a header separator widens that column (needs a graphics
+    /// adapter, like the render test).
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn column_separator_drag_widens_column() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 420.0))
+            .build_eframe(|cc| GuiApp::for_render_tests(cc));
+        harness.run_steps(10);
+        let before = harness.state().col_widths[0];
+        // The first header cell starts at its label's left edge and is
+        // `before` px wide; the 6 px separator sits one item gap (6 px)
+        // past its right edge, so its centre is at left + width + 9.
+        let header = harness.get_by_label("国家/地区");
+        let r = header.rect();
+        let sep = egui::pos2(r.left() + before as f32 + 9.0, r.center().y);
+        harness.hover_at(sep);
+        harness.run();
+        harness.drag_at(sep);
+        harness.run();
+        // Move while the button is held (a real drag sends PointerMoved
+        // events between press and release; drop_at alone only sends
+        // the release event, whose delta the release frame would miss).
+        let target = egui::pos2(sep.x + 40.0, sep.y);
+        harness.hover_at(target);
+        harness.run();
+        harness.drop_at(target);
+        harness.run();
+        let after = harness.state().col_widths[0];
+        assert!(
+            after >= before + 30,
+            "dragging the separator should widen column 0: {} -> {}",
+            before,
+            after
+        );
     }
 }

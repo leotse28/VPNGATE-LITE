@@ -7,15 +7,19 @@
 //!   test     establish the tunnel and run generate_204 + google HTTPS
 
 use clap::{Parser, Subcommand};
-use vpngate_client::config::Config;
-use vpngate_client::net::{self, Connector};
-use vpngate_client::{socks5, sstp, sysproxy, vpngate};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use vpngate_client::config::Config;
+use vpngate_client::net::{self, Connector};
+use vpngate_client::{socks5, sstp, sysproxy, vpngate};
 
 #[derive(Parser)]
-#[command(name = "vpngate-client", version, about = "VPNGate (SoftEther/SSTP) client in Rust — local SOCKS5, no TUN, no GUI")]
+#[command(
+    name = "vpngate-client",
+    version,
+    about = "VPNGate (SoftEther/SSTP) client in Rust — local SOCKS5, no TUN, no GUI"
+)]
 struct Cli {
     /// Config file (TOML). Default: config.toml next to the exe
     /// (portable), then ./config.toml in the working directory.
@@ -54,7 +58,7 @@ enum Cmd {
     Connect {
         /// Node: host:port, hostname, or index into the curated list
         target: String,
-        /// Local listen address, e.g. 127.0.0.1:10808
+        /// Local listen address, e.g. 127.0.0.1:10818
         #[arg(long)]
         listen: Option<String>,
         /// Bind 0.0.0.0 (allow LAN), like V2Ray's allow-LAN
@@ -114,7 +118,11 @@ async fn connect_first(
             }
         }
     }
-    Err(format!("all {} candidate(s) failed; last error: {}", candidates.len(), last_err))
+    Err(format!(
+        "all {} candidate(s) failed; last error: {}",
+        candidates.len(),
+        last_err
+    ))
 }
 
 async fn cmd_list(cli: &Cli, cfg: &Config, country: Option<String>, limit: usize) -> i32 {
@@ -125,7 +133,10 @@ async fn cmd_list(cli: &Cli, cfg: &Config, country: Option<String>, limit: usize
     let nodes = &upd.nodes;
     match upd.source {
         vpngate::NodeListSource::Api => {
-            println!("# VPNGate live list ({} nodes from api/iphone)", nodes.len());
+            println!(
+                "# VPNGate live list ({} nodes from api/iphone)",
+                nodes.len()
+            );
             let _ = vpngate::save_cached_nodes(nodes);
         }
         vpngate::NodeListSource::WebScrape => {
@@ -155,15 +166,22 @@ async fn cmd_list(cli: &Cli, cfg: &Config, country: Option<String>, limit: usize
         }
     }
     let mut shown = 0usize;
-    println!("{:<4} {:<32} {:<22} {:>8} {:>6} {:>7} {:>5}  {:<6} {}", "idx", "host", "country", "score", "ping", "speed", "sess", "sstp", "isp");
+    println!(
+        "{:<4} {:<32} {:<22} {:>8} {:>6} {:>7} {:>5}  {:<6} {}",
+        "idx", "host", "country", "score", "ping", "speed", "sess", "sstp", "isp"
+    );
     for (i, n) in nodes.iter().enumerate() {
         if let Some(c) = &country {
             let c = c.to_lowercase();
-            if !n.country.to_lowercase().contains(&c) && !n.country_code.to_lowercase().contains(&c) {
+            if !n.country.to_lowercase().contains(&c) && !n.country_code.to_lowercase().contains(&c)
+            {
                 continue;
             }
         }
-        let port = n.port.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string());
+        let port = n
+            .port
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "?".to_string());
         println!(
             "{:<4} {:<32} {:<22} {:>8} {:>6} {:>7} {:>5}  {:<6} {}",
             i, n.host, n.country, n.score, n.ping_ms, n.speed_mbps, n.sessions, port, n.isp
@@ -237,8 +255,9 @@ async fn cmd_test(cli: &Cli, cfg: &Config, target: &str) -> i32 {
     println!("-- google https (https://www.google.com/) --");
     match tunnel.open_stream("www.google.com", 443, timeout).await {
         Ok(stream) => {
-            let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from("www.google.com".to_string())
-                .expect("valid server name");
+            let server_name =
+                tokio_rustls::rustls::pki_types::ServerName::try_from("www.google.com".to_string())
+                    .expect("valid server name");
             let tls = tokio_rustls::TlsConnector::from(net::verified_tls_config());
             match tokio::time::timeout(timeout, tls.connect(server_name, stream)).await {
                 Ok(Ok(mut tls)) => {
@@ -267,7 +286,14 @@ async fn cmd_test(cli: &Cli, cfg: &Config, target: &str) -> i32 {
     0
 }
 
-async fn cmd_connect(cli: &Cli, cfg: &Config, target: &str, listen: Option<String>, allow_lan: bool, system_proxy: bool) -> i32 {
+async fn cmd_connect(
+    cli: &Cli,
+    cfg: &Config,
+    target: &str,
+    listen: Option<String>,
+    allow_lan: bool,
+    system_proxy: bool,
+) -> i32 {
     let mut cfg = cfg.clone();
     if allow_lan {
         cfg.listen.allow_lan = true;
@@ -349,7 +375,9 @@ fn print_no_args_notice() {
     println!("基本用法（在命令行里运行）：");
     println!("  vpngate-client list                    列出节点");
     println!("  vpngate-client probe <节点>            探测节点是否能连");
-    println!("  vpngate-client connect <节点>          连接并开本地 SOCKS5 代理（默认 127.0.0.1:10808）");
+    println!(
+        "  vpngate-client connect <节点>          连接并开本地 SOCKS5 代理（默认 127.0.0.1:10818）"
+    );
     println!("  vpngate-client test <节点>             连接并测试隧道");
     println!("节点可以写 主机名:端口，例如 kanratown.opengw.net:992。");
     println!();
@@ -374,7 +402,17 @@ async fn main() {
             listen,
             allow_lan,
             system_proxy,
-        } => cmd_connect(&cli, &cfg, target, listen.clone(), *allow_lan, *system_proxy).await,
+        } => {
+            cmd_connect(
+                &cli,
+                &cfg,
+                target,
+                listen.clone(),
+                *allow_lan,
+                *system_proxy,
+            )
+            .await
+        }
         Cmd::Test { target } => cmd_test(&cli, &cfg, target).await,
     };
     std::process::exit(code);
