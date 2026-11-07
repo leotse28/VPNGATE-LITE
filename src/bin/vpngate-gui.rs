@@ -668,15 +668,11 @@ struct GuiApp {
     /// (Ctrl+click can toggle it out).
     selected_set: BTreeSet<usize>,
     /// Hostnames deleted from the list, kept out of every list load
-    /// until restored. Mirrors `Config::blocked_hosts` (canonical
+    /// until unblocked. Mirrors `Config::blocked_hosts` (canonical
     /// completed hostnames — see `blocked_key`); persisted via
-    /// auto-save.
+    /// auto-save. There is no restore button (v3.10): to unblock a
+    /// host, delete it from `blocked_hosts` in config.toml.
     blocked_hosts: BTreeSet<String>,
-    /// Full data of the nodes deleted in this session, so 恢复已删除
-    /// can put them back. Session-only: after a restart this is
-    /// empty and restore only clears the blocklist (the nodes come
-    /// back on the next refresh).
-    deleted_nodes: Vec<Node>,
     probes: HashMap<String, String>,
     /// Last successful probe latency per host (ms), parallel to
     /// `probes`: the 延迟/状态 sort reads this number, never
@@ -738,6 +734,21 @@ struct GuiApp {
     /// button would lose the gesture there — the press-time latch
     /// is what makes Shift+click select a range reliably.
     row_press_mods: Option<egui::Modifiers>,
+    /// Which node the row press started on (`None` when no press is
+    /// in flight, or when the press was not on a row at all). The
+    /// tolerant-click path used to key off the rows' CURRENT rects
+    /// on the release frame, which mis-selected whenever the rows
+    /// moved between press and release — the list scrolling under
+    /// the cursor, or a plain click on the vertical scrollbar
+    /// (row rects span the full list width, including the
+    /// scrollbar strip, so the track click selected whatever row
+    /// sat at that height and the next delete removed THAT row
+    /// while the one Leo meant stayed; the v3.9 delete bug). The
+    /// tolerant path now fires only for the node recorded here.
+    /// Recorded only when the press lands inside the list's clip
+    /// rect, which excludes the scrollbar strips, so a scrollbar
+    /// press records no row at all.
+    row_press_node: Option<usize>,
     /// One-shot request from the arrow keys: after ↑/↓ moves the
     /// selection, the row loop scrolls the selected row into view
     /// (see the row loop). Only set when the selection actually
@@ -788,7 +799,6 @@ impl Default for GuiApp {
             selected: None,
             selected_set: BTreeSet::new(),
             blocked_hosts: BTreeSet::new(),
-            deleted_nodes: Vec::new(),
             probes: HashMap::new(),
             probe_ms: HashMap::new(),
             busy: None,
@@ -812,6 +822,7 @@ impl Default for GuiApp {
             sort: None,
             row_press_pos: None,
             row_press_mods: None,
+            row_press_node: None,
             scroll_to_selected: false,
             node_list_scroll_y: 0.0,
             selected_row_in_view: false,
@@ -2085,10 +2096,8 @@ impl GuiApp {
     /// Delete the multi-selected nodes. The connected node is never
     /// deleted — if it is selected it is skipped and logged.
     /// Deleted hosts go on the persistent blocklist (so a refresh
-    /// never brings them back) and their full data is kept in
-    /// `deleted_nodes` for this session's restore. Probe results
-    /// for deleted hosts are cleaned up, and the selection is
-    /// cleared.
+    /// never brings them back). Probe results for deleted hosts are
+    /// cleaned up, and the selection is cleared.
     fn delete_selected(&mut self) {
         if !self.can_delete() {
             return;
@@ -2130,7 +2139,6 @@ impl GuiApp {
         // Remove highest index first so earlier indices stay valid.
         let mut idxs: Vec<usize> = self.selected_set.iter().copied().collect();
         idxs.sort_unstable_by(|a, b| b.cmp(a));
-        let mut kept: Vec<Node> = Vec::new();
         for i in idxs {
             let Some(node) = self.nodes.get(i) else {
                 continue;
@@ -2144,43 +2152,15 @@ impl GuiApp {
             self.probes.remove(&node.host);
             self.probe_ms.remove(&node.host);
             self.blocked_hosts.insert(key);
-            kept.push(node);
             removed += 1;
         }
-        self.deleted_nodes.extend(kept);
         (removed, skipped)
-    }
-
-    /// Clear the blocklist and, if this session deleted nodes, put
-    /// their full data back into the current list. After a restart
-    /// there is nothing in memory to put back — then only the block
-    /// record is cleared and the nodes return on the next refresh.
-    /// Clears the selection either way.
-    fn restore_deleted(&mut self) {
-        if self.blocked_hosts.is_empty() {
-            return;
-        }
-        let n_blocked = self.blocked_hosts.len();
-        self.blocked_hosts.clear();
-        let restored = std::mem::take(&mut self.deleted_nodes);
-        let n_restored = restored.len();
-        self.nodes.extend(restored);
-        self.clear_selection();
-        if n_restored > 0 {
-            self.status = format!("已恢复 {} 个节点。", n_restored);
-            self.log_line(format!(
-                "已恢复 {} 个节点，屏蔽列表已清空（原有 {} 个主机）。",
-                n_restored, n_blocked
-            ));
-        } else {
-            self.status = "已清除删除记录，下次刷新后节点恢复。".to_string();
-            self.log_line("已清除删除记录，下次刷新后节点恢复。".to_string());
-        }
     }
 
     /// Drop the blocked hosts from a freshly loaded list. Applied on
     /// every list load — API refresh, web scrape, cache, embedded
-    /// fallback — so a deleted node never comes back until restored.
+    /// fallback — so a deleted node never comes back until its host
+    /// is removed from `blocked_hosts` in config.toml.
     fn apply_blocklist(&self, nodes: Vec<Node>) -> Vec<Node> {
         if self.blocked_hosts.is_empty() {
             return nodes;
@@ -2534,6 +2514,11 @@ impl eframe::App for GuiApp {
                         if pressed {
                             self.row_press_pos = ptr_pos;
                             self.row_press_mods = Some(click_mods);
+                            // Clear first: the row loop below records
+                            // the pressed row (if the press is on one);
+                            // a stale value from an earlier gesture
+                            // must not survive a press elsewhere.
+                            self.row_press_node = None;
                         }
                         let (click_ctrl, click_shift) = Self::effective_click_mods(
                             self.row_press_mods,
@@ -2706,6 +2691,12 @@ impl eframe::App for GuiApp {
                         // The row rect spans the full available width
                         // (row_w, not just total_w) so clicks on the
                         // empty right part of a row still select it.
+                        // Frame-level flag for the click mutual
+                        // exclusion below: `clicked()` and the
+                        // tolerant path must not both fire in one
+                        // frame (they can land on different rows
+                        // once the list has moved).
+                        let mut row_clicked = false;
                         for (
                             display_i,
                             (node_idx, status_icon, country, isp, sessions, quality, hostport, status, full),
@@ -2715,6 +2706,24 @@ impl eframe::App for GuiApp {
                                 egui::vec2(row_w, row_h),
                                 egui::Sense::click(),
                             );
+                            // Record which row the press started on
+                            // (v3.10 delete fix): the tolerant-click
+                            // path below must fire for the PRESSED row,
+                            // not for whatever row the release point
+                            // happens to sit on after the list moved.
+                            // Only a press inside the list's clip rect
+                            // counts — the clip rect excludes the
+                            // scrollbar strips, so a scrollbar press
+                            // records no row and selects nothing.
+                            if pressed {
+                                if let Some(p) = self.row_press_pos {
+                                    if row_rect.contains(p)
+                                        && ui.clip_rect().contains(p)
+                                    {
+                                        self.row_press_node = Some(*node_idx);
+                                    }
+                                }
+                            }
                             // Highlight follows the multi-select set
                             // (see `click_row`): every row in the set
                             // gets the indigo fill and white text.
@@ -2827,17 +2836,29 @@ impl eframe::App for GuiApp {
                             // clicked row, a Ctrl toggle would toggle
                             // back out). `clicked()` wins when it fires;
                             // the tolerant path covers the 6–12 px drift
-                            // egui's click misses.
+                            // egui's click misses. The exclusion is
+                            // frame-level (`row_clicked`), not per-row:
+                            // once the list has moved, the two paths
+                            // can land on different rows. And the
+                            // tolerant path fires only for the row the
+                            // press started on (`row_press_node`) —
+                            // never for the row the release point sits
+                            // on now (the v3.9 delete bug: a press on
+                            // a row, the list scrolling under the
+                            // cursor, and the delete removing the
+                            // wrong row).
                             let clicked = row_resp.clicked();
                             if clicked {
+                                row_clicked = true;
                                 self.click_row(*node_idx, click_ctrl, click_shift);
-                            } else if released {
+                            } else if released && !row_clicked {
                                 if let (Some(origin), Some(pos)) =
                                     (self.row_press_pos, ptr_pos)
                                 {
+                                    // The 12 px budget still separates
+                                    // a click from a real scroll drag.
                                     if origin.distance(pos) < 12.0
-                                        && row_rect.contains(origin)
-                                        && row_rect.contains(pos)
+                                        && self.row_press_node == Some(*node_idx)
                                     {
                                         self.click_row(*node_idx, click_ctrl, click_shift);
                                     }
@@ -2847,6 +2868,7 @@ impl eframe::App for GuiApp {
                         if released {
                             self.row_press_pos = None;
                             self.row_press_mods = None;
+                            self.row_press_node = None;
                         }
                     });
                 // The list's current scroll offset (the arrow-key
@@ -2977,19 +2999,6 @@ impl eframe::App for GuiApp {
                     .clicked()
                 {
                     self.delete_selected();
-                }
-                if !self.blocked_hosts.is_empty() {
-                    let n_blocked = self.blocked_hosts.len();
-                    if ui
-                        .add(
-                            egui::Button::new(format!("恢复已删除 ({})", n_blocked))
-                                .min_size(btn_size),
-                        )
-                        .on_hover_text("清除屏蔽记录，并把本会话里删掉的节点放回列表")
-                        .clicked()
-                    {
-                        self.restore_deleted();
-                    }
                 }
                 ui.label("Ctrl+单击多选，Shift+单击选一个范围。");
             });
@@ -3868,10 +3877,9 @@ mod tests {
     }
 
     /// Delete: removes the selected nodes from the list, records
-    /// their hostnames on the persistent blocklist, keeps their full
-    /// data for this session's restore, cleans their probe results,
-    /// and clears the selection. The blocklist round-trips through
-    /// the config.
+    /// their hostnames on the persistent blocklist, cleans their
+    /// probe results, and clears the selection. The blocklist
+    /// round-trips through the config.
     #[test]
     fn delete_selected_removes_and_blocks() {
         let mut app = GuiApp::for_tests();
@@ -3892,12 +3900,6 @@ mod tests {
             app.blocked_hosts,
             BTreeSet::from(["a.opengw.net".to_string(), "c.opengw.net".to_string()])
         );
-        let deleted: Vec<&str> = app
-            .deleted_nodes
-            .iter()
-            .map(|n| n.host.as_str())
-            .collect();
-        assert_eq!(deleted, vec!["c.opengw.net", "a.opengw.net"]);
         // Probe results for the deleted hosts are gone; the kept
         // node's stay untouched (none recorded for b/d here).
         assert!(!app.probes.contains_key("c.opengw.net"));
@@ -3938,7 +3940,6 @@ mod tests {
             app.blocked_hosts,
             BTreeSet::from(["a.opengw.net".to_string()])
         );
-        assert_eq!(app.deleted_nodes.len(), 1);
         // The connected node was skipped even though it was selected.
         assert!(app.nodes.iter().any(|n| n.host == "b.opengw.net"));
     }
@@ -4014,72 +4015,6 @@ mod tests {
         let kept = app.apply_blocklist(bare);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].host, "z.opengw.net");
-    }
-
-    /// Restore puts this session's deleted nodes back and clears the
-    /// blocklist; the selection is cleared too.
-    #[test]
-    fn restore_deleted_puts_nodes_back() {
-        let mut app = GuiApp::for_tests();
-        app.nodes = four_nodes();
-        app.click_row(0, false, false);
-        app.click_row(2, true, false);
-        app.delete_selected();
-        assert_eq!(app.nodes.len(), 2);
-        assert_eq!(app.blocked_hosts.len(), 2);
-        app.restore_deleted();
-        assert!(app.blocked_hosts.is_empty());
-        assert!(app.deleted_nodes.is_empty());
-        let hosts: Vec<&str> = app.nodes.iter().map(|n| n.host.as_str()).collect();
-        assert_eq!(
-            hosts,
-            vec![
-                "b.opengw.net",
-                "d.opengw.net",
-                "c.opengw.net",
-                "a.opengw.net"
-            ],
-            "restored nodes come back (appended after the survivors)"
-        );
-        assert_eq!(app.selected, None);
-        assert!(app.selected_set.is_empty());
-        assert!(
-            app.log.iter().any(|l| l.contains("已恢复 2 个节点")),
-            "restore must be logged: {:?}",
-            app.log
-        );
-        // And the config round-trip carries the cleared blocklist.
-        assert!(app.current_config().blocked_hosts.is_empty());
-    }
-
-    /// After a restart there is nothing in memory to put back:
-    /// restore only clears the block record and says the nodes will
-    /// return on the next refresh.
-    #[test]
-    fn restore_without_session_copies_only_clears_blocklist() {
-        let mut app = GuiApp::for_tests();
-        app.nodes = vec![
-            node_in("x.opengw.net", "日本"),
-            node_in("y.opengw.net", "美国"),
-        ];
-        // A blocklist loaded from config.toml, with no deleted nodes
-        // in this session's memory (as after a restart).
-        app.blocked_hosts.insert("b.opengw.net".to_string());
-        app.click_row(0, false, false);
-        app.restore_deleted();
-        assert!(app.blocked_hosts.is_empty());
-        assert_eq!(app.nodes.len(), 2, "nothing in memory, nothing re-inserted");
-        assert!(app.selected_set.is_empty());
-        assert!(
-            app.log
-                .iter()
-                .any(|l| l.contains("已清除删除记录，下次刷新后节点恢复")),
-            "restart restore must log the next-refresh note: {:?}",
-            app.log
-        );
-        // And a later load really does bring the host back.
-        let kept = app.apply_blocklist(vec![node_in("b.opengw.net", "美国")]);
-        assert_eq!(kept.len(), 1);
     }
 
     #[test]
@@ -5207,8 +5142,7 @@ mod tests {
     /// Ctrl+click multi-select, then the 删除选中 button: clicking
     /// one row selects it, Ctrl+clicking a second row adds it to the
     /// set, and 删除选中 removes both rows and records them on the
-    /// blocklist; 恢复已删除 puts them back. Needs a graphics
-    /// adapter, like the render test.
+    /// blocklist. Needs a graphics adapter, like the render test.
     #[test]
     #[ignore = "drives the UI with kittest; needs a graphics adapter"]
     fn ctrl_click_multi_select_and_delete_button() {
@@ -5274,16 +5208,9 @@ mod tests {
         assert_eq!(harness.state().nodes[0].host, "c.opengw.net");
         assert_eq!(harness.state().blocked_hosts.len(), 2);
         assert!(harness.state().selected_set.is_empty());
-        // The restore button appears with the blocked count; clicking
-        // it puts this session's deleted nodes back.
-        let btn = harness.get_by_label("恢复已删除 (2)");
-        let center = btn.rect().center();
-        harness.drag_at(center);
-        harness.run();
-        harness.drop_at(center);
-        harness.run();
-        assert_eq!(harness.state().nodes.len(), 3);
-        assert!(harness.state().blocked_hosts.is_empty());
+        // No restore button any more (v3.10): the deleted hosts stay
+        // on the blocklist until unblocked in config.toml.
+        assert!(harness.query_by_label("恢复已删除 (2)").is_none());
     }
 
     /// Shift+click selects the whole range from the anchor to the
@@ -5632,6 +5559,235 @@ mod tests {
         assert_eq!(harness.state().nodes[0].host, "e.opengw.net");
         assert_eq!(harness.state().blocked_hosts.len(), 4);
         assert!(harness.state().selected_set.is_empty());
+        assert_eq!(harness.state().selected, None);
+    }
+
+    /// Reproduction for the v3.9 delete bug Leo reported on his
+    /// Windows machine: with the list sorted, clicking a row and
+    /// pressing "删除选中" logged "已删除 1 个节点" and grew the
+    /// blocklist, but the clicked row stayed in the list. The row
+    /// that goes must be exactly the clicked one, and the blocklist
+    /// must hold exactly its host. Needs a graphics adapter, like
+    /// the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn sorted_list_delete_removes_the_clicked_row() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "美国"),
+                    node_in("b.opengw.net", "日本"),
+                    node_in("c.opengw.net", "德国"),
+                    node_in("d.opengw.net", "法国"),
+                ];
+                // Country A-Z: 德国(c) < 日本(b) < 法国(d) < 美国(a),
+                // so display order [2, 1, 3, 0] differs from node order.
+                app.sort = Some((SortCol::Country, SortDir::Asc));
+                app
+            });
+        harness.run_steps(10);
+        assert_eq!(harness.state().display_indices(), vec![2, 1, 3, 0]);
+        // Click the 法国 row: display position 2, node index 3.
+        click_row_label(&mut harness, "法国");
+        assert_eq!(harness.state().selected, Some(3));
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([3]),
+            "clicking the 法国 row must select node index 3"
+        );
+        let _btn = harness.get_by_label("删除选中 (1)");
+        click_button_label(&mut harness, "删除选中 (1)");
+        let hosts: Vec<&str> = harness
+            .state()
+            .nodes
+            .iter()
+            .map(|n| n.host.as_str())
+            .collect();
+        assert_eq!(
+            hosts,
+            vec!["a.opengw.net", "b.opengw.net", "c.opengw.net"],
+            "the clicked row (d) must be gone, got: {:?}",
+            hosts
+        );
+        assert!(harness.state().blocked_hosts.contains("d.opengw.net"));
+        assert_eq!(harness.state().blocked_hosts.len(), 1);
+        assert!(harness.state().selected_set.is_empty());
+    }
+
+    /// Sorted-list multi-select + delete: Ctrl+click two rows in a
+    /// sorted list, delete, and both go — not the rows sitting at
+    /// those display positions in node order. Needs a graphics
+    /// adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn sorted_list_ctrl_click_delete_removes_both_rows() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "美国"),
+                    node_in("b.opengw.net", "日本"),
+                    node_in("c.opengw.net", "德国"),
+                    node_in("d.opengw.net", "法国"),
+                ];
+                app.sort = Some((SortCol::Country, SortDir::Asc));
+                app
+            });
+        harness.run_steps(10);
+        assert_eq!(harness.state().display_indices(), vec![2, 1, 3, 0]);
+        // Click 德国 (node 2) then Ctrl+click 美国 (node 0).
+        click_row_label(&mut harness, "德国");
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([2]),
+            "first click must select node index 2"
+        );
+        // Ctrl+click helper: plain click_row_label with Ctrl held.
+        {
+            use egui_kittest::kittest::Queryable as _;
+            let ctrl = egui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            };
+            let cell = harness.get_by_label("美国");
+            let center = cell.rect().center();
+            harness.event(egui::Event::ModifiersChanged(ctrl));
+            harness.drag_at(center);
+            harness.run();
+            harness.event(egui::Event::ModifiersChanged(ctrl));
+            harness.drop_at(center);
+            harness.run();
+            harness.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+            harness.run();
+        }
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0, 2]),
+            "Ctrl+click must add node index 0, got: {:?}",
+            harness.state().selected_set
+        );
+        let _btn = harness.get_by_label("删除选中 (2)");
+        click_button_label(&mut harness, "删除选中 (2)");
+        let hosts: Vec<&str> = harness
+            .state()
+            .nodes
+            .iter()
+            .map(|n| n.host.as_str())
+            .collect();
+        assert_eq!(
+            hosts,
+            vec!["b.opengw.net", "d.opengw.net"],
+            "only the two clicked rows must go, got: {:?}",
+            hosts
+        );
+        assert_eq!(harness.state().blocked_hosts.len(), 2);
+        assert!(harness.state().blocked_hosts.contains("a.opengw.net"));
+        assert!(harness.state().blocked_hosts.contains("c.opengw.net"));
+        assert!(harness.state().selected_set.is_empty());
+    }
+
+    /// Press on a row, scroll the list with the mouse wheel, then
+    /// release at the same screen point: the row that was PRESSED
+    /// must be selected — not whichever row has scrolled under the
+    /// cursor. This is the v3.9 delete bug (Leo): the tolerant-click
+    /// path keys off the rows' CURRENT rects, so a click whose rows
+    /// moved between press and release selects the wrong row, and
+    /// the delete then removes that row while the one Leo meant
+    /// stays. Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn drifted_click_after_scroll_selects_pressed_row() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = (1..=20)
+                    .map(|i| {
+                        node_in(
+                            &format!("n{:02}.opengw.net", i),
+                            &format!("国家{:02}", i),
+                        )
+                    })
+                    .collect();
+                app
+            });
+        harness.run_steps(10);
+        // Press on the 国家05 row (node index 4).
+        let cell = harness.get_by_label("国家05");
+        let center = cell.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        // Scroll the list down with the wheel while the button is
+        // held: the rows move, the pointer does not.
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -3.0),
+            modifiers: egui::Modifiers::default(),
+            phase: egui::TouchPhase::Move,
+        });
+        harness.run();
+        assert!(
+            harness.state().node_list_scroll_y > 30.0,
+            "the wheel must have scrolled the list by more than one row, got: {}",
+            harness.state().node_list_scroll_y
+        );
+        // Release at the same screen point (now over another row).
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(
+            harness.state().selected,
+            Some(4),
+            "the pressed row (node 4) must be selected, got: {:?} (set {:?})",
+            harness.state().selected,
+            harness.state().selected_set
+        );
+        assert_eq!(harness.state().selected_set, BTreeSet::from([4]));
+    }
+
+    /// Pressing and releasing on the vertical scrollbar must not
+    /// select any row. The tolerant-click path keys off any press
+    /// in the window and row rects span the full list width
+    /// (including the scrollbar strip), so a plain click on the
+    /// scrollbar track selected whatever row sat at that height —
+    /// and the next "删除选中" then removed that row while the one
+    /// Leo meant stayed. Needs a graphics adapter.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn scrollbar_press_does_not_select_a_row() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "美国"),
+                    node_in("b.opengw.net", "日本"),
+                    node_in("c.opengw.net", "德国"),
+                    node_in("d.opengw.net", "法国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        let cell = harness.get_by_label("德国");
+        let y = cell.rect().center().y;
+        // The vertical scrollbar sits at the far right edge of the
+        // list (window is 800 wide; the bar is ~10 px).
+        let on_bar = egui::pos2(787.0, y);
+        harness.drag_at(on_bar);
+        harness.run();
+        harness.drop_at(on_bar);
+        harness.run();
+        assert!(
+            harness.state().selected_set.is_empty(),
+            "a scrollbar press must not select any row, got: {:?}",
+            harness.state().selected_set
+        );
         assert_eq!(harness.state().selected, None);
     }
 

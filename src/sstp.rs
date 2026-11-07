@@ -1150,7 +1150,7 @@ impl SstpTunnel {
         let dst_ip_str = resolve_ipv4(&self.connector, dst_host).await?;
         let dst_ip: Ipv4Addr = dst_ip_str
             .parse()
-            .map_err(|_| format!("bad resolved IP {}", dst_ip_str))?;
+            .map_err(|_| format!("resolved {} to {}, which is not an IPv4 address (the tunnel is IPv4-only)", dst_host, dst_ip_str))?;
         // Allocate a unique source port.
         let src_port = loop {
             let rb = random_bytes(2);
@@ -1257,7 +1257,7 @@ impl SstpTunnel {
         let dst_ip_str = resolve_ipv4(&self.connector, dst_host).await?;
         let dst_ip: Ipv4Addr = dst_ip_str
             .parse()
-            .map_err(|_| format!("bad resolved IP {}", dst_ip_str))?;
+            .map_err(|_| format!("resolved {} to {}, which is not an IPv4 address (the tunnel is IPv4-only)", dst_host, dst_ip_str))?;
         self.open_udp_flow_ip(dst_ip, dst_port).await
     }
 
