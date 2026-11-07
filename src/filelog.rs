@@ -31,8 +31,17 @@ pub const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 /// File name, always next to the exe (portable dir, same as config.toml).
 pub const LOG_FILE_NAME: &str = "vpngate-gui.log";
 
-/// Rotation target: the previous file is kept under this name.
-pub const OLD_LOG_FILE_NAME: &str = "vpngate-gui.log.old";
+/// Path of the rotated file for a given log path: the log path with
+/// ".old" appended (`vpngate-gui.log` -> `vpngate-gui.log.old`, the
+/// same name as before for the real log). Per-path, not a fixed
+/// name in the directory — so two loggers in the same directory
+/// (e.g. two tests running in parallel) never share a `.old` file
+/// and cannot delete each other's rotated log mid-test.
+pub fn old_log_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".old");
+    PathBuf::from(s)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogLevel {
@@ -199,7 +208,7 @@ impl FileLogger {
     fn rotate(&mut self) {
         // Close our handle first (dropping is what closes it).
         self.file.take();
-        let old_path = self.path.with_file_name(OLD_LOG_FILE_NAME);
+        let old_path = old_log_path(&self.path);
         let _ = std::fs::remove_file(&old_path);
         let renamed = std::fs::rename(&self.path, &old_path).is_ok();
         let opened = if renamed {
@@ -275,7 +284,7 @@ mod tests {
     #[test]
     fn writes_lines_with_timestamp_and_level() {
         let path = tmp_path("lines");
-        let old = path.with_file_name(OLD_LOG_FILE_NAME);
+        let old = old_log_path(&path);
         let mut log = FileLogger::new(&path);
         assert!(log.is_open(), "fresh temp file must open");
         log.log(LogLevel::Info, "hello info");
@@ -302,7 +311,7 @@ mod tests {
     #[test]
     fn rotates_after_max_bytes_and_keeps_old() {
         let path = tmp_path("rotate");
-        let old = path.with_file_name(OLD_LOG_FILE_NAME);
+        let old = old_log_path(&path);
         // Each line is ~50 bytes ("YYYY-MM-DD HH:MM:SS [INFO] " is 27
         // + "rotation line number N" is 22 + newline): with a 200-byte
         // limit, lines 0-3 fill the file, line 4 rotates (.old gets
@@ -402,7 +411,7 @@ mod tests {
     #[test]
     fn header_written_to_file() {
         let path = tmp_path("header");
-        let old = path.with_file_name(OLD_LOG_FILE_NAME);
+        let old = old_log_path(&path);
         let mut cfg = Config::default();
         cfg.front_proxy.enabled = true;
         cfg.front_proxy.addr = "192.168.236.197:10808".to_string();

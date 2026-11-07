@@ -8,7 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -157,17 +157,18 @@ enum ProbeFailure {
     NodeDown(String),
 }
 
-/// A live connection: tunnel + the SOCKS5 server task(s) + the optional
+/// A live connection: tunnel + the mixed proxy server task(s) + the optional
 /// system-proxy guard. Dropping the tunnel Arc closes the TLS stream
 /// (the lib's writer task sends close_notify when its channel closes).
-/// With LAN sharing on there are two serve tasks (local + LAN) sharing
-/// the one tunnel; both are aborted together on disconnect.
+/// With LAN sharing on, the one server binds the wildcard address
+/// (0.0.0.0:local_port) instead of a second port; the task is
+/// aborted on disconnect.
 struct ActiveConnection {
     tunnel: Arc<SstpTunnel>,
     serve: Vec<tokio::task::JoinHandle<()>>,
     proxy_guard: Option<SystemProxyGuard>,
     /// Display label, e.g. "127.0.0.1:10818" or
-    /// "127.0.0.1:10818 ＋ 0.0.0.0:10809".
+    /// "127.0.0.1:10818 ＋ 0.0.0.0:10818".
     listen_addr: String,
     node_label: String,
     vip: Ipv4Addr,
@@ -387,15 +388,19 @@ async fn front_proxy_test_flow(
 /// own 10 s timeout, twice over, for two sites.
 const FRONT_PROXY_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Connect the tunnel, start the local SOCKS5 server(s), optionally set
-/// the system proxy. Runs on a background task; returns the live
-/// connection. `listen_addrs` is always the local address first, plus
-/// the LAN address when LAN sharing is on; both servers share the one
-/// tunnel, and the system proxy (if on) points at the local address.
+/// Connect the tunnel, start the local mixed proxy server(s),
+/// optionally set the system proxy. Runs on a background task;
+/// returns the live connection. `listen_addrs` is the address(es)
+/// to actually bind (one mixed server per address); `listen_display`
+/// is what the user sees (loopback always, plus the LAN address
+/// when sharing is on — a single wildcard bind under the hood).
+/// Both servers share the one tunnel, and the system proxy (if on)
+/// points at the loopback address, never 0.0.0.0.
 async fn connect_flow(
     connector: Connector,
     target: String,
     listen_addrs: Vec<String>,
+    listen_display: String,
     timeout: Duration,
     system_proxy: bool,
     service: Option<String>,
@@ -411,7 +416,7 @@ async fn connect_flow(
     for addr in &listen_addrs {
         let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
             format!(
-                "本地 SOCKS5 无法监听 {}：{}（端口可能被占用，换一个端口再试）",
+                "本地混合代理无法监听 {}：{}（端口可能被占用，换一个端口再试）",
                 addr, e
             )
         })?;
@@ -419,17 +424,19 @@ async fn connect_flow(
     }
     let mut serve = Vec::new();
     for listener in listeners {
-        serve.push(tokio::spawn(vpngate_client::socks5::serve_socks5(
+        serve.push(tokio::spawn(vpngate_client::socks5::serve_mixed(
             listener,
             tunnel.clone(),
             timeout,
         )));
     }
-    let listen_addr = listen_addrs.join(" ＋ ");
+    let listen_addr = listen_display;
     let mut guard = None;
     if system_proxy {
-        // System proxy always points at the local port (first address).
-        match SystemProxyGuard::set(&listen_addrs[0], service.as_deref()) {
+        // System proxy always points at the loopback address (a
+        // 0.0.0.0 bind is not a usable proxy address).
+        let sysproxy_addr = vpngate_client::config::loopback_of(&listen_addrs[0]);
+        match SystemProxyGuard::set(&sysproxy_addr, service.as_deref()) {
             Ok(g) => guard = Some(g),
             Err(e) => {
                 for s in &serve {
@@ -642,7 +649,27 @@ struct GuiApp {
     config_path: Option<std::path::PathBuf>,
     nodes: Vec<Node>,
     nodes_source: String,
+    /// Anchor row: the last clicked row (an index into `self.nodes`,
+    /// not a display position). Enter / Ctrl+R / the 探测 and 连接
+    /// buttons act on this row; `None` means nothing is current and
+    /// those actions are unavailable, as before.
     selected: Option<usize>,
+    /// Multi-select set: node indices selected by click / Ctrl+click
+    /// / Shift+click (see `click_row`). This is what 删除选中
+    /// deletes, and the row highlight follows this set — not the
+    /// anchor alone. The anchor is not necessarily in the set
+    /// (Ctrl+click can toggle it out).
+    selected_set: BTreeSet<usize>,
+    /// Hostnames deleted from the list, kept out of every list load
+    /// until restored. Mirrors `Config::blocked_hosts` (canonical
+    /// completed hostnames — see `blocked_key`); persisted via
+    /// auto-save.
+    blocked_hosts: BTreeSet<String>,
+    /// Full data of the nodes deleted in this session, so 恢复已删除
+    /// can put them back. Session-only: after a restart this is
+    /// empty and restore only clears the blocklist (the nodes come
+    /// back on the next refresh).
+    deleted_nodes: Vec<Node>,
     probes: HashMap<String, String>,
     /// Last successful probe latency per host (ms), parallel to
     /// `probes`: the 延迟/状态 sort reads this number, never
@@ -671,16 +698,18 @@ struct GuiApp {
     front_user: String,
     front_pass: String,
     local_port: u16,
-    lan_port: u16,
     allow_lan: bool,
     system_proxy: bool,
-    /// Node-list column widths in pixels (country, ISP, host:port,
-    /// latency/status). Draggable at the header separators; persisted
-    /// to config.toml with the rest of the settings via auto-save.
-    /// The status column (∞ for the connected node) is a fixed 28 px
-    /// and is NOT in this array — it has no separator and is not
-    /// resizable, so old config files keep loading as-is.
-    col_widths: [u16; 4],
+    /// Node-list column widths in pixels, in display order: country,
+    /// ISP, 当前人数， 线路质量， host:port, latency/status. Draggable
+    /// at the header separators (every resizable column but the last
+    /// has one); persisted to config.toml with the rest of the
+    /// settings via auto-save. The status column (∞ for the connected
+    /// node) is a fixed 28 px and is NOT in this array — it has no
+    /// separator and is not resizable. Pre-v3.7 configs stored only
+    /// 4 widths; those migrate on load (see `de_col_widths` in
+    /// config.rs), so old config files keep loading as-is.
+    col_widths: [u16; 6],
     /// List sort: `None` = fetch order (startup default), `Some`
     /// = (column, direction) the user picked by clicking a
     /// sortable header （国家/地区 / 当前人数 / 线路质量 / 延迟/状态）.
@@ -743,6 +772,9 @@ impl Default for GuiApp {
             nodes: vpngate::curated_nodes(),
             nodes_source: "内嵌列表（28 个已知节点）".to_string(),
             selected: None,
+            selected_set: BTreeSet::new(),
+            blocked_hosts: BTreeSet::new(),
+            deleted_nodes: Vec::new(),
             probes: HashMap::new(),
             probe_ms: HashMap::new(),
             busy: None,
@@ -760,7 +792,6 @@ impl Default for GuiApp {
             front_user: String::new(),
             front_pass: String::new(),
             local_port: 10818,
-            lan_port: 10809,
             allow_lan: false,
             system_proxy: false,
             col_widths: vpngate_client::config::UiSettings::default().node_col_widths,
@@ -945,6 +976,9 @@ impl GuiApp {
         } else {
             vpngate::NodeListSource::Curated
         };
+        // The blocklist (loaded from config.toml just above) filters
+        // the startup list too, like every other load.
+        let nodes = app.apply_blocklist(nodes);
         let n = nodes.len();
         app.nodes = nodes;
         app.nodes_source = source.label(n, cache_age);
@@ -993,10 +1027,10 @@ impl GuiApp {
         self.front_user = cfg.front_proxy.username.clone().unwrap_or_default();
         self.front_pass = cfg.front_proxy.password.clone().unwrap_or_default();
         self.local_port = cfg.listen.local_port;
-        self.lan_port = cfg.listen.lan_port;
         self.allow_lan = cfg.listen.allow_lan;
         self.system_proxy = cfg.system_proxy.enabled;
         self.col_widths = cfg.ui.node_col_widths;
+        self.blocked_hosts = cfg.blocked_hosts.iter().cloned().collect();
     }
 
     /// Build the current settings as a Config (for saving).
@@ -1015,10 +1049,12 @@ impl GuiApp {
             Some(self.front_pass.clone())
         };
         cfg.listen.local_port = self.local_port;
-        cfg.listen.lan_port = self.lan_port;
         cfg.listen.allow_lan = self.allow_lan;
         cfg.system_proxy.enabled = self.system_proxy;
         cfg.ui.node_col_widths = self.col_widths;
+        // BTreeSet iteration is sorted, so the saved list is in a
+        // stable order across runs.
+        cfg.blocked_hosts = self.blocked_hosts.iter().cloned().collect();
         cfg
     }
 
@@ -1318,12 +1354,16 @@ impl GuiApp {
         self.log_line("已请求停止探测全部，当前节点测完后停下。".to_string());
     }
 
-    /// Listen addresses for the next connection, from the live UI
-    /// fields: always the local port, plus the LAN port when LAN
-    /// sharing is on. Fails (with a plain message) when LAN sharing
-    /// is on and both ports are the same.
-    fn listen_addrs(&self) -> Result<Vec<String>, String> {
+    /// Addresses to actually bind for the next connection, from the
+    /// live UI fields: the local port, or the same port on all
+    /// interfaces when LAN sharing is on (one mixed server).
+    fn listen_addrs(&self) -> Vec<String> {
         self.current_config().listen.listen_addrs()
+    }
+
+    /// What the user sees for the next connection's local proxy.
+    fn listen_display(&self) -> String {
+        self.current_config().listen.display_addrs()
     }
 
     fn start_connect(&mut self, ctx: egui::Context) {
@@ -1341,14 +1381,8 @@ impl GuiApp {
             Some(p) => format!("{}:{}", vpngate::complete_ddns_host(&node.host), p),
             None => vpngate::complete_ddns_host(&node.host),
         };
-        let listen_addrs = match self.listen_addrs() {
-            Ok(a) => a,
-            Err(e) => {
-                self.status = "连接失败。".to_string();
-                self.set_error(format!("连接失败：{}。", e));
-                return;
-            }
-        };
+        let listen_addrs = self.listen_addrs();
+        let listen_display = self.listen_display();
         self.busy = Some(Busy::Connecting);
         self.status = format!("正在连接 {}…", target);
         self.error.clear();
@@ -1375,6 +1409,7 @@ impl GuiApp {
                 connector,
                 target.clone(),
                 listen_addrs,
+                listen_display,
                 timeout,
                 system_proxy,
                 service,
@@ -1465,7 +1500,6 @@ impl GuiApp {
         match ev {
             GuiEvent::Nodes(upd) => {
                 self.busy = None;
-                let n = upd.nodes.len();
                 // A fresh list from the API or the web scrape is worth
                 // caching, so the next failed refresh still has a recent
                 // list to show.
@@ -1475,9 +1509,14 @@ impl GuiApp {
                 ) {
                     let _ = vpngate::save_cached_nodes(&upd.nodes);
                 }
-                self.nodes = upd.nodes;
+                // Deleted hosts never come back: the blocklist filters
+                // every load — API, web scrape, cache, embedded.
+                // (The cache above still stores the full list; the
+                // filter re-applies when the cache is loaded.)
+                self.nodes = self.apply_blocklist(upd.nodes);
+                let n = self.nodes.len();
                 self.nodes_source = upd.source.label(n, upd.cache_age_secs);
-                self.selected = None;
+                self.clear_selection();
                 match upd.source {
                     vpngate::NodeListSource::Api => {
                         self.status = format!("节点列表已更新：{} 个节点。", n);
@@ -1691,7 +1730,7 @@ impl GuiApp {
                 self.status = format!("已连接 {}，虚拟 IP {}。", c.node_label, c.vip);
                 self.error.clear();
                 self.log_line(format!(
-                    "已连接 {}，虚拟 IP {}，本地 SOCKS5 {}。浏览器/应用连这个端口即可上网。",
+                    "已连接 {}，虚拟 IP {}，本地混合代理（SOCKS5+HTTP）{}。浏览器/应用连这个端口即可上网。",
                     c.node_label, c.vip, c.listen_addr
                 ));
                 self.conn = Some(*c);
@@ -1875,6 +1914,15 @@ impl GuiApp {
         }
     }
 
+    /// Canonical key for the blocklist: the completed DDNS hostname
+    /// (a bare API label like "public-vpn-192" becomes
+    /// "public-vpn-192.opengw.net"), so a node matches its block
+    /// entry no matter which source listed it — and so the
+    /// connected-node check compares like with like.
+    fn blocked_key(host: &str) -> String {
+        vpngate::complete_ddns_host(host)
+    }
+
     /// Host of the currently connected node, if any (the `node_label`
     /// is the target string, "host" or "host:port", with the DDNS
     /// suffix already completed). The status column shows ∞ for the
@@ -1921,8 +1969,174 @@ impl GuiApp {
         };
         if Some(order[new_pos]) != self.selected {
             self.selected = Some(order[new_pos]);
+            // Arrow keys keep the v3.4 behaviour: the multi-select
+            // collapses to just the row the anchor moved to.
+            self.selected_set = BTreeSet::from([order[new_pos]]);
             self.scroll_to_selected = true;
         }
+    }
+
+    /// Clear both halves of the selection: the anchor and the
+    /// multi-select set (used after a delete, a restore, and a list
+    /// reload — indices from the old list are meaningless there).
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.selected_set.clear();
+    }
+
+    /// Click selection for a row (`node_idx` is an index into
+    /// `self.nodes`, not a display position). Plain click selects
+    /// only that row; Ctrl/Cmd+click toggles it in or out of the
+    /// multi-select set; Shift+click selects the whole range from
+    /// the anchor to this row in display order. Every click moves
+    /// the anchor to the clicked row — the anchor is the row Enter /
+    /// Ctrl+R / 探测 / 连接 act on, while 删除选中 deletes the set.
+    fn click_row(&mut self, node_idx: usize, ctrl: bool, shift: bool) {
+        if shift {
+            if let Some(anchor) = self.selected {
+                let order = self.display_indices();
+                match (
+                    order.iter().position(|&i| i == anchor),
+                    order.iter().position(|&i| i == node_idx),
+                ) {
+                    (Some(a), Some(b)) => {
+                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                        self.selected_set =
+                            order[lo..=hi].iter().copied().collect();
+                    }
+                    // Anchor or clicked row is gone (the list was
+                    // reloaded between clicks): fall back to
+                    // selecting just this row.
+                    _ => self.selected_set = BTreeSet::from([node_idx]),
+                }
+            } else {
+                self.selected_set = BTreeSet::from([node_idx]);
+            }
+        } else if ctrl {
+            if !self.selected_set.remove(&node_idx) {
+                self.selected_set.insert(node_idx);
+            }
+        } else {
+            self.selected_set = BTreeSet::from([node_idx]);
+        }
+        self.selected = Some(node_idx);
+    }
+
+    /// Whether 删除选中 may run: a non-empty selection and no job
+    /// running (probe / connect / refresh / probe-all all set
+    /// `busy` — the same guard as the 刷新节点 button). Deleting
+    /// mid-sweep would change the list under the running probe-all.
+    fn can_delete(&self) -> bool {
+        !self.selected_set.is_empty() && self.busy.is_none()
+    }
+
+    /// Delete the multi-selected nodes. The connected node is never
+    /// deleted — if it is selected it is skipped and logged.
+    /// Deleted hosts go on the persistent blocklist (so a refresh
+    /// never brings them back) and their full data is kept in
+    /// `deleted_nodes` for this session's restore. Probe results
+    /// for deleted hosts are cleaned up, and the selection is
+    /// cleared.
+    fn delete_selected(&mut self) {
+        if !self.can_delete() {
+            return;
+        }
+        let connected = self.connected_node_host();
+        self.delete_selected_with_connected(connected.as_deref());
+    }
+
+    /// `delete_selected` with the connected host supplied directly
+    /// (the live path passes `connected_node_host()`): the list
+    /// mutation plus the status/log reporting, so the connected-node
+    /// skip wording is unit-testable without a live tunnel.
+    fn delete_selected_with_connected(&mut self, connected_host: Option<&str>) {
+        let (removed, skipped) = self.delete_selected_except(connected_host);
+        self.clear_selection();
+        if skipped > 0 {
+            self.log_line(format!("已连接的节点不能删除，已跳过 {}。", skipped));
+        }
+        if removed > 0 {
+            self.status = format!(
+                "已删除 {} 个节点（已记入屏蔽列表，刷新后也不会回来）。",
+                removed
+            );
+            self.log_line(format!(
+                "已删除 {} 个节点：屏蔽列表现在有 {} 个主机。",
+                removed,
+                self.blocked_hosts.len()
+            ));
+        }
+    }
+
+    /// Core of `delete_selected`, split out so the connected-node
+    /// skip is unit-testable without a live tunnel:
+    /// `connected_host` is the completed hostname of the connected
+    /// node, if any. Returns (removed, skipped).
+    fn delete_selected_except(&mut self, connected_host: Option<&str>) -> (usize, usize) {
+        let mut removed = 0usize;
+        let mut skipped = 0usize;
+        // Remove highest index first so earlier indices stay valid.
+        let mut idxs: Vec<usize> = self.selected_set.iter().copied().collect();
+        idxs.sort_unstable_by(|a, b| b.cmp(a));
+        let mut kept: Vec<Node> = Vec::new();
+        for i in idxs {
+            let Some(node) = self.nodes.get(i) else {
+                continue;
+            };
+            let key = Self::blocked_key(&node.host);
+            if connected_host == Some(key.as_str()) {
+                skipped += 1;
+                continue;
+            }
+            let node = self.nodes.remove(i);
+            self.probes.remove(&node.host);
+            self.probe_ms.remove(&node.host);
+            self.blocked_hosts.insert(key);
+            kept.push(node);
+            removed += 1;
+        }
+        self.deleted_nodes.extend(kept);
+        (removed, skipped)
+    }
+
+    /// Clear the blocklist and, if this session deleted nodes, put
+    /// their full data back into the current list. After a restart
+    /// there is nothing in memory to put back — then only the block
+    /// record is cleared and the nodes return on the next refresh.
+    /// Clears the selection either way.
+    fn restore_deleted(&mut self) {
+        if self.blocked_hosts.is_empty() {
+            return;
+        }
+        let n_blocked = self.blocked_hosts.len();
+        self.blocked_hosts.clear();
+        let restored = std::mem::take(&mut self.deleted_nodes);
+        let n_restored = restored.len();
+        self.nodes.extend(restored);
+        self.clear_selection();
+        if n_restored > 0 {
+            self.status = format!("已恢复 {} 个节点。", n_restored);
+            self.log_line(format!(
+                "已恢复 {} 个节点，屏蔽列表已清空（原有 {} 个主机）。",
+                n_restored, n_blocked
+            ));
+        } else {
+            self.status = "已清除删除记录，下次刷新后节点恢复。".to_string();
+            self.log_line("已清除删除记录，下次刷新后节点恢复。".to_string());
+        }
+    }
+
+    /// Drop the blocked hosts from a freshly loaded list. Applied on
+    /// every list load — API refresh, web scrape, cache, embedded
+    /// fallback — so a deleted node never comes back until restored.
+    fn apply_blocklist(&self, nodes: Vec<Node>) -> Vec<Node> {
+        if self.blocked_hosts.is_empty() {
+            return nodes;
+        }
+        nodes
+            .into_iter()
+            .filter(|n| !self.blocked_hosts.contains(&Self::blocked_key(&n.host)))
+            .collect()
     }
 
     /// Keyboard shortcuts (Enter = connect, Ctrl+R = probe): the pure
@@ -2207,21 +2421,19 @@ impl eframe::App for GuiApp {
                         // window at the default widths.
                         ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
                         // Status column (∞) is fixed 28 px and never
-                        // resizable, and the two new columns （当前人数 /
-                        // 线路质量） are fixed too, so the old 4-element
-                        // node_col_widths in config.toml keeps loading
-                        // as-is; the other four come from config.
+                        // resizable; the other six columns （国家/地
+                        // 区、运营商、当前人数、线路质量、主机:端口、
+                        // 延迟/状态） all come from `col_widths`
+                        // (config `node_col_widths`, 6 elements).
                         const STATUS_COL_W: f32 = 28.0;
-                        const SESSIONS_COL_W: f32 = 64.0;
-                        const QUALITY_COL_W: f32 = 88.0;
                         let widths: [f32; 7] = [
                             STATUS_COL_W,
                             self.col_widths[0] as f32,
                             self.col_widths[1] as f32,
-                            SESSIONS_COL_W,
-                            QUALITY_COL_W,
                             self.col_widths[2] as f32,
                             self.col_widths[3] as f32,
+                            self.col_widths[4] as f32,
+                            self.col_widths[5] as f32,
                         ];
                         // 30 px rows: 22 px was easy to miss, and a
                         // click that drifts a few pixels is lost to the
@@ -2254,6 +2466,15 @@ impl eframe::App for GuiApp {
                                 i.pointer.interact_pos(),
                             )
                         });
+                        // Modifier keys on this frame, for the row
+                        // clicks below: Ctrl/Cmd+click toggles a row
+                        // in the multi-select set, Shift+click selects
+                        // a range from the anchor. `command` is Cmd on
+                        // macOS and Ctrl elsewhere, so Ctrl+click works
+                        // on both.
+                        let click_mods = ui.input(|i| i.modifiers);
+                        let click_ctrl = click_mods.ctrl || click_mods.command;
+                        let click_shift = click_mods.shift;
                         if pressed {
                             self.row_press_pos = ptr_pos;
                         }
@@ -2356,17 +2577,24 @@ impl eframe::App for GuiApp {
                             if i < 6 {
                                 x += gap;
                                 // Separator after a resizable column
-                                // only: country (1) -> col_widths[0],
-                                // ISP (2) -> col_widths[1], host:port
-                                // (5) -> col_widths[2]. The status
+                                // only, and it resizes that column:
+                                // country (1) -> col_widths[0], ISP
+                                // (2) -> col_widths[1], 当前人数
+                                // (3) -> col_widths[2], 线路质量
+                                // (4) -> col_widths[3], host:port
+                                // (5) -> col_widths[4]. The status
                                 // column keeps the same gap but no
-                                // handle, the two fixed columns （当前人
-                                // 数 / 线路质量） have none, and the
-                                // last column has none.
+                                // handle, and the last column
+                                // (延迟/状态， 6) has none — so it is
+                                // the one resizable column that cannot
+                                // be dragged (its width is still
+                                // stored in col_widths[5]).
                                 let sep_col = match i {
                                     1 => Some(0usize),
                                     2 => Some(1usize),
-                                    5 => Some(2usize),
+                                    3 => Some(2usize),
+                                    4 => Some(3usize),
+                                    5 => Some(4usize),
                                     _ => None,
                                 };
                                 if let Some(wi) = sep_col {
@@ -2423,14 +2651,21 @@ impl eframe::App for GuiApp {
                                 egui::vec2(row_w, row_h),
                                 egui::Sense::click(),
                             );
-                            let selected = self.selected == Some(*node_idx);
+                            // Highlight follows the multi-select set
+                            // (see `click_row`): every row in the set
+                            // gets the indigo fill and white text.
+                            // The arrow-key follow-scroll and the
+                            // visibility bookkeeping below still track
+                            // the anchor row only (`self.selected`).
+                            let selected = self.selected_set.contains(node_idx);
+                            let is_anchor = self.selected == Some(*node_idx);
                             // Arrow-key follow-scroll: a one-shot
                             // request from move_selection. Align None
                             // scrolls only as far as needed to bring
                             // the row into view (already-visible rows
                             // don't move the list). The target is
                             // consumed by this (innermost) ScrollArea.
-                            if self.scroll_to_selected && selected {
+                            if self.scroll_to_selected && is_anchor {
                                 ui.scroll_to_rect(row_rect, None);
                                 self.scroll_to_selected = false;
                             }
@@ -2444,7 +2679,7 @@ impl eframe::App for GuiApp {
                             // Recomputed every frame (the scroll
                             // target above only takes effect after
                             // this frame's show).
-                            if selected {
+                            if is_anchor {
                                 let clip = ui.clip_rect();
                                 self.selected_row_in_view = row_rect.top() >= clip.top()
                                     && row_rect.bottom() <= clip.bottom();
@@ -2515,8 +2750,12 @@ impl eframe::App for GuiApp {
                             let row_resp = row_resp
                                 .on_hover_text(full)
                                 .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            // Click selection (see `click_row`): plain
+                            // click selects only this row, Ctrl/Cmd
+                            // toggles it in the multi-select set,
+                            // Shift selects a range from the anchor.
                             if row_resp.clicked() {
-                                self.selected = Some(*node_idx);
+                                self.click_row(*node_idx, click_ctrl, click_shift);
                             }
                             // Tolerant click: egui only counts a click
                             // when the pointer moves under 6 px, and a
@@ -2524,7 +2763,8 @@ impl eframe::App for GuiApp {
                             // drag instead — so a press and a release on
                             // the same row within 12 px also selects it.
                             // (The press position was recorded above the
-                            // row loop, on the press frame.)
+                            // row loop, on the press frame; the
+                            // modifiers are this frame's, like clicked.)
                             if released {
                                 if let (Some(origin), Some(pos)) =
                                     (self.row_press_pos, ptr_pos)
@@ -2533,7 +2773,7 @@ impl eframe::App for GuiApp {
                                         && row_rect.contains(origin)
                                         && row_rect.contains(pos)
                                     {
-                                        self.selected = Some(*node_idx);
+                                        self.click_row(*node_idx, click_ctrl, click_shift);
                                     }
                                 }
                             }
@@ -2642,12 +2882,56 @@ impl eframe::App for GuiApp {
                     None => ui.label("未选择节点"),
                 };
             });
-            // 常用开关和端口放主面板上，不用展开高级设置也能看到；改动会自动保存。
-            // 端口只在连接时生效：连接中两个端口输入都锁住；局域网端口只在
-            // 勾选局域网分享时可改。
+            // Batch delete: removes the multi-selected rows from the
+            // list and records their hostnames on the persistent
+            // blocklist, so a refresh never brings them back. Busy
+            // jobs (probe / connect / refresh / probe-all) disable
+            // it — same guard as 刷新节点. The restore button only
+            // shows while the blocklist is non-empty.
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.allow_lan, "允许局域网分享（绑定 0.0.0.0）")
-                    .on_hover_text("开启后，局域网里的其他设备也能连这个本地代理端口");
+                let btn_size = egui::vec2(96.0, 34.0);
+                let n_sel = self.selected_set.len();
+                let delete_label = if n_sel > 0 {
+                    format!("删除选中 ({})", n_sel)
+                } else {
+                    "删除选中".to_string()
+                };
+                if ui
+                    .add_enabled(
+                        self.can_delete(),
+                        egui::Button::new(delete_label).min_size(btn_size),
+                    )
+                    .on_hover_text("删除选中的节点，并记入屏蔽列表（刷新后也不会回来）")
+                    .on_disabled_hover_text(if n_sel == 0 {
+                        "请先选择要删除的节点（单击选一行，Ctrl+单击多选）"
+                    } else {
+                        "正在忙，请稍候"
+                    })
+                    .clicked()
+                {
+                    self.delete_selected();
+                }
+                if !self.blocked_hosts.is_empty() {
+                    let n_blocked = self.blocked_hosts.len();
+                    if ui
+                        .add(
+                            egui::Button::new(format!("恢复已删除 ({})", n_blocked))
+                                .min_size(btn_size),
+                        )
+                        .on_hover_text("清除屏蔽记录，并把本会话里删掉的节点放回列表")
+                        .clicked()
+                    {
+                        self.restore_deleted();
+                    }
+                }
+                ui.label("Ctrl+单击多选，Shift+单击选一个范围。");
+            });
+            // 常用开关和端口放主面板上，不用展开高级设置也能看到；改动会自动保存。
+            // 本地端口只在连接时生效，连接中锁住；局域网分享用同一个
+            // 混合端口（SOCKS5+HTTP），不再另开端口。
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.allow_lan, "允许局域网分享（混合端口同时监听 0.0.0.0）")
+                    .on_hover_text("开启后，局域网里的其他设备也能连这个本地混合代理端口——同一个端口，不用再多占一个");
                 ui.checkbox(&mut self.system_proxy, "设置系统代理（断开/退出时还原）")
                     .on_hover_text("开启后，系统代理会指到本地端口；关闭或退出时自动还原。");
             });
@@ -2659,25 +2943,15 @@ impl eframe::App for GuiApp {
                     egui::DragValue::new(&mut self.local_port).range(1..=65535),
                 )
                 .on_disabled_hover_text("连接中，断开后才能改端口");
-                ui.label("局域网端口：");
-                ui.add_enabled(
-                    !connected && self.allow_lan,
-                    egui::DragValue::new(&mut self.lan_port).range(1..=65535),
-                )
-                .on_disabled_hover_text(if connected {
-                    "连接中，断开后才能改端口"
-                } else {
-                    "先勾选“允许局域网分享”"
-                });
                 if connected {
                     ui.label("连接中，断开后才能改。");
-                } else if self.allow_lan && self.local_port == self.lan_port {
-                    ui.label(
-                        egui::RichText::new("两个端口不能相同。")
-                            .color(ui.visuals().error_fg_color),
-                    );
-                } else if !self.allow_lan {
-                    ui.label("（需先勾选局域网分享）");
+                } else if self.allow_lan {
+                    ui.label(format!(
+                        "局域网设备连本机 IP:{}（同一混合端口）。",
+                        self.local_port
+                    ));
+                } else {
+                    ui.label("（勾选局域网分享后，局域网设备连本机 IP 用同一端口）");
                 }
             });
             ui.separator();
@@ -2718,7 +2992,13 @@ impl eframe::App for GuiApp {
                                         source: "manual".to_string(),
                                     };
                                     self.nodes.insert(0, node);
+                                    // The insert shifts every old index
+                                    // by one, so the old multi-select
+                                    // would point at the wrong rows:
+                                    // replace it with just the new row,
+                                    // like the anchor.
                                     self.selected = Some(0);
+                                    self.selected_set = BTreeSet::from([0]);
                                     self.log_line(format!("手动添加节点：{}。", target));
                                     self.manual_host.clear();
                                 }
@@ -3021,6 +3301,38 @@ mod tests {
     }
 
     #[test]
+    fn api_speed_bps_converts_to_mbps_in_quality_cell() {
+        // Leo's v3.6 report: 线路质量 showed "77570260M" — the API
+        // Speed column is bits per second, not Mbps. Parse the
+        // real-magnitude row and check the cell the GUI shows.
+        let csv = "# comment\n* vpn_servers\nHostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64\nvpn267947139.opengw.net,1.2.3.4,1000000,12,77570260,Japan,JP,47,1000,2000,3000,0,SoftBank BB,,AAAA\n";
+        let nodes = vpngate::parse_api_csv(csv);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(quality_cell(&nodes[0]), "78M@12ms");
+        assert_eq!(sessions_cell(&nodes[0]), "47人");
+    }
+
+    #[test]
+    fn quality_sort_compares_api_and_scrape_speeds_like_for_like() {
+        // Before the v3.7 fix, API nodes stored raw bps in
+        // speed_mbps, so an API node at 77.6 Mbps sorted as
+        // 77,570,260 and always beat scrape nodes (whole Mbps) in
+        // the quality sort. After the fix both are Mbps.
+        let csv = "# comment\n* vpn_servers\nHostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64\nvpn267947139.opengw.net,1.2.3.4,1000000,12,77570260,Japan,JP,47,1000,2000,3000,0,SoftBank BB,,AAAA\n";
+        let api = vpngate::parse_api_csv(csv).into_iter().next().unwrap();
+        assert_eq!(api.speed_mbps, 78);
+        // Scrape node: "261.83 Mbps" from the page → 262 Mbps.
+        let scrape = node_stats("s.opengw.net", "日本", 70, 262, 8);
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![api, scrape];
+        app.sort = Some((SortCol::Quality, SortDir::Desc));
+        // Fastest first: 262 Mbps scrape node before 78 Mbps API node.
+        assert_eq!(app.display_indices(), vec![1, 0]);
+        app.sort = Some((SortCol::Quality, SortDir::Asc));
+        assert_eq!(app.display_indices(), vec![0, 1]);
+    }
+
+    #[test]
     fn toggle_sort_resets_direction_when_switching_columns() {
         let mut app = GuiApp::for_tests();
         app.sort = Some((SortCol::Country, SortDir::Desc));
@@ -3253,6 +3565,315 @@ mod tests {
         assert_eq!(app.selected, None);
         app.move_selection(-1);
         assert_eq!(app.selected, None);
+    }
+
+    /// Selection model: plain click selects one row, Ctrl+click
+    /// toggles rows in/out of the set, Shift+click selects the
+    /// range from the anchor to the clicked row in display order,
+    /// and every click moves the anchor to the clicked row.
+    #[test]
+    fn click_row_selection_model() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "美国"),
+            node_in("c.opengw.net", "德国"),
+            node_in("d.opengw.net", "法国"),
+            node_in("e.opengw.net", "英国"),
+        ];
+        // Shift+click with no anchor yet: just this row.
+        app.click_row(2, false, true);
+        assert_eq!(app.selected, Some(2));
+        assert_eq!(app.selected_set, BTreeSet::from([2]));
+        // Plain click: only that row, anchor moves.
+        app.click_row(1, false, false);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.selected_set, BTreeSet::from([1]));
+        // Ctrl+click adds a row; anchor moves to it.
+        app.click_row(3, true, false);
+        assert_eq!(app.selected, Some(3));
+        assert_eq!(app.selected_set, BTreeSet::from([1, 3]));
+        // Ctrl+click again toggles it back out; the anchor stays on
+        // the clicked row even though it is no longer in the set.
+        app.click_row(1, true, false);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.selected_set, BTreeSet::from([3]));
+        // Shift+click from the anchor (1) to row 4: the whole range.
+        app.click_row(4, false, true);
+        assert_eq!(app.selected, Some(4));
+        assert_eq!(app.selected_set, BTreeSet::from([1, 2, 3, 4]));
+        // Shift+click backwards (anchor 4 -> row 0): the range the
+        // other way, anchor moves to row 0.
+        app.click_row(0, false, true);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(
+            app.selected_set,
+            BTreeSet::from([0, 1, 2, 3, 4])
+        );
+        // Plain click collapses back to one row.
+        app.click_row(2, false, false);
+        assert_eq!(app.selected, Some(2));
+        assert_eq!(app.selected_set, BTreeSet::from([2]));
+        // Shift+click follows display order, not list order: sorted
+        // A-Z by country string (code points: 德国 U+5FB7 < 日本
+        // U+65E5 < 法国 U+6CD5 < 美国 U+7F8E < 英国 U+82F1), the
+        // display is [2 德国， 0 日本， 3 法国， 1 美国， 4 英国].
+        // The anchor is row 2 (display position 0); Shift+clicking
+        // row 1 (display position 3) selects display[0..=3].
+        app.sort = Some((SortCol::Country, SortDir::Asc));
+        assert_eq!(app.display_indices(), vec![2, 0, 3, 1, 4]);
+        app.click_row(1, false, true);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.selected_set, BTreeSet::from([0, 1, 2, 3]));
+    }
+
+    /// Arrow keys keep the v3.4 behaviour and collapse the
+    /// multi-select to just the row the anchor moved to.
+    #[test]
+    fn arrow_keys_collapse_multi_select_to_anchor() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "美国"),
+            node_in("c.opengw.net", "德国"),
+        ];
+        app.click_row(0, false, false);
+        app.click_row(2, true, false);
+        assert_eq!(app.selected_set, BTreeSet::from([0, 2]));
+        app.move_selection(-1);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.selected_set, BTreeSet::from([1]));
+        app.move_selection(-1);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.selected_set, BTreeSet::from([0]));
+        // ↓ from the anchor also collapses (and stops at the end).
+        app.move_selection(1);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.selected_set, BTreeSet::from([1]));
+    }
+
+    fn four_nodes() -> Vec<Node> {
+        vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "美国"),
+            node_in("c.opengw.net", "德国"),
+            node_in("d.opengw.net", "法国"),
+        ]
+    }
+
+    /// Delete: removes the selected nodes from the list, records
+    /// their hostnames on the persistent blocklist, keeps their full
+    /// data for this session's restore, cleans their probe results,
+    /// and clears the selection. The blocklist round-trips through
+    /// the config.
+    #[test]
+    fn delete_selected_removes_and_blocks() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = four_nodes();
+        app.probes
+            .insert("c.opengw.net".to_string(), "10 ms".to_string());
+        app.probe_ms.insert("c.opengw.net".to_string(), 10);
+        app.probes
+            .insert("a.opengw.net".to_string(), "5 ms".to_string());
+        app.probe_ms.insert("a.opengw.net".to_string(), 5);
+        app.click_row(0, false, false);
+        app.click_row(2, true, false);
+        assert_eq!(app.selected_set, BTreeSet::from([0, 2]));
+        app.delete_selected();
+        let hosts: Vec<&str> = app.nodes.iter().map(|n| n.host.as_str()).collect();
+        assert_eq!(hosts, vec!["b.opengw.net", "d.opengw.net"]);
+        assert_eq!(
+            app.blocked_hosts,
+            BTreeSet::from(["a.opengw.net".to_string(), "c.opengw.net".to_string()])
+        );
+        let deleted: Vec<&str> = app
+            .deleted_nodes
+            .iter()
+            .map(|n| n.host.as_str())
+            .collect();
+        assert_eq!(deleted, vec!["c.opengw.net", "a.opengw.net"]);
+        // Probe results for the deleted hosts are gone; the kept
+        // node's stay untouched (none recorded for b/d here).
+        assert!(!app.probes.contains_key("c.opengw.net"));
+        assert!(!app.probe_ms.contains_key("c.opengw.net"));
+        assert!(!app.probes.contains_key("a.opengw.net"));
+        // Selection is cleared.
+        assert_eq!(app.selected, None);
+        assert!(app.selected_set.is_empty());
+        // The blocklist persists through the config round-trip.
+        let cfg = app.current_config();
+        assert_eq!(
+            cfg.blocked_hosts,
+            vec!["a.opengw.net".to_string(), "c.opengw.net".to_string()]
+        );
+        let mut app2 = GuiApp::for_tests();
+        app2.apply_config(&cfg);
+        assert_eq!(app2.blocked_hosts, app.blocked_hosts);
+    }
+
+    /// Delete skips the connected node: it stays in the list and the
+    /// skip is logged. (`delete_selected_except` takes the connected
+    /// host directly so the skip is testable without a live tunnel;
+    /// `delete_selected` passes `connected_node_host()`.)
+    #[test]
+    fn delete_selected_skips_connected_node() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = four_nodes();
+        app.click_row(0, false, false);
+        app.click_row(1, true, false);
+        let (removed, skipped) = app.delete_selected_except(Some("b.opengw.net"));
+        assert_eq!((removed, skipped), (1, 1));
+        let hosts: Vec<&str> = app.nodes.iter().map(|n| n.host.as_str()).collect();
+        assert_eq!(
+            hosts,
+            vec!["b.opengw.net", "c.opengw.net", "d.opengw.net"]
+        );
+        assert_eq!(
+            app.blocked_hosts,
+            BTreeSet::from(["a.opengw.net".to_string()])
+        );
+        assert_eq!(app.deleted_nodes.len(), 1);
+        // The connected node was skipped even though it was selected.
+        assert!(app.nodes.iter().any(|n| n.host == "b.opengw.net"));
+    }
+
+    /// The full delete path logs the connected-node skip in the
+    /// visible log (same wording the user sees). Goes through the
+    /// real reporting path with the connected host supplied
+    /// directly (no live tunnel in unit tests).
+    #[test]
+    fn delete_selected_logs_connected_skip() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = four_nodes();
+        app.click_row(0, false, false);
+        app.click_row(1, true, false);
+        app.delete_selected_with_connected(Some("b.opengw.net"));
+        assert!(
+            app.log.iter().any(|l| l.contains("已连接的节点不能删除，已跳过 1")),
+            "skip must be logged: {:?}",
+            app.log
+        );
+        assert_eq!(app.nodes.len(), 3);
+        assert!(app.nodes.iter().any(|n| n.host == "b.opengw.net"));
+    }
+
+    /// Busy guard: with a job running, deletion is disabled and a
+    /// direct call is a no-op; with nothing running it is allowed.
+    #[test]
+    fn delete_selected_blocked_when_busy() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = four_nodes();
+        app.click_row(0, false, false);
+        assert!(app.can_delete());
+        app.busy = Some(Busy::Probing);
+        assert!(!app.can_delete());
+        app.delete_selected();
+        assert_eq!(app.nodes.len(), 4, "busy delete must be a no-op");
+        assert!(app.blocked_hosts.is_empty());
+        app.busy = Some(Busy::ProbingAll);
+        assert!(!app.can_delete());
+        app.busy = None;
+        assert!(app.can_delete());
+        // Empty selection disables it too.
+        app.clear_selection();
+        assert!(!app.can_delete());
+    }
+
+    /// The blocklist filters every list load: an incoming list that
+    /// still contains a blocked host loses it before it is shown,
+    /// and the selection is cleared (indices from the old list are
+    /// meaningless).
+    #[test]
+    fn list_load_filters_blocked_hosts() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = four_nodes();
+        app.blocked_hosts.insert("b.opengw.net".to_string());
+        app.click_row(0, false, false);
+        app.apply_event(GuiEvent::Nodes(vpngate::NodeListUpdate {
+            nodes: four_nodes(),
+            source: vpngate::NodeListSource::Api,
+            cache_age_secs: None,
+            api_error: None,
+            web_error: None,
+        }));
+        let hosts: Vec<&str> = app.nodes.iter().map(|n| n.host.as_str()).collect();
+        assert_eq!(
+            hosts,
+            vec!["a.opengw.net", "c.opengw.net", "d.opengw.net"]
+        );
+        assert_eq!(app.selected, None);
+        assert!(app.selected_set.is_empty());
+        // A bare API label matches its completed block entry too.
+        let bare = vec![node_in("b", "美国"), node_in("z.opengw.net", "日本")];
+        let kept = app.apply_blocklist(bare);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].host, "z.opengw.net");
+    }
+
+    /// Restore puts this session's deleted nodes back and clears the
+    /// blocklist; the selection is cleared too.
+    #[test]
+    fn restore_deleted_puts_nodes_back() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = four_nodes();
+        app.click_row(0, false, false);
+        app.click_row(2, true, false);
+        app.delete_selected();
+        assert_eq!(app.nodes.len(), 2);
+        assert_eq!(app.blocked_hosts.len(), 2);
+        app.restore_deleted();
+        assert!(app.blocked_hosts.is_empty());
+        assert!(app.deleted_nodes.is_empty());
+        let hosts: Vec<&str> = app.nodes.iter().map(|n| n.host.as_str()).collect();
+        assert_eq!(
+            hosts,
+            vec![
+                "b.opengw.net",
+                "d.opengw.net",
+                "c.opengw.net",
+                "a.opengw.net"
+            ],
+            "restored nodes come back (appended after the survivors)"
+        );
+        assert_eq!(app.selected, None);
+        assert!(app.selected_set.is_empty());
+        assert!(
+            app.log.iter().any(|l| l.contains("已恢复 2 个节点")),
+            "restore must be logged: {:?}",
+            app.log
+        );
+        // And the config round-trip carries the cleared blocklist.
+        assert!(app.current_config().blocked_hosts.is_empty());
+    }
+
+    /// After a restart there is nothing in memory to put back:
+    /// restore only clears the block record and says the nodes will
+    /// return on the next refresh.
+    #[test]
+    fn restore_without_session_copies_only_clears_blocklist() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_in("x.opengw.net", "日本"),
+            node_in("y.opengw.net", "美国"),
+        ];
+        // A blocklist loaded from config.toml, with no deleted nodes
+        // in this session's memory (as after a restart).
+        app.blocked_hosts.insert("b.opengw.net".to_string());
+        app.click_row(0, false, false);
+        app.restore_deleted();
+        assert!(app.blocked_hosts.is_empty());
+        assert_eq!(app.nodes.len(), 2, "nothing in memory, nothing re-inserted");
+        assert!(app.selected_set.is_empty());
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.contains("已清除删除记录，下次刷新后节点恢复")),
+            "restart restore must log the next-refresh note: {:?}",
+            app.log
+        );
+        // And a later load really does bring the host back.
+        let kept = app.apply_blocklist(vec![node_in("b.opengw.net", "美国")]);
+        assert_eq!(kept.len(), 1);
     }
 
     #[test]
@@ -3787,13 +4408,13 @@ mod tests {
     #[test]
     fn col_widths_roundtrip_through_config() {
         let mut app = GuiApp::for_tests();
-        assert_eq!(app.col_widths, [90, 130, 190, 90]);
-        app.col_widths = [120, 140, 200, 100];
+        assert_eq!(app.col_widths, [90, 130, 64, 88, 190, 90]);
+        app.col_widths = [120, 140, 70, 95, 200, 100];
         let cfg = app.current_config();
-        assert_eq!(cfg.ui.node_col_widths, [120, 140, 200, 100]);
+        assert_eq!(cfg.ui.node_col_widths, [120, 140, 70, 95, 200, 100]);
         let mut app2 = GuiApp::for_tests();
         app2.apply_config(&cfg);
-        assert_eq!(app2.col_widths, [120, 140, 200, 100]);
+        assert_eq!(app2.col_widths, [120, 140, 70, 95, 200, 100]);
     }
 
     #[test]
@@ -3821,7 +4442,6 @@ mod tests {
         app.front_user = "u".to_string();
         app.front_pass = "p".to_string();
         app.local_port = 10809;
-        app.lan_port = 10810;
         app.allow_lan = true;
         app.system_proxy = true;
         let cfg = app.current_config();
@@ -3830,7 +4450,6 @@ mod tests {
         assert_eq!(cfg.front_proxy.username.as_deref(), Some("u"));
         assert_eq!(cfg.front_proxy.password.as_deref(), Some("p"));
         assert_eq!(cfg.listen.local_port, 10809);
-        assert_eq!(cfg.listen.lan_port, 10810);
         assert!(cfg.listen.allow_lan);
         assert!(cfg.system_proxy.enabled);
     }
@@ -3843,7 +4462,7 @@ mod tests {
             .as_nanos();
         let path =
             std::env::temp_dir().join(format!("vpngate-gui-test-{}.log", n));
-        let old = path.with_file_name(vpngate_client::filelog::OLD_LOG_FILE_NAME);
+        let old = vpngate_client::filelog::old_log_path(&path);
         let mut app = GuiApp::for_tests();
         // No logger yet: log calls only touch the on-screen log.
         app.log_line("info before logger".to_string());
@@ -3876,24 +4495,19 @@ mod tests {
         let _ = std::fs::remove_file(&old);
     }
 
+    /// LAN sharing binds the same mixed port on all interfaces: one
+    /// wildcard bind serves loopback too, so the list has a single
+    /// entry — no second port, and no equal-port error to raise.
     #[test]
-    fn listen_addrs_local_plus_lan_and_equal_port_error() {
+    fn listen_addrs_local_plus_lan_same_port() {
         let mut app = GuiApp::for_tests();
-        assert_eq!(
-            app.listen_addrs().unwrap(),
-            vec!["127.0.0.1:10818".to_string()]
-        );
+        assert_eq!(app.listen_addrs(), vec!["127.0.0.1:10818".to_string()]);
+        assert_eq!(app.listen_display(), "127.0.0.1:10818");
         app.allow_lan = true;
+        assert_eq!(app.listen_addrs(), vec!["0.0.0.0:10818".to_string()]);
         assert_eq!(
-            app.listen_addrs().unwrap(),
-            vec!["127.0.0.1:10818".to_string(), "0.0.0.0:10809".to_string()]
-        );
-        app.lan_port = 10818;
-        let err = app.listen_addrs().unwrap_err();
-        assert!(
-            err.contains("不能设成一样"),
-            "equal ports must fail loudly: {}",
-            err
+            app.listen_display(),
+            "127.0.0.1:10818 ＋ 0.0.0.0:10818"
         );
     }
 
@@ -4229,23 +4843,21 @@ mod tests {
         );
     }
 
-    /// Dragging a header separator widens that column (needs a graphics
-    /// adapter, like the render test).
-    #[test]
-    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
-    fn column_separator_drag_widens_column() {
-        use egui_kittest::{kittest::Queryable, Harness};
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(560.0, 420.0))
-            .build_eframe(|cc| GuiApp::for_render_tests(cc));
-        harness.run_steps(10);
-        let before = harness.state().col_widths[0];
-        // The first header cell starts at its label's left edge and is
-        // `before` px wide; the 6 px separator sits one item gap (6 px)
-        // past its right edge, so its centre is at left + width + 9.
-        let header = harness.get_by_label("国家/地区");
+    /// Drag the separator after the header cell with `label` right by
+    /// `delta` px and return the column widths afterwards. The
+    /// separator centre is one item gap (6 px) past the cell's right
+    /// edge plus half the 6 px handle: left + width + 9.
+    fn drag_header_separator(
+        harness: &mut egui_kittest::Harness<GuiApp>,
+        label: &str,
+        wi: usize,
+        delta: f32,
+    ) -> [u16; 6] {
+        use egui_kittest::kittest::Queryable;
+        let w = harness.state().col_widths[wi];
+        let header = harness.get_by_label(label);
         let r = header.rect();
-        let sep = egui::pos2(r.left() + before as f32 + 9.0, r.center().y);
+        let sep = egui::pos2(r.left() + w as f32 + 9.0, r.center().y);
         harness.hover_at(sep);
         harness.run();
         harness.drag_at(sep);
@@ -4253,18 +4865,74 @@ mod tests {
         // Move while the button is held (a real drag sends PointerMoved
         // events between press and release; drop_at alone only sends
         // the release event, whose delta the release frame would miss).
-        let target = egui::pos2(sep.x + 40.0, sep.y);
+        let target = egui::pos2(sep.x + delta, sep.y);
         harness.hover_at(target);
         harness.run();
         harness.drop_at(target);
         harness.run();
-        let after = harness.state().col_widths[0];
-        assert!(
-            after >= before + 30,
-            "dragging the separator should widen column 0: {} -> {}",
-            before,
-            after
+        harness.state().col_widths
+    }
+
+    /// Dragging a header separator widens that column (needs a graphics
+    /// adapter, like the render test). Every resizable column but the
+    /// last has a separator: 国家/地区， 运营商， 当前人数， 线路质量，
+    /// 主机:端口 — dragging one widens exactly that column and leaves
+    /// the other five alone, and the widths persist through the
+    /// config round-trip.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn column_separator_drag_widens_column() {
+        use egui_kittest::Harness;
+        // 800 px, not the 560 px minimum: at the default widths the
+        // row is 788 px wide, so the 主机:端口 separator (x ≈ 689)
+        // is off-screen at 560 px and cannot be grabbed. Dragging
+        // right-to-left keeps the not-yet-dragged separators at
+        // their initial positions (a drag only shifts columns to
+        // its right).
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 420.0))
+            .build_eframe(|cc| GuiApp::for_render_tests(cc));
+        harness.run_steps(10);
+        assert_eq!(
+            harness.state().col_widths,
+            [90, 130, 64, 88, 190, 90],
+            "defaults before any drag"
         );
+        for (label, wi) in [
+            ("主机:端口", 4usize),
+            ("线路质量", 3usize),
+            ("当前人数", 2usize),
+            ("运营商", 1usize),
+            ("国家/地区", 0usize),
+        ] {
+            let before = harness.state().col_widths;
+            let after = drag_header_separator(&mut harness, label, wi, 40.0);
+            assert!(
+                after[wi] >= before[wi] + 30,
+                "dragging the separator after {} should widen col_widths[{}]: {} -> {}",
+                label,
+                wi,
+                before[wi],
+                after[wi]
+            );
+            for (j, (&b, &a)) in before.iter().zip(after.iter()).enumerate() {
+                if j != wi {
+                    assert_eq!(
+                        b, a,
+                        "dragging {} must not move col_widths[{}]: {} -> {}",
+                        label, j, b, a
+                    );
+                }
+            }
+        }
+        // The dragged widths persist: current_config carries them,
+        // and a fresh app built from that config shows the same
+        // widths.
+        let cfg = harness.state().current_config();
+        assert_eq!(cfg.ui.node_col_widths, harness.state().col_widths);
+        let mut app2 = GuiApp::for_tests();
+        app2.apply_config(&cfg);
+        assert_eq!(app2.col_widths, harness.state().col_widths);
     }
 
     /// A plain click selects the row, and a press that drifts 8 px
@@ -4328,6 +4996,88 @@ mod tests {
             .save(&path)
             .unwrap();
         eprintln!("{}", path.display());
+    }
+
+    /// Ctrl+click multi-select, then the 删除选中 button: clicking
+    /// one row selects it, Ctrl+clicking a second row adds it to the
+    /// set, and 删除选中 removes both rows and records them on the
+    /// blocklist; 恢复已删除 puts them back. Needs a graphics
+    /// adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn ctrl_click_multi_select_and_delete_button() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        // Plain click on the 日本 row.
+        let cell = harness.get_by_label("日本");
+        let center = cell.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(harness.state().selected, Some(0));
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0]),
+            "plain click selects one row"
+        );
+        // Ctrl+click on the 美国 row: egui only tracks modifiers
+        // from ModifiersChanged events, so queue one before the
+        // press and again before the release (the row code reads
+        // the modifiers on the release frame).
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let cell = harness.get_by_label("美国");
+        let center = cell.rect().center();
+        harness.event(egui::Event::ModifiersChanged(ctrl));
+        harness.drag_at(center);
+        harness.run();
+        harness.event(egui::Event::ModifiersChanged(ctrl));
+        harness.drop_at(center);
+        harness.run();
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+        harness.run();
+        assert_eq!(harness.state().selected, Some(1));
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0, 1]),
+            "Ctrl+click must add the row to the set, not replace it"
+        );
+        // The delete button carries the count; clicking it removes
+        // both rows and blocks their hostnames.
+        let btn = harness.get_by_label("删除选中 (2)");
+        let center = btn.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(harness.state().nodes.len(), 1);
+        assert_eq!(harness.state().nodes[0].host, "c.opengw.net");
+        assert_eq!(harness.state().blocked_hosts.len(), 2);
+        assert!(harness.state().selected_set.is_empty());
+        // The restore button appears with the blocked count; clicking
+        // it puts this session's deleted nodes back.
+        let btn = harness.get_by_label("恢复已删除 (2)");
+        let center = btn.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(harness.state().nodes.len(), 3);
+        assert!(harness.state().blocked_hosts.is_empty());
     }
 
     /// Clicking the 国家/地区 header toggles the sort A-Z / Z-A.
@@ -4485,7 +5235,7 @@ mod tests {
                     node_stats("b.opengw.net", "日本", 10, 100, 5),
                     node_stats("c.opengw.net", "日本", 10, 200, 20),
                 ];
-                app.col_widths = [50, 60, 80, 50];
+                app.col_widths = [50, 60, 40, 50, 80, 50];
                 app
             });
         harness.run_steps(10);

@@ -101,6 +101,17 @@ pub fn curated_nodes() -> Vec<Node> {
         .collect()
 }
 
+/// The API's Speed column is bits per second, not Mbps: convert,
+/// rounding to the nearest whole Mbps (77,570,260 bps → 78 Mbps).
+/// Ping (cols[3]) is already ms and sessions (cols[7]) a plain
+/// count, so they pass through unchanged. The scrape path already
+/// stores whole Mbps (the page prints "261.83 Mbps"), so after this
+/// both sources are the same unit — and the 线路质量 sort compares
+/// like for like instead of putting every API node first.
+fn bps_to_mbps(bps: u64) -> u64 {
+    (bps + 500_000) / 1_000_000
+}
+
 pub fn parse_api_csv(text: &str) -> Vec<Node> {
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
@@ -130,7 +141,7 @@ pub fn parse_api_csv(text: &str) -> Vec<Node> {
             name: String::new(),
             score: num(2),
             ping_ms: num(3),
-            speed_mbps: num(4),
+            speed_mbps: bps_to_mbps(num(4)),
             sessions: num(7),
             ip: cols[1].to_string(),
             backups: Vec::new(),
@@ -753,6 +764,27 @@ mod tests {
         // name read cols[11], so the ISP column showed "2weeks".
         assert_eq!(nodes[0].isp, "SoftBank BB");
         assert!(nodes[0].name.is_empty(), "API nodes carry no display name");
+        // Speed 100 here is 100 bps → 0 Mbps (rounds to nearest);
+        // Ping is already ms and sessions a plain count.
+        assert_eq!(nodes[0].speed_mbps, 0, "100 bps rounds to 0 Mbps");
+        assert_eq!(nodes[0].ping_ms, 10);
+        assert_eq!(nodes[0].sessions, 5);
+    }
+
+    #[test]
+    fn parse_api_csv_speed_is_bps_not_mbps() {
+        // Leo's v3.6 report: 线路质量 showed "77570260M" — the API
+        // Speed column is bits per second, not Mbps.
+        let csv = "# comment\n* vpn_servers\nHostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64\nvpn267947139.opengw.net,1.2.3.4,1000000,12,77570260,Japan,JP,47,1000,2000,3000,0,SoftBank BB,,AAAA\n";
+        let nodes = parse_api_csv(csv);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].speed_mbps, 78, "77,570,260 bps → 78 Mbps");
+        assert_eq!(nodes[0].ping_ms, 12, "ping stays in ms");
+        assert_eq!(nodes[0].sessions, 47, "sessions stay a plain count");
+        // Rounding to nearest: 500,000 bps → 1 Mbps, 499,999 → 0.
+        assert_eq!(bps_to_mbps(500_000), 1);
+        assert_eq!(bps_to_mbps(499_999), 0);
+        assert_eq!(bps_to_mbps(1_500_000), 2);
     }
 
     #[test]

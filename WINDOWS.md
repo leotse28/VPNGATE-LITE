@@ -18,7 +18,7 @@ vpngate-client.exe   （约 10 MB，命令行版）
 - 第一次打开时 Windows Defender SmartScreen 可能会拦（程序没有代码签名），
   点“更多信息”→“仍要运行”即可。
 - 默认只绑 `127.0.0.1:10818`，不会弹防火墙；只有勾了“允许局域网分享”
-  （额外绑 `0.0.0.0:10809`）时才可能弹防火墙提示。
+  （同一个端口再绑 `0.0.0.0:10818`）时才可能弹防火墙提示。
 - 别双击 `vpngate-client.exe` 指望出窗口：它是命令行版，没有界面，
   双击只会弹一个黑窗口告诉你去用 `vpngate-gui.exe`，再按回车退出。
   命令行版要在 PowerShell / 命令提示符里运行，见下面的用法。
@@ -87,7 +87,7 @@ vpngate-client.exe   （约 10 MB，命令行版）
 3. 选一条节点，先点“探测”——先试日本 NTT `kanratown.opengw.net:992`，
    再点“连接”，最后点“测试隧道”，generate_204 回 204 才算通。
 4. 浏览器把代理设为 SOCKS5 `127.0.0.1:10818`（勾选远程 DNS），打开 Google
-   试试；或用命令行版对照：
+   试试；同一端口也接受 HTTP 代理（设为 HTTP `127.0.0.1:10818` 同样走隧道）。或用命令行版对照：
    ```powershell
    .\target\release\vpngate-client.exe test kanratown.opengw.net:992
    ```

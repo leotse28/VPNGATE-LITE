@@ -3,7 +3,7 @@
 //! Subcommands:
 //!   list     fetch the VPNGate node list (official API) and show it
 //!   probe    SSTP handshake only: does the node give us a virtual IP?
-//!   connect  establish the tunnel and serve a local SOCKS5 proxy
+//!   connect  establish the tunnel and serve a local mixed proxy (SOCKS5+HTTP)
 //!   test     establish the tunnel and run generate_204 + google HTTPS
 
 use clap::{Parser, Subcommand};
@@ -54,7 +54,7 @@ enum Cmd {
         /// Node: host:port, hostname, or index into the curated list
         target: String,
     },
-    /// Connect and serve a local SOCKS5 proxy until Ctrl-C
+    /// Connect and serve a local mixed proxy (SOCKS5+HTTP) until Ctrl-C
     Connect {
         /// Node: host:port, hostname, or index into the curated list
         target: String,
@@ -64,7 +64,7 @@ enum Cmd {
         /// Bind 0.0.0.0 (allow LAN), like V2Ray's allow-LAN
         #[arg(long)]
         allow_lan: bool,
-        /// Also set the OS system proxy to the local SOCKS5 port
+        /// Also set the OS system proxy to the local mixed-proxy port
         #[arg(long)]
         system_proxy: bool,
     },
@@ -320,28 +320,23 @@ async fn cmd_connect(
         }
     };
     // Listen addresses: --listen overrides the local address (old
-    // single-listener behavior); otherwise always 127.0.0.1:local_port,
-    // plus 0.0.0.0:lan_port when LAN sharing is on. Both SOCKS5 servers
-    // share the one tunnel; the system proxy points at the local port.
-    let addrs: Vec<String> = match &listen {
-        Some(a) => vec![a.clone()],
-        None => match cfg.listen.listen_addrs() {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("listen error: {}", e);
-                return 1;
-            }
-        },
+    // single-listener behavior); otherwise `listen_addrs()` — always
+    // 127.0.0.1:local_port, or the same port on 0.0.0.0 when LAN
+    // sharing is on (one mixed server, no second port). The system
+    // proxy points at the loopback form of the first address.
+    let (addrs, display): (Vec<String>, String) = match &listen {
+        Some(a) => (vec![a.clone()], a.clone()),
+        None => (cfg.listen.listen_addrs(), cfg.listen.display_addrs()),
     };
     let mut serves = tokio::task::JoinSet::new();
     for addr in &addrs {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => {
-                serves.spawn(socks5::serve_socks5(l, tunnel.clone(), timeout));
+                serves.spawn(socks5::serve_mixed(l, tunnel.clone(), timeout));
             }
             Err(e) => {
                 eprintln!(
-                    "cannot bind SOCKS5 listener {}: {} (port may be in use, try another port)",
+                    "cannot bind mixed proxy listener {}: {} (port may be in use, try another port)",
                     addr, e
                 );
                 return 1;
@@ -350,7 +345,8 @@ async fn cmd_connect(
     }
     let mut guard = None;
     if cfg.system_proxy.enabled {
-        match sysproxy::SystemProxyGuard::set(&addrs[0], cfg.system_proxy.service.as_deref()) {
+        let loopback = vpngate_client::config::loopback_of(&addrs[0]);
+        match sysproxy::SystemProxyGuard::set(&loopback, cfg.system_proxy.service.as_deref()) {
             Ok(g) => {
                 println!("system proxy: {}", g.applied.as_deref().unwrap_or(""));
                 guard = Some(g);
@@ -359,7 +355,7 @@ async fn cmd_connect(
         }
     }
     println!("tunnel virtual IP: {}", tunnel.vip);
-    println!("SOCKS5 listening on {}", addrs.join(", "));
+    println!("本地混合代理（SOCKS5+HTTP）监听 {}", display);
     tokio::select! {
         _ = serves.join_next() => 0,
         _ = tokio::signal::ctrl_c() => {
@@ -384,7 +380,7 @@ fn print_no_args_notice() {
     println!("  vpngate-client list                    列出节点");
     println!("  vpngate-client probe <节点>            探测节点是否能连");
     println!(
-        "  vpngate-client connect <节点>          连接并开本地 SOCKS5 代理（默认 127.0.0.1:10818）"
+        "  vpngate-client connect <节点>          连接并开本地混合代理（SOCKS5+HTTP，默认 127.0.0.1:10818）"
     );
     println!("  vpngate-client test <节点>             连接并测试隧道");
     println!("节点可以写 主机名:端口，例如 kanratown.opengw.net:992。");

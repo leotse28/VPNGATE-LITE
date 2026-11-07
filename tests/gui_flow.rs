@@ -155,10 +155,11 @@ async fn gui_connect_flow_against_mock() {
         head
     );
 
-    // Local SOCKS5 server through the tunnel (the GUI's connect path).
+    // Local mixed proxy server through the tunnel (the GUI's connect
+    // path): SOCKS5 still works through the mixed port.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let socks_addr = listener.local_addr().unwrap();
-    let serve = tokio::spawn(vpngate_client::socks5::serve_socks5(
+    let serve = tokio::spawn(vpngate_client::socks5::serve_mixed(
         listener,
         tunnel.clone(),
         timeout,
@@ -196,6 +197,179 @@ async fn gui_connect_flow_against_mock() {
 
     serve.abort();
     drop(tunnel); // last tunnel ref: writer task shuts TLS down
+}
+
+/// Shared mock setup for the mixed-proxy tests: lock the mock for
+/// the whole test, start it if needed, and open one tunnel to it.
+/// Returns the lock guard first so the caller keeps it alive — the
+/// mock is shared, and dropping the guard early would let another
+/// test kill the mock mid-test.
+async fn setup_mock_tunnel() -> Option<(
+    tokio::sync::MutexGuard<'static, ()>,
+    MockServer,
+    std::sync::Arc<SstpTunnel>,
+)> {
+    if !tool_exists("python3") || !tool_exists("openssl") {
+        eprintln!("SKIP: python3/openssl not available; mock SSTP server cannot run");
+        return None;
+    }
+    let guard = MOCK_LOCK.lock().await;
+    let mock = match start_mock() {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP: could not start mock SSTP server");
+            return None;
+        }
+    };
+    if !wait_for_port().await {
+        eprintln!("SKIP: mock SSTP server did not listen on 8443");
+        return None;
+    }
+    let connector = Connector::new(None);
+    let timeout = Duration::from_secs(10);
+    let tunnel = SstpTunnel::connect(&connector, "127.0.0.1", 8443, timeout)
+        .await
+        .ok()?;
+    Some((guard, mock, tunnel))
+}
+
+/// Read from `client` until `needle` appears or the timeout elapses;
+/// returns everything read so far.
+async fn read_until(
+    client: &mut tokio::net::TcpStream,
+    needle: &str,
+    timeout: Duration,
+) -> String {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, client.read(&mut buf)).await {
+            Ok(Ok(0)) => break, // peer closed
+            Ok(Ok(n)) => {
+                out.extend_from_slice(&buf[..n]);
+                if String::from_utf8_lossy(&out).contains(needle) {
+                    break;
+                }
+            }
+            _ => break, // timeout or read error
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// The mixed port speaks HTTP as well as SOCKS5: an HTTP CONNECT
+/// builds a tunnel and passes raw bytes through it, a plain
+/// absolute-form GET returns the response through the tunnel, and a
+/// POST with a Content-Length body forwards the body too. The mock
+/// answers every tunnel stream with a canned 204.
+#[tokio::test]
+async fn mixed_proxy_http_methods_against_mock() {
+    let Some((_guard, _mock, tunnel)) = setup_mock_tunnel().await else {
+        return;
+    };
+    let timeout = Duration::from_secs(10);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve = tokio::spawn(vpngate_client::socks5::serve_mixed(
+        listener,
+        tunnel.clone(),
+        timeout,
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // CONNECT: 200, then raw bytes pass through the tunnel and the
+    // mock's 204 comes back.
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    c.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+        .await
+        .unwrap();
+    let head = read_until(&mut c, "\r\n\r\n", timeout).await;
+    assert!(
+        head.contains("200"),
+        "CONNECT should answer 200, got: {}",
+        head
+    );
+    c.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let body = read_until(&mut c, "204", timeout).await;
+    assert!(
+        body.contains("204"),
+        "bytes through the CONNECT tunnel should return the mock 204, got: {}",
+        body
+    );
+    drop(c);
+
+    // Plain absolute-form GET: the response comes back through the
+    // tunnel (and the connection then closes — a fresh connection is
+    // needed for the next request).
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    c.write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let body = read_until(&mut c, "204", timeout).await;
+    assert!(
+        body.contains("204"),
+        "plain HTTP GET through the tunnel should return the mock 204, got: {}",
+        body
+    );
+    drop(c);
+
+    // POST with a Content-Length body: the body is forwarded through
+    // the tunnel, and the mock's 204 comes back.
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    c.write_all(b"POST http://example.com/post HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")
+        .await
+        .unwrap();
+    let body = read_until(&mut c, "204", timeout).await;
+    assert!(
+        body.contains("204"),
+        "POST with a body through the tunnel should return the mock 204, got: {}",
+        body
+    );
+    drop(c);
+
+    serve.abort();
+    drop(tunnel);
+}
+
+/// LAN sharing binds the same mixed port on all interfaces: one
+/// 0.0.0.0 bind serves loopback too, so a client connecting via
+/// 127.0.0.1 reaches the mixed server (SOCKS5 greeting answered).
+#[tokio::test]
+async fn wildcard_bind_serves_loopback_against_mock() {
+    let Some((_guard, _mock, tunnel)) = setup_mock_tunnel().await else {
+        return;
+    };
+    let timeout = Duration::from_secs(10);
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let serve = tokio::spawn(vpngate_client::socks5::serve_mixed(
+        listener,
+        tunnel.clone(),
+        timeout,
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap(); // no-auth
+    let mut resp = [0u8; 2];
+    client.read_exact(&mut resp).await.unwrap();
+    assert_eq!(
+        resp,
+        [0x05, 0x00],
+        "a wildcard bind must answer loopback SOCKS5 clients"
+    );
+
+    serve.abort();
+    drop(tunnel);
 }
 
 /// A TCP listener that accepts and holds connections forever, never
