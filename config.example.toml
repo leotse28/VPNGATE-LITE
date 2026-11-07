@@ -1,0 +1,27 @@
+# vpngate-client 配置示例。复制为 config.toml 后修改。
+# 所有项都有默认值；命令行参数会覆盖这里的设置。
+
+# 前置 SOCKS5 代理：连 VPNGate 节点（以及拉节点列表、DoH）时先走它。
+# 不用就把 enabled 设为 false（默认）。
+[front_proxy]
+enabled = false
+addr = "127.0.0.1:1080"
+# username = ""
+# password = ""
+
+# 本地 SOCKS5 监听（隧道起来后，浏览器/应用连这里）。
+[listen]
+addr = "127.0.0.1"
+port = 10808
+# allow_lan = true 时绑 0.0.0.0:10808，局域网设备也能用（相当于 V2Ray 的允许局域网连接）。
+allow_lan = false
+
+# 系统代理：connect 时把系统代理指到上面的本地端口，退出时还原。
+# 默认关闭；只在需要时打开。
+[system_proxy]
+enabled = false
+# service = "Wi-Fi"   # macOS 的网络服务名，默认 Wi-Fi
+
+# 隧道超时（秒）：SSTP 建连、PPP 取 IP、TCP 握手的单次超时。
+[tunnel]
+timeout_secs = 10

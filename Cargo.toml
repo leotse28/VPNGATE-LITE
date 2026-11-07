@@ -1,0 +1,36 @@
+[package]
+name = "vpngate-client"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal Rust client for VPNGate volunteer nodes over MS-SSTP + PPP, exposing a local SOCKS5 port (no TUN, no GUI)"
+license = "MIT"
+
+[[bin]]
+name = "vpngate-client"
+path = "src/main.rs"
+
+[[bin]]
+name = "vpngate-gui"
+path = "src/bin/vpngate-gui.rs"
+
+[lib]
+name = "vpngate_client"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["tls12"] }
+webpki-roots = "0.26"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rand = "0.8"
+eframe = "0.36"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["eframe", "snapshot", "wgpu"] }
+
+[profile.release]
+opt-level = 2
