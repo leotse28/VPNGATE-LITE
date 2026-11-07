@@ -628,3 +628,223 @@ async fn parallel_candidate_race_all_hanging_returns_within_timeout() {
         elapsed
     );
 }
+
+/// SOCKS5 UDP ASSOCIATE through the mock tunnel, with the mock's UDP
+/// ECHO mode: a datagram sent to the relay comes back byte-for-byte,
+/// proving the whole path (SOCKS UDP header → tunnel UDP → mock →
+/// tunnel UDP → SOCKS UDP reply). The mock only proves the path —
+/// real DNS/QUIC still need Leo's phone test (see the docs).
+#[tokio::test]
+async fn socks5_udp_associate_echo_against_mock() {
+    let Some((_guard, _mock, tunnel)) = setup_mock_tunnel().await else {
+        return;
+    };
+    let timeout = Duration::from_secs(10);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let serve = tokio::spawn(vpngate_client::socks5::serve_mixed(
+        listener,
+        tunnel.clone(),
+        timeout,
+        Some(log_tx),
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // UDP ASSOCIATE over TCP: greeting, then command 0x03 with a
+    // 0.0.0.0:0 address (the usual "any" request).
+    let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut resp = [0u8; 2];
+    tokio::time::timeout(timeout, c.read_exact(&mut resp))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp, [0x05, 0x00], "SOCKS5 greeting must be accepted");
+    c.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut rep = [0u8; 10];
+    tokio::time::timeout(timeout, c.read_exact(&mut rep))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        &rep[..2],
+        &[0x05, 0x00],
+        "UDP ASSOCIATE must succeed, got: {:?}",
+        rep
+    );
+    assert_eq!(rep[3], 0x01, "relay address must be IPv4, got: {:?}", rep);
+    let relay_ip = std::net::Ipv4Addr::new(rep[4], rep[5], rep[6], rep[7]);
+    let relay_port = u16::from_be_bytes([rep[8], rep[9]]);
+    assert_eq!(
+        relay_ip.to_string(),
+        "127.0.0.1",
+        "relay must answer on loopback"
+    );
+    assert_eq!(
+        relay_port, port,
+        "UDP relay must share the TCP listener's port"
+    );
+
+    // The datagram round-trip needs a machine that can actually
+    // send UDP. This VM's sandbox blocks UDP sendto with EPERM even
+    // to 127.0.0.1, so the round-trip part skips here — the TCP
+    // handshake above already ran, and the tunnel-level echo test
+    // covers the UDP path itself.
+    if !udp_available().await {
+        eprintln!("SKIP: this machine cannot send UDP datagrams (sandbox blocks sendto); datagram round-trip skipped, ASSOCIATE handshake above still ran");
+    } else {
+    // One datagram to an IPv4 target: SOCKS UDP header + payload.
+    // The mock echoes the payload back through the tunnel.
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut dgram = vec![0, 0, 0, 0x01, 127, 0, 0, 1];
+    dgram.extend_from_slice(&80u16.to_be_bytes());
+    dgram.extend_from_slice(b"UDP-ECHO-HELLO");
+    udp.send_to(&dgram, (relay_ip, relay_port)).await.unwrap();
+    let mut buf = [0u8; 2048];
+    let (n, _from) = tokio::time::timeout(timeout, udp.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let back = &buf[..n];
+    // Reply header: RSV 0, FRAG 0, ATYP 1, source 127.0.0.1:80.
+    assert!(n >= 10, "UDP reply too short: {:?}", back);
+    assert_eq!(&back[..4], &[0, 0, 0, 0x01], "reply header: {:?}", back);
+    assert_eq!(&back[4..8], &[127, 0, 0, 1], "reply source IP: {:?}", back);
+    assert_eq!(
+        u16::from_be_bytes([back[8], back[9]]),
+        80,
+        "reply source port"
+    );
+    assert_eq!(
+        &back[10..],
+        b"UDP-ECHO-HELLO",
+        "payload must echo byte-for-byte"
+    );
+
+    // A domain target goes through DoH resolution, then the same echo.
+    let mut dgram = vec![0, 0, 0, 0x03, 11];
+    dgram.extend_from_slice(b"example.com");
+    dgram.extend_from_slice(&80u16.to_be_bytes());
+    dgram.extend_from_slice(b"UDP-ECHO-DOMAIN");
+    udp.send_to(&dgram, (relay_ip, relay_port)).await.unwrap();
+    let (n, _) = tokio::time::timeout(timeout, udp.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        &buf[10..n],
+        b"UDP-ECHO-DOMAIN",
+        "domain-target payload must echo"
+    );
+
+    // A fragmented datagram (FRAG 1) is dropped, never answered.
+    let mut dgram = vec![0, 0, 1, 0x01, 127, 0, 0, 1];
+    dgram.extend_from_slice(&80u16.to_be_bytes());
+    dgram.extend_from_slice(b"FRAG-DROPPED");
+    udp.send_to(&dgram, (relay_ip, relay_port)).await.unwrap();
+    let res = tokio::time::timeout(Duration::from_millis(500), udp.recv_from(&mut buf)).await;
+    assert!(
+        res.is_err(),
+        "a fragmented datagram must get no reply, got: {:?}",
+        res
+    );
+    }
+
+    // The connection log names the UDP ASSOCIATE line.
+    drop(c); // close the ASSOCIATE TCP connection
+    let mut lines = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), log_rx.recv()).await {
+            Ok(Some(line)) => lines.push(line),
+            _ => break,
+        }
+    }
+    assert!(
+        lines.iter().any(|l| l.contains("UDP ASSOCIATE")),
+        "the log must carry a UDP ASSOCIATE line, got: {:?}",
+        lines
+    );
+
+    serve.abort();
+    drop(tunnel);
+}
+
+/// Tunnel-level UDP: a `UdpFlow` through the mock tunnel, echoed by
+/// the mock's UDP mode. This needs no real UDP socket at all (the
+/// datagrams travel inside the SSTP stream), so it runs even where
+/// the sandbox blocks UDP — it proves the frame builder, the IP
+/// demuxer, and the flow table end to end.
+#[tokio::test]
+async fn udp_flow_echo_against_mock() {
+    let Some((_guard, _mock, tunnel)) = setup_mock_tunnel().await else {
+        return;
+    };
+    let timeout = Duration::from_secs(10);
+
+    // One flow, two datagrams: both echo back with the target as
+    // their source (127.0.0.1:80), as a real NAT would.
+    let mut flow = tunnel
+        .open_udp_flow("127.0.0.1", 80)
+        .await
+        .expect("open UDP flow to the mock");
+    flow.send(b"UDP-FLOW-ONE").unwrap();
+    let (ip, port, payload) = tokio::time::timeout(timeout, flow.recv())
+        .await
+        .unwrap()
+        .expect("first UDP echo must arrive");
+    assert_eq!(ip.to_string(), "127.0.0.1");
+    assert_eq!(port, 80);
+    assert_eq!(payload, b"UDP-FLOW-ONE");
+    flow.send(b"UDP-FLOW-TWO").unwrap();
+    let (ip, port, payload) = tokio::time::timeout(timeout, flow.recv())
+        .await
+        .unwrap()
+        .expect("second UDP echo must arrive");
+    assert_eq!(ip.to_string(), "127.0.0.1");
+    assert_eq!(port, 80);
+    assert_eq!(payload, b"UDP-FLOW-TWO");
+
+    // A domain target resolves (DoH) and echoes the same way.
+    let mut flow2 = tunnel
+        .open_udp_flow("example.com", 80)
+        .await
+        .expect("open UDP flow to a domain");
+    flow2.send(b"UDP-FLOW-DOMAIN").unwrap();
+    let (_ip, port, payload) = tokio::time::timeout(timeout, flow2.recv())
+        .await
+        .unwrap()
+        .expect("domain UDP echo must arrive");
+    assert_eq!(port, 80);
+    assert_eq!(payload, b"UDP-FLOW-DOMAIN");
+
+    // An oversize datagram is refused, not fragmented.
+    let big = vec![0u8; 2000];
+    assert!(
+        flow.send(&big).is_err(),
+        "a 2000-byte datagram must not fit the tunnel MTU"
+    );
+
+    drop(tunnel);
+}
+
+/// True when this machine can actually send a UDP datagram (bind +
+/// sendto to loopback). This VM's sandbox blocks UDP sendto with
+/// EPERM even to 127.0.0.1, so the full ASSOCIATE test skips here
+/// instead of failing on the sandbox — same pattern as the
+/// python3/openssl skips above.
+async fn udp_available() -> bool {
+    let Ok(s) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else {
+        return false;
+    };
+    let addr = match s.local_addr() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    s.send_to(b"probe", addr).await.is_ok()
+}

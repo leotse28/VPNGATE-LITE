@@ -10,6 +10,15 @@
 //!   userspace TCP sessions, so one port serves SOCKS5 and HTTP
 //!   (NekoBox-style "Mixed (SOCKS+HTTP)") and LAN sharing needs no
 //!   second port.
+//! * **UDP relay** (v3.9, `UdpRelay`): the same port number on UDP
+//!   serves SOCKS5 UDP ASSOCIATE (RFC 1928). Datagrams from a client
+//!   are stripped of their SOCKS UDP header and sent through the
+//!   tunnel as UDP flows (`SstpTunnel::open_udp_flow`); replies come
+//!   back the same way. This is what makes a phone behind v2rayNG
+//!   browse: its DNS lookups and QUIC are UDP, and a TCP-only proxy
+//!   drops them silently. HTTP has no UDP, so only SOCKS5 gets it.
+//!   TCP and UDP port numbers do not collide, so one port number
+//!   serves both.
 //!
 //! The HTTP proxy supports CONNECT (tunnel mode: 200, then raw bytes
 //! both ways — HTTPS goes this way) and plain HTTP requests in
@@ -29,11 +38,14 @@
 //! (blocked before us, e.g. by the Windows firewall), while a
 //! connection that arrives but fails names the step it died on.
 
-use crate::sstp::SstpTunnel;
+use crate::sstp::{SstpTunnel, UdpFlow};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::task::JoinSet;
 
 /// Connect to `host:port` through a SOCKS5 proxy at `proxy_addr`.
 /// Supports no-auth and username/password auth.
@@ -152,21 +164,97 @@ pub async fn serve_mixed(
         listener.local_addr().unwrap()
     );
     println!("Configure your apps / browser to use this proxy (SOCKS5 or HTTP). Ctrl-C to stop.");
-    loop {
-        let (socket, peer) = match listener.accept().await {
-            Ok(v) => v,
+    // UDP relay on the same address (same port number) as the TCP
+    // listener — TCP and UDP port numbers do not collide. When the
+    // UDP bind fails (the port is already taken by another program's
+    // UDP socket), the TCP proxy keeps working and UDP ASSOCIATE is
+    // refused with a clear error; nothing else changes.
+    let udp_socket: Option<Arc<UdpSocket>> = match listener.local_addr() {
+        Ok(a) => match UdpSocket::bind(a).await {
+            Ok(s) => {
+                println!("UDP 中继（SOCKS5 UDP ASSOCIATE）listening on {} (UDP)", a);
+                Some(Arc::new(s))
+            }
             Err(e) => {
-                eprintln!("mixed proxy accept error: {}", e);
-                continue;
+                eprintln!(
+                    "UDP 中继绑定 {} 失败：{}（UDP 不可用，SOCKS5 UDP ASSOCIATE 会被拒绝；TCP 代理不受影响）",
+                    a, e
+                );
+                None
             }
-        };
-        let t = tunnel.clone();
-        let log = conn_log.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_mixed_conn(socket, t, timeout, &log).await {
-                emit_conn_log(&log, format!("混合代理连接 {} 失败：{}", peer, e));
+        },
+        Err(_) => None,
+    };
+    let relay: Option<Arc<UdpRelay>> = udp_socket.as_ref().map(|s| {
+        Arc::new(UdpRelay::new(
+            tunnel.clone(),
+            s.clone(),
+            conn_log.clone(),
+        ))
+    });
+    // Reply-forwarding tasks live in this JoinSet, owned by this
+    // task's stack: aborting the mixed server (disconnect) drops the
+    // set, which aborts every forwarder and frees the UDP socket —
+    // no leaked relay, no leaked port.
+    let mut forwarders: JoinSet<()> = JoinSet::new();
+    let mut sweep = tokio::time::interval(UDP_SWEEP_INTERVAL);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            res = listener.accept() => {
+                let (socket, peer) = match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("mixed proxy accept error: {}", e);
+                        continue;
+                    }
+                };
+                let t = tunnel.clone();
+                let log = conn_log.clone();
+                let relay_addr = relay.as_ref().map(|r| r.socket_addr());
+                let relay_for_assoc = relay.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        handle_mixed_conn(socket, t, timeout, &log, relay_addr, relay_for_assoc).await
+                    {
+                        emit_conn_log(&log, format!("混合代理连接 {} 失败：{}", peer, e));
+                    }
+                });
             }
-        });
+            datagram = recv_udp_datagram(&udp_socket) => {
+                let (data, src) = datagram;
+                if let Some(r) = &relay {
+                    r.handle_datagram(&mut forwarders, src, &data).await;
+                }
+            }
+            _ = sweep.tick() => {
+                if let Some(r) = &relay {
+                    let n = r.sweep_idle();
+                    if n > 0 {
+                        emit_conn_log(&conn_log, format!("UDP 中继：清理 {} 条空闲超时的流", n));
+                    }
+                }
+            }
+            Some(_done) = forwarders.join_next(), if !forwarders.is_empty() => {
+                // Reap a finished reply-forwarder (its flow closed).
+            }
+        }
+    }
+}
+
+/// Receive one datagram from the relay socket; parks forever when
+/// there is no relay (UDP bind failed) or the socket errors, so the
+/// select loop never spins.
+async fn recv_udp_datagram(socket: &Option<Arc<UdpSocket>>) -> (Vec<u8>, SocketAddr) {
+    match socket {
+        Some(s) => {
+            let mut buf = [0u8; UDP_RELAY_BUF];
+            match s.recv_from(&mut buf).await {
+                Ok((n, src)) => (buf[..n].to_vec(), src),
+                Err(_) => std::future::pending().await,
+            }
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -194,11 +282,17 @@ fn classify_first_byte(b: u8) -> FirstByte {
 
 /// One accepted connection: sniff the first byte (`peek`, so the
 /// chosen handler still sees the whole stream) and dispatch.
+/// `relay_addr` is the UDP relay's address for SOCKS5 UDP ASSOCIATE
+/// replies (None when the UDP bind failed); `relay` is the shared
+/// relay state for per-client cleanup when an ASSOCIATE connection
+/// closes.
 async fn handle_mixed_conn(
     local: TcpStream,
     tunnel: Arc<SstpTunnel>,
     timeout: Duration,
     conn_log: &Option<ConnLog>,
+    relay_addr: Option<SocketAddr>,
+    relay: Option<Arc<UdpRelay>>,
 ) -> Result<(), String> {
     let peer = peer_of(&local);
     let mut first = [0u8; 1];
@@ -211,7 +305,9 @@ async fn handle_mixed_conn(
         return Ok(()); // client closed immediately
     }
     match classify_first_byte(first[0]) {
-        FirstByte::Socks5 => handle_socks5_conn(local, tunnel, timeout, conn_log).await,
+        FirstByte::Socks5 => {
+            handle_socks5_conn(local, tunnel, timeout, conn_log, relay_addr, relay).await
+        }
         FirstByte::Http => handle_http_conn(local, tunnel, timeout, conn_log).await,
         FirstByte::Unknown => {
             emit_conn_log(
@@ -231,6 +327,8 @@ async fn handle_socks5_conn(
     tunnel: Arc<SstpTunnel>,
     timeout: Duration,
     conn_log: &Option<ConnLog>,
+    relay_addr: Option<SocketAddr>,
+    relay: Option<Arc<UdpRelay>>,
 ) -> Result<(), String> {
     // Greeting.
     let mut hdr = [0u8; 2];
@@ -264,11 +362,11 @@ async fn handle_socks5_conn(
         .read_exact(&mut rhdr)
         .await
         .map_err(|e| e.to_string())?;
-    if rhdr[0] != 0x05 || rhdr[1] != 0x01 {
+    if rhdr[0] != 0x05 {
         let _ = local
             .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
             .await;
-        return Err(format!("unsupported SOCKS5 command {}", rhdr[1]));
+        return Err("not a SOCKS5 client".to_string());
     }
     let (host, port) = match rhdr[3] {
         0x01 => {
@@ -301,6 +399,21 @@ async fn handle_socks5_conn(
             return Err(format!("unsupported SOCKS5 address type {}", t));
         }
     };
+    match rhdr[1] {
+        0x03 => {
+            // UDP ASSOCIATE: the address just parsed is the client's
+            // "expected" address (usually 0.0.0.0:0) and is ignored —
+            // datagrams are keyed by their actual source instead.
+            return handle_socks5_udp_associate(local, relay_addr, relay, conn_log).await;
+        }
+        0x01 => {} // CONNECT: fall through to the body below.
+        cmd => {
+            let _ = local
+                .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+            return Err(format!("unsupported SOCKS5 command {}", cmd));
+        }
+    }
     emit_conn_log(
         conn_log,
         format!(
@@ -330,6 +443,455 @@ async fn handle_socks5_conn(
         .await
         .map_err(|e| e.to_string())?;
     let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SOCKS5 UDP relay (UDP ASSOCIATE, RFC 1928) — v3.9
+// ---------------------------------------------------------------------------
+
+/// Max UDP datagram (including the SOCKS header) we read from a client.
+const UDP_RELAY_BUF: usize = 2048;
+/// Max payload bytes in one tunnelled UDP datagram (1500-byte PPP MRU
+/// minus the 20-byte IP and 8-byte UDP headers). Larger payloads are
+/// dropped, never fragmented.
+const UDP_RELAY_MAX_PAYLOAD: usize = 1472;
+/// Max concurrent UDP flows through one relay.
+const UDP_RELAY_MAX_FLOWS: usize = 1024;
+/// A flow with no traffic for this long is dropped.
+const UDP_FLOW_IDLE: Duration = Duration::from_secs(60);
+/// How often the relay sweeps idle flows.
+const UDP_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Parse a SOCKS5 UDP datagram (RFC 1928): RSV(2) FRAG(1) ATYP(1)
+/// ADDR PORT(2) DATA. Returns (frag, host, port, payload) — host is
+/// a dotted IPv4 string for ATYP 1, a domain for ATYP 3. None when
+/// malformed (short, non-zero RSV, IPv6, unknown ATYP).
+fn parse_socks_udp(data: &[u8]) -> Option<(u8, String, u16, &[u8])> {
+    if data.len() < 4 || data[0] != 0 || data[1] != 0 {
+        return None;
+    }
+    let frag = data[2];
+    match data[3] {
+        0x01 => {
+            if data.len() < 10 {
+                return None;
+            }
+            let host = format!("{}.{}.{}.{}", data[4], data[5], data[6], data[7]);
+            let port = u16::from_be_bytes([data[8], data[9]]);
+            Some((frag, host, port, &data[10..]))
+        }
+        0x03 => {
+            let n = data[4] as usize;
+            if data.len() < 5 + n + 2 {
+                return None;
+            }
+            let host = String::from_utf8_lossy(&data[5..5 + n]).into_owned();
+            let port = u16::from_be_bytes([data[5 + n], data[5 + n + 1]]);
+            Some((frag, host, port, &data[5 + n + 2..]))
+        }
+        _ => None, // IPv6 (0x04) and anything else: unsupported
+    }
+}
+
+/// Build a SOCKS5 UDP datagram reply: RSV 0, FRAG 0, ATYP 1 with the
+/// packet's source address, then the payload.
+fn build_socks_udp(src_ip: Ipv4Addr, src_port: u16, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10 + payload.len());
+    out.extend_from_slice(&[0, 0, 0, 0x01]);
+    out.extend_from_slice(&src_ip.octets());
+    out.extend_from_slice(&src_port.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// One UDP flow, keyed by the client's UDP socket address and the
+/// target as asked (host string, so a domain target resolves once
+/// per flow instead of once per datagram). The client's TCP
+/// ASSOCIATE connection may use a different port, so the key is the
+/// datagram source, not the TCP peer.
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
+struct UdpFlowKey {
+    client: SocketAddr,
+    host: String,
+    port: u16,
+}
+
+struct UdpFlowEntry {
+    key: UdpFlowKey,
+    /// Source port of the tunnel flow (replies are demuxed on it).
+    src_port: u16,
+    /// Resolved destination (for `send_udp`).
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+    /// "host:port" as the client asked, for the log line.
+    dst_display: String,
+    last_active: std::sync::Mutex<Instant>,
+}
+
+impl UdpFlowEntry {
+    fn new(key: UdpFlowKey, src_port: u16, dst: (Ipv4Addr, u16), dst_display: String) -> Self {
+        Self {
+            key,
+            src_port,
+            dst_ip: dst.0,
+            dst_port: dst.1,
+            dst_display,
+            last_active: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    fn touch(&self) {
+        if let Ok(mut g) = self.last_active.lock() {
+            *g = Instant::now();
+        }
+    }
+
+    fn last_active(&self) -> Instant {
+        self.last_active
+            .lock()
+            .map(|g| *g)
+            .unwrap_or_else(|_| Instant::now())
+    }
+
+    fn idle_for(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last_active())
+    }
+}
+
+/// The UDP flow table: bounded, with idle expiry. Pure bookkeeping —
+/// no tunnel, no sockets — so it is unit-testable on its own. The
+/// relay owns one behind a mutex; the tunnel flows themselves are
+/// closed by the relay, not by the table.
+struct UdpFlowTable {
+    flows: HashMap<UdpFlowKey, Arc<UdpFlowEntry>>,
+    max_flows: usize,
+}
+
+impl UdpFlowTable {
+    fn new(max_flows: usize) -> Self {
+        Self {
+            flows: HashMap::new(),
+            max_flows,
+        }
+    }
+
+    fn get(&self, key: &UdpFlowKey) -> Option<Arc<UdpFlowEntry>> {
+        self.flows.get(key).cloned()
+    }
+
+    fn insert(&mut self, entry: Arc<UdpFlowEntry>) {
+        self.flows.insert(entry.key.clone(), entry);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.flows.len()
+    }
+
+    /// Remove `entry` only if it is still the entry stored under its
+    /// key (a newer flow for the same key must survive).
+    fn remove_if_same(&mut self, entry: &Arc<UdpFlowEntry>) {
+        if let Some(cur) = self.flows.get(&entry.key) {
+            if Arc::ptr_eq(cur, entry) {
+                self.flows.remove(&entry.key);
+            }
+        }
+    }
+
+    /// Drop every flow from one client IP (ASSOCIATE TCP close).
+    /// Returns the dropped entries so the caller can close their
+    /// tunnel flows.
+    fn remove_client(&mut self, ip: IpAddr) -> Vec<Arc<UdpFlowEntry>> {
+        let keys: Vec<UdpFlowKey> = self
+            .flows
+            .keys()
+            .filter(|k| k.client.ip() == ip)
+            .cloned()
+            .collect();
+        keys.iter()
+            .filter_map(|k| self.flows.remove(k))
+            .collect()
+    }
+
+    /// When the table is full, evict the least-recently-active flow
+    /// so a new one can be created (bounded memory under a flood).
+    /// Returns the evicted entry so the caller can close its tunnel
+    /// flow. None when there is room.
+    fn evict_oldest_if_full(&mut self) -> Option<Arc<UdpFlowEntry>> {
+        if self.flows.len() < self.max_flows {
+            return None;
+        }
+        let oldest = self
+            .flows
+            .values()
+            .min_by_key(|e| e.last_active())
+            .cloned()?;
+        self.flows.remove(&oldest.key);
+        Some(oldest)
+    }
+
+    /// Drop flows idle longer than `idle`. Returns the dropped
+    /// entries so the caller can close their tunnel flows.
+    fn sweep_idle(&mut self, now: Instant, idle: Duration) -> Vec<Arc<UdpFlowEntry>> {
+        let keys: Vec<UdpFlowKey> = self
+            .flows
+            .iter()
+            .filter(|(_, e)| e.idle_for(now) > idle)
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.iter()
+            .filter_map(|k| self.flows.remove(k))
+            .collect()
+    }
+}
+
+/// The UDP relay shared by one mixed-proxy listener: one UDP socket
+/// bound to the same port as the TCP listener, a flow table, and the
+/// tunnel. Datagrams are handled inline in `serve_mixed`'s select
+/// loop; replies are forwarded by per-flow tasks owned by that same
+/// loop's JoinSet, so aborting the mixed server (disconnect) aborts
+/// the relay and its forwarders too — no leaked UDP socket.
+struct UdpRelay {
+    tunnel: Arc<SstpTunnel>,
+    socket: Arc<UdpSocket>,
+    flows: std::sync::Mutex<UdpFlowTable>,
+    conn_log: Option<ConnLog>,
+}
+
+impl UdpRelay {
+    fn new(tunnel: Arc<SstpTunnel>, socket: Arc<UdpSocket>, conn_log: Option<ConnLog>) -> Self {
+        Self {
+            tunnel,
+            socket,
+            flows: std::sync::Mutex::new(UdpFlowTable::new(UDP_RELAY_MAX_FLOWS)),
+            conn_log,
+        }
+    }
+
+    fn socket_addr(&self) -> SocketAddr {
+        self.socket
+            .local_addr()
+            .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap())
+    }
+
+    /// Handle one datagram received on the relay socket: parse the
+    /// SOCKS UDP header, find or open the tunnel flow for
+    /// (client, target), and send the payload through the tunnel.
+    /// `forwarders` is the JoinSet the reply-forwarding task is
+    /// spawned into (owned by `serve_mixed`, so it dies with it).
+    /// Malformed datagrams, fragmented ones (FRAG > 0, unsupported)
+    /// and oversize payloads are dropped silently — UDP is lossy
+    /// anyway, and answering garbage would only help a scanner.
+    async fn handle_datagram(
+        self: &Arc<Self>,
+        forwarders: &mut JoinSet<()>,
+        src: SocketAddr,
+        data: &[u8],
+    ) {
+        let Some((frag, host, port, payload)) = parse_socks_udp(data) else {
+            return;
+        };
+        if frag != 0 {
+            return;
+        }
+        if payload.len() > UDP_RELAY_MAX_PAYLOAD {
+            return;
+        }
+        let key = UdpFlowKey {
+            client: src,
+            host: host.clone(),
+            port,
+        };
+        let entry = {
+            let table = self.flows.lock().unwrap();
+            table.get(&key)
+        };
+        let entry = match entry {
+            Some(e) => e,
+            None => {
+                if self.tunnel.is_dead() {
+                    return;
+                }
+                if let Some(old) = {
+                    let mut table = self.flows.lock().unwrap();
+                    table.evict_oldest_if_full()
+                } {
+                    self.tunnel.close_udp_flow(old.src_port);
+                }
+                let flow = match self.tunnel.open_udp_flow(&host, port).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        emit_conn_log(
+                            &self.conn_log,
+                            format!(
+                                "混合代理 UDP {}：打通 {}:{} 失败：{}",
+                                src, host, port, e
+                            ),
+                        );
+                        return;
+                    }
+                };
+                let entry = Arc::new(UdpFlowEntry::new(
+                    key.clone(),
+                    flow.src_port(),
+                    flow.dst(),
+                    format!("{}:{}", host, port),
+                ));
+                {
+                    let mut table = self.flows.lock().unwrap();
+                    table.insert(entry.clone());
+                }
+                forwarders.spawn(udp_reply_forwarder(self.clone(), entry.clone(), flow));
+                // One line per flow, not per datagram (DNS does
+                // dozens a second): source, target host:port, and
+                // the first packet's byte count. Never any content.
+                emit_conn_log(
+                    &self.conn_log,
+                    format!(
+                        "混合代理 UDP {}：新建流 → {}（首包 {} 字节）",
+                        src,
+                        entry.dst_display,
+                        payload.len()
+                    ),
+                );
+                entry
+            }
+        };
+        entry.touch();
+        if self
+            .tunnel
+            .send_udp(entry.src_port, entry.dst_ip, entry.dst_port, payload)
+            .is_err()
+        {
+            // The flow went away between lookup and send (swept, or
+            // the tunnel died): drop the entry so the next datagram
+            // opens a fresh flow instead of black-holing.
+            self.tunnel.close_udp_flow(entry.src_port);
+            let mut table = self.flows.lock().unwrap();
+            table.remove_if_same(&entry);
+        }
+    }
+
+    /// Drop flows idle longer than `UDP_FLOW_IDLE`: close the tunnel
+    /// flow (the forwarder's recv then returns None and it exits)
+    /// and remove the entry. Returns how many were dropped.
+    fn sweep_idle(&self) -> usize {
+        let expired = {
+            let mut table = self.flows.lock().unwrap();
+            table.sweep_idle(Instant::now(), UDP_FLOW_IDLE)
+        };
+        for e in &expired {
+            self.tunnel.close_udp_flow(e.src_port);
+        }
+        expired.len()
+    }
+
+    /// Remove `entry` only if it is still the entry stored under its
+    /// key (a newer flow for the same key must survive).
+    fn remove_if_same(&self, entry: &Arc<UdpFlowEntry>) {
+        let mut table = self.flows.lock().unwrap();
+        table.remove_if_same(entry);
+    }
+
+    /// Drop every flow from one client IP (called when its UDP
+    /// ASSOCIATE TCP connection closes). The 60 s idle sweep is the
+    /// backstop for clients that never close cleanly.
+    fn remove_client_flows(&self, client_ip: IpAddr) {
+        let victims = {
+            let mut table = self.flows.lock().unwrap();
+            table.remove_client(client_ip)
+        };
+        for e in &victims {
+            self.tunnel.close_udp_flow(e.src_port);
+        }
+    }
+}
+
+/// One flow's reply pump: tunnel replies → SOCKS UDP datagrams back
+/// to the client. Ends when the tunnel flow closes (idle sweep,
+/// client disconnect, or tunnel death); the entry is removed from
+/// the table on exit (only if it is still the same entry).
+async fn udp_reply_forwarder(relay: Arc<UdpRelay>, entry: Arc<UdpFlowEntry>, mut flow: UdpFlow) {
+    let client = entry.key.client;
+    loop {
+        match flow.recv().await {
+            Some((src_ip, src_port, payload)) => {
+                entry.touch();
+                let reply = build_socks_udp(src_ip, src_port, &payload);
+                if relay.socket.send_to(&reply, client).await.is_err() {
+                    break;
+                }
+            }
+            None => break, // flow closed (sweep / tunnel death)
+        }
+    }
+    relay.remove_if_same(&entry);
+    // Dropping `flow` removes it from the tunnel's udp_flows table.
+}
+
+/// SOCKS5 UDP ASSOCIATE (RFC 1928): reply with the relay's UDP
+/// address, then hold the TCP connection open — the association
+/// lives as long as this connection. When it closes, drop this
+/// client's flows (the 60 s idle sweep is the backstop).
+async fn handle_socks5_udp_associate(
+    mut local: TcpStream,
+    relay_addr: Option<SocketAddr>,
+    relay: Option<Arc<UdpRelay>>,
+    conn_log: &Option<ConnLog>,
+) -> Result<(), String> {
+    let Some(relay_addr) = relay_addr else {
+        let _ = local
+            .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
+        return Err("SOCKS5 UDP ASSOCIATE 被拒绝：UDP 中继不可用".to_string());
+    };
+    let peer_ip = local.peer_addr().map(|a| a.ip()).ok();
+    // If the relay is bound to 0.0.0.0, the client needs the concrete
+    // IP it connected to (a 0.0.0.0 reply address is unusable).
+    let reply_ip = if relay_addr.ip().is_unspecified() {
+        local
+            .local_addr()
+            .map(|a| a.ip())
+            .unwrap_or(relay_addr.ip())
+    } else {
+        relay_addr.ip()
+    };
+    let mut rep = vec![0x05, 0x00, 0x00, 0x01];
+    match reply_ip {
+        IpAddr::V4(v4) => rep.extend_from_slice(&v4.octets()),
+        IpAddr::V6(_) => {
+            // Our binds are IPv4-only; this cannot happen, but refuse
+            // cleanly rather than sending a malformed reply.
+            let _ = local
+                .write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+            return Err("SOCKS5 UDP ASSOCIATE 被拒绝：中继地址不是 IPv4".to_string());
+        }
+    }
+    rep.extend_from_slice(&relay_addr.port().to_be_bytes());
+    local.write_all(&rep).await.map_err(|e| e.to_string())?;
+    emit_conn_log(
+        conn_log,
+        format!(
+            "混合代理连接 {}：SOCKS5 UDP ASSOCIATE → 中继 {}:{}",
+            peer_of(&local),
+            reply_ip,
+            relay_addr.port()
+        ),
+    );
+    // Hold the association open until the client closes the TCP
+    // connection; ASSOCIATE carries no TCP data.
+    let mut buf = [0u8; 512];
+    loop {
+        match local.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    if let (Some(r), Some(ip)) = (relay, peer_ip) {
+        r.remove_client_flows(ip);
+    }
     Ok(())
 }
 
@@ -974,5 +1536,146 @@ mod tests {
         let mut got = Vec::new();
         sink_b.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"5\r\nHELLO\r\n0\r\n\r\n");
+    }
+
+    #[test]
+    fn parse_socks_udp_edges() {
+        // IPv4 target.
+        let mut d = vec![0, 0, 0, 0x01, 1, 2, 3, 4];
+        d.extend_from_slice(&53u16.to_be_bytes());
+        d.extend_from_slice(b"QUERY");
+        let (frag, host, port, payload) = parse_socks_udp(&d).unwrap();
+        assert_eq!(frag, 0);
+        assert_eq!(host, "1.2.3.4");
+        assert_eq!(port, 53);
+        assert_eq!(payload, b"QUERY");
+        // Domain target, FRAG preserved for the caller to drop.
+        let mut d = vec![0, 0, 2, 0x03, 11];
+        d.extend_from_slice(b"example.com");
+        d.extend_from_slice(&443u16.to_be_bytes());
+        d.extend_from_slice(b"QUIC");
+        let (frag, host, port, payload) = parse_socks_udp(&d).unwrap();
+        assert_eq!(frag, 2);
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+        assert_eq!(payload, b"QUIC");
+        // IPv6, bad RSV, short, and unknown ATYP are all refused.
+        assert!(parse_socks_udp(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0, 0]).is_none());
+        assert!(parse_socks_udp(&[0, 1, 0, 0x01, 1, 2, 3, 4, 0, 53]).is_none());
+        assert!(parse_socks_udp(&[0, 0, 0]).is_none());
+        assert!(parse_socks_udp(&[0, 0, 0, 0x09, 1, 2, 3, 4, 0, 53]).is_none());
+        // Truncated domain: length byte promises more than present.
+        assert!(parse_socks_udp(&[0, 0, 0, 0x03, 11, b'e', b'x']).is_none());
+    }
+
+    #[test]
+    fn build_socks_udp_roundtrip() {
+        let ip = Ipv4Addr::new(8, 8, 8, 8);
+        let built = build_socks_udp(ip, 53, b"DNS-REPLY");
+        let (frag, host, port, payload) = parse_socks_udp(&built).unwrap();
+        assert_eq!(frag, 0);
+        assert_eq!(host, "8.8.8.8");
+        assert_eq!(port, 53);
+        assert_eq!(payload, b"DNS-REPLY");
+        assert_eq!(&built[..4], &[0, 0, 0, 0x01], "header bytes");
+    }
+
+    fn udp_test_entry(client_port: u16, host: &str, port: u16) -> Arc<UdpFlowEntry> {
+        Arc::new(UdpFlowEntry::new(
+            UdpFlowKey {
+                client: SocketAddr::from(([127, 0, 0, 1], client_port)),
+                host: host.to_string(),
+                port,
+            },
+            20000 + client_port,
+            (Ipv4Addr::new(8, 8, 8, 8), port),
+            format!("{}:{}", host, port),
+        ))
+    }
+
+    #[test]
+    fn udp_flow_table_sweep_drops_idle_only() {
+        let mut table = UdpFlowTable::new(1024);
+        let now = Instant::now();
+        let idle = udp_test_entry(1001, "a.example", 53);
+        let recent = udp_test_entry(1002, "b.example", 53);
+        let fresh = udp_test_entry(1003, "c.example", 53);
+        *idle.last_active.lock().unwrap() = now - Duration::from_secs(120);
+        *recent.last_active.lock().unwrap() = now - Duration::from_secs(10);
+        table.insert(idle.clone());
+        table.insert(recent.clone());
+        table.insert(fresh.clone());
+        let dropped = table.sweep_idle(now, UDP_FLOW_IDLE);
+        assert_eq!(dropped.len(), 1, "only the 120 s-idle flow goes");
+        assert!(Arc::ptr_eq(&dropped[0], &idle));
+        assert_eq!(table.len(), 2);
+        assert!(table.get(&recent.key).is_some());
+        assert!(table.get(&fresh.key).is_some());
+    }
+
+    #[test]
+    fn udp_flow_table_evicts_oldest_when_full() {
+        let mut table = UdpFlowTable::new(3);
+        let now = Instant::now();
+        let e1 = udp_test_entry(1001, "a.example", 53);
+        let e2 = udp_test_entry(1002, "b.example", 53);
+        let e3 = udp_test_entry(1003, "c.example", 53);
+        *e1.last_active.lock().unwrap() = now - Duration::from_secs(30);
+        *e2.last_active.lock().unwrap() = now - Duration::from_secs(20);
+        *e3.last_active.lock().unwrap() = now - Duration::from_secs(10);
+        table.insert(e1.clone());
+        table.insert(e2.clone());
+        table.insert(e3.clone());
+        // Full (3 of 3): the least-recently-active flow is evicted.
+        let evicted = table.evict_oldest_if_full().unwrap();
+        assert!(
+            Arc::ptr_eq(&evicted, &e1),
+            "the least-recently-active flow is evicted"
+        );
+        assert_eq!(table.len(), 2);
+        assert!(table.get(&e1.key).is_none());
+        // Room again: nothing to evict.
+        assert!(table.evict_oldest_if_full().is_none());
+        table.insert(udp_test_entry(1004, "d.example", 53));
+        let evicted = table.evict_oldest_if_full().unwrap();
+        assert!(
+            Arc::ptr_eq(&evicted, &e2),
+            "after refill, the next-oldest flow is evicted"
+        );
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn udp_flow_table_remove_client() {
+        let mut table = UdpFlowTable::new(1024);
+        let phone = udp_test_entry(1001, "a.example", 53);
+        // Same client IP as `phone`, different UDP source port.
+        let phone2 = Arc::new(UdpFlowEntry::new(
+            UdpFlowKey {
+                client: SocketAddr::from(([127, 0, 0, 1], 1002)),
+                host: "b.example".to_string(),
+                port: 443,
+            },
+            21002,
+            (Ipv4Addr::new(1, 1, 1, 1), 443),
+            "b.example:443".to_string(),
+        ));
+        let other = Arc::new(UdpFlowEntry::new(
+            UdpFlowKey {
+                client: SocketAddr::from(([192, 168, 1, 5], 1003)),
+                host: "c.example".to_string(),
+                port: 53,
+            },
+            21003,
+            (Ipv4Addr::new(8, 8, 4, 4), 53),
+            "c.example:53".to_string(),
+        ));
+        table.insert(phone.clone());
+        table.insert(phone2.clone());
+        table.insert(other.clone());
+        let removed = table.remove_client("127.0.0.1".parse().unwrap());
+        assert_eq!(removed.len(), 2, "both flows from that IP go");
+        assert_eq!(table.len(), 1);
+        assert!(table.get(&other.key).is_some());
     }
 }

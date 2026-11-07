@@ -116,10 +116,12 @@ vpngate-client.exe   （约 10 MB，命令行版）
    日志里完全没有那台局域网设备的地址 → 连接根本没到达程序（第 1 条的防火墙问题）；
    有“混合代理连接 192.168.x.x：SOCKS5 → …” → 连接到了，问题在隧道/节点那头；
    有“失败：…” → 按那行的原因往下查。
-3. **局域网设备上关 QUIC 再试**：隧道只走 TCP，QUIC（UDP）过不去；YouTube、X
-   这类站大量用 QUIC，本机能开页面但视频放不了、X 打不开，多半是这个原因（与局域网
-   无关，本机也一样）。浏览器地址栏输 `chrome://flags`，搜 QUIC，把“Experimental
-   QUIC protocol”设为 Disabled，重启浏览器再试。
+3. **局域网设备上关 QUIC 再试（只针对 PC 浏览器）**：v3.9 起，手机经 v2rayNG 这类把
+   流量全收进代理的客户端上网时，它的 DNS 与 QUIC 都走隧道的 UDP 中继，不用再关 QUIC。
+   但 PC 上 Chrome 的 QUIC 是直连、不走代理，UDP 中继管不到它；YouTube、X 这类站大量
+   用 QUIC，本机能开页面但视频放不了、X 打不开，多半是这个原因（与局域网无关，本机也
+   一样）。浏览器地址栏输 `chrome://flags`，搜 QUIC，把“Experimental QUIC protocol”
+   设为 Disabled，重启浏览器再试。
 4. 局域网设备上的浏览器代理要设成本机 IP（如 `192.168.x.x:10818`），不是
    `127.0.0.1`（那是指设备自己）。
 

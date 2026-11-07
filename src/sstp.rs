@@ -16,7 +16,10 @@
 //! 4. Afterwards every TCP connection is a hand-built IPv4+TCP packet
 //!    (SYN → SYN-ACK → ACK, 1300-byte PSH+ACK chunks, ACKs, FIN)
 //!    wrapped as SSTP data packets (FF 03 + PPP protocol 0x0021).
-//!    Only TCP is tunnelled; UDP is not (same limitation as the JS code).
+//! 5. UDP (v3.9) rides the same PPP/IP layer: hand-built IPv4+UDP
+//!    datagrams, demuxed by source port (`UdpFlow`). The SoftEther
+//!    server's NAT forwards them, so no server-side change is needed.
+//!    The IP layer dispatches on the protocol number (TCP 6, UDP 17).
 
 use crate::doh::resolve_ipv4;
 use crate::net::Connector;
@@ -37,6 +40,12 @@ const PPP_IPCP: u16 = 0x8021;
 const PPP_IPV4: u16 = 0x0021;
 const TCP_MSS: usize = 1300;
 const MAX_PACKETS_ESTABLISH: usize = 200;
+/// Max UDP payload in one tunnelled datagram: the 1500-byte PPP MRU
+/// minus the 20-byte IPv4 and 8-byte UDP headers. UDP has no
+/// fragmentation here — oversize datagrams are dropped by the caller.
+const UDP_MAX_PAYLOAD: usize = 1472;
+const IP_PROTO_TCP: u8 = 6;
+const IP_PROTO_UDP: u8 = 17;
 
 // ---------------------------------------------------------------------------
 // SSTP / PPP frame builders (port of JS tunData / tunCtrl / linkFrame /
@@ -423,6 +432,70 @@ fn tcp_frame(
     f
 }
 
+/// Build one SSTP data packet carrying a hand-built IPv4+UDP
+/// datagram. Layout mirrors `tcp_frame`: 4-byte SSTP header, FF 03,
+/// PPP protocol 0x0021, 20-byte IPv4 header, 8-byte UDP header.
+/// Returns None when the payload would not fit the 1500-byte PPP
+/// MRU (UDP has no fragmentation here — oversize datagrams are
+/// dropped by the caller, never split).
+fn udp_frame(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    if payload.len() > UDP_MAX_PAYLOAD {
+        return None;
+    }
+    let total = 36 + payload.len();
+    let mut f = vec![0u8; total];
+    f[0] = 0x10;
+    f[2] = (((total >> 8) & 0x0F) | 0x80) as u8;
+    f[3] = (total & 0xFF) as u8;
+    f[4] = 0xFF;
+    f[5] = 0x03;
+    f[6] = 0x00;
+    f[7] = 0x21;
+    // IPv4 header at offset 8.
+    let il = 20 + 8 + payload.len();
+    f[8] = 0x45;
+    f[10] = (il >> 8) as u8;
+    f[11] = (il & 0xFF) as u8;
+    let ip_id = random_bytes(2);
+    f[12] = ip_id[0];
+    f[13] = ip_id[1];
+    f[14] = 0x40; // DF
+    f[16] = 64; // TTL
+    f[17] = IP_PROTO_UDP;
+    f[20..24].copy_from_slice(&src_ip.octets());
+    f[24..28].copy_from_slice(&dst_ip.octets());
+    let c = checksum(&f[8..28]);
+    f[18] = (c >> 8) as u8;
+    f[19] = (c & 0xFF) as u8;
+    // UDP header at offset 28.
+    f[28..30].copy_from_slice(&src_port.to_be_bytes());
+    f[30..32].copy_from_slice(&dst_port.to_be_bytes());
+    f[32..34].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    f[36..].copy_from_slice(payload);
+    // UDP checksum over pseudo-header + UDP header + payload. A
+    // computed zero is transmitted as 0xFFFF (RFC 768).
+    let mut ps = Vec::with_capacity(12 + 8 + payload.len());
+    ps.extend_from_slice(&src_ip.octets());
+    ps.extend_from_slice(&dst_ip.octets());
+    ps.push(0);
+    ps.push(IP_PROTO_UDP);
+    ps.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    ps.extend_from_slice(&f[28..]);
+    let mut uc = checksum(&ps);
+    if uc == 0 {
+        uc = 0xFFFF;
+    }
+    f[34] = (uc >> 8) as u8;
+    f[35] = (uc & 0xFF) as u8;
+    Some(f)
+}
+
 #[derive(Default)]
 struct SessionState {
     seq: u32,
@@ -466,6 +539,58 @@ impl Session {
             *g = None; // dropping the sender closes the receiver -> EOF
         }
         self.handshake.notify_waiters();
+    }
+}
+
+/// One UDP flow's receive half, held in the tunnel's demux table.
+/// Replies for a source port are sent here; dropping the sender
+/// (when the flow is closed) makes `UdpFlow::recv` return None.
+/// The destination is tracked by the `UdpFlow` / relay entry, not
+/// here — this struct only needs the sender.
+struct UdpFlowEndpoint {
+    tx: mpsc::UnboundedSender<(Ipv4Addr, u16, Vec<u8>)>,
+}
+
+/// One UDP conversation through the tunnel: a source port on our
+/// virtual IP talking to one destination. UDP has no handshake — a
+/// flow exists from creation until it is dropped (or the tunnel
+/// closes it); replies arrive on `recv`.
+pub struct UdpFlow {
+    tunnel: Arc<SstpTunnel>,
+    src_port: u16,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+    rx: mpsc::UnboundedReceiver<(Ipv4Addr, u16, Vec<u8>)>,
+}
+
+impl UdpFlow {
+    /// Our source port on the virtual IP (what the demuxer keys on).
+    pub fn src_port(&self) -> u16 {
+        self.src_port
+    }
+
+    /// The destination this flow talks to.
+    pub fn dst(&self) -> (Ipv4Addr, u16) {
+        (self.dst_ip, self.dst_port)
+    }
+
+    /// Send one datagram. Err when the payload does not fit the
+    /// tunnel MTU or the tunnel is closed.
+    pub fn send(&self, payload: &[u8]) -> Result<(), String> {
+        self.tunnel
+            .send_udp(self.src_port, self.dst_ip, self.dst_port, payload)
+    }
+
+    /// Next reply datagram: (source IP, source port, payload).
+    /// None when the flow was closed.
+    pub async fn recv(&mut self) -> Option<(Ipv4Addr, u16, Vec<u8>)> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for UdpFlow {
+    fn drop(&mut self) {
+        self.tunnel.close_udp_flow(self.src_port);
     }
 }
 
@@ -630,6 +755,7 @@ pub struct SstpTunnel {
     pub connector: Connector,
     tx: mpsc::UnboundedSender<Vec<u8>>,
     sessions: Arc<Mutex<HashMap<u16, Arc<Session>>>>,
+    udp_flows: Arc<Mutex<HashMap<u16, UdpFlowEndpoint>>>,
     dead: AtomicBool,
 }
 
@@ -675,6 +801,8 @@ impl SstpTunnel {
             .map_err(|e| e)?;
         let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let sessions: Arc<Mutex<HashMap<u16, Arc<Session>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let udp_flows: Arc<Mutex<HashMap<u16, UdpFlowEndpoint>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let tunnel = Arc::new(SstpTunnel {
             host: host.to_string(),
             port,
@@ -682,6 +810,7 @@ impl SstpTunnel {
             connector: connector.clone(),
             tx,
             sessions: sessions.clone(),
+            udp_flows,
             dead: AtomicBool::new(false),
         });
         // Writer task: outbound SSTP packets -> TLS.
@@ -865,8 +994,59 @@ impl SstpTunnel {
         Ok(())
     }
 
+    /// One IPv4 packet off the tunnel: dispatch on the protocol
+    /// number — TCP (6) to the session table, UDP (17) to the flow
+    /// table. Anything else (ICMP and the rest) is ignored: the
+    /// tunnel carries no ICMP service.
     fn handle_ip_packet(&self, ip: &[u8]) {
-        if ip.len() < 40 || (ip[0] >> 4) != 4 || ip[9] != 6 {
+        if ip.len() < 20 || (ip[0] >> 4) != 4 {
+            return;
+        }
+        match ip[9] {
+            IP_PROTO_TCP => self.handle_tcp_packet(ip),
+            IP_PROTO_UDP => self.handle_udp_packet(ip),
+            _ => {}
+        }
+    }
+
+    /// One UDP datagram off the tunnel: deliver it to the flow keyed
+    /// by our source port (= the IP destination port here). Only the
+    /// port is matched, not the source — a reply may legitimately
+    /// come from a different address than the one queried (DNS
+    /// anycast, QUIC). Replies for unknown ports are dropped.
+    fn handle_udp_packet(&self, ip: &[u8]) {
+        let ihl = ((ip[0] & 0x0F) as usize) * 4;
+        if ip.len() < ihl + 8 {
+            return;
+        }
+        let ip_len = (u16be(ip, 2) as usize).min(ip.len());
+        if ip_len < ihl + 8 {
+            return;
+        }
+        let src_ip = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
+        let src_port = u16be(ip, ihl);
+        let dst_port = u16be(ip, ihl + 2);
+        let udp_len = u16be(ip, ihl + 4) as usize;
+        if udp_len < 8 {
+            return;
+        }
+        let end = (ihl + udp_len).min(ip_len);
+        let payload = &ip[ihl + 8..end];
+        let tx = {
+            let map = match self.udp_flows.try_lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            match map.get(&dst_port) {
+                Some(e) => e.tx.clone(),
+                None => return,
+            }
+        };
+        let _ = tx.send((src_ip, src_port, payload.to_vec()));
+    }
+
+    fn handle_tcp_packet(&self, ip: &[u8]) {
+        if ip.len() < 40 {
             return;
         }
         let ihl = ((ip[0] & 0x0F) as usize) * 4;
@@ -1060,5 +1240,142 @@ impl SstpTunnel {
                 s.close();
             }
         }
+    }
+
+    /// Open a UDP flow to `dst_host:dst_port` (host resolved the same
+    /// way as TCP: DoH, then the system resolver). UDP has no
+    /// handshake — sending works immediately; replies arrive on
+    /// `UdpFlow::recv`.
+    pub async fn open_udp_flow(
+        self: &Arc<Self>,
+        dst_host: &str,
+        dst_port: u16,
+    ) -> Result<UdpFlow, String> {
+        if self.is_dead() {
+            return Err("tunnel is dead".to_string());
+        }
+        let dst_ip_str = resolve_ipv4(&self.connector, dst_host).await?;
+        let dst_ip: Ipv4Addr = dst_ip_str
+            .parse()
+            .map_err(|_| format!("bad resolved IP {}", dst_ip_str))?;
+        self.open_udp_flow_ip(dst_ip, dst_port).await
+    }
+
+    /// Same, with an already-resolved destination IP.
+    pub async fn open_udp_flow_ip(
+        self: &Arc<Self>,
+        dst_ip: Ipv4Addr,
+        dst_port: u16,
+    ) -> Result<UdpFlow, String> {
+        if self.is_dead() {
+            return Err("tunnel is dead".to_string());
+        }
+        // Allocate a unique source port. UDP and TCP port spaces are
+        // separate, so only the UDP table is consulted.
+        let src_port = loop {
+            let rb = random_bytes(2);
+            let p = 20000 + (u16be(&rb, 0) % 40000);
+            let map = self.udp_flows.lock().await;
+            if !map.contains_key(&p) {
+                break p;
+            }
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        {
+            let mut map = self.udp_flows.lock().await;
+            map.insert(src_port, UdpFlowEndpoint { tx });
+        }
+        Ok(UdpFlow {
+            tunnel: self.clone(),
+            src_port,
+            dst_ip,
+            dst_port,
+            rx,
+        })
+    }
+
+    /// Send one UDP datagram through the tunnel from `src_port`.
+    /// Err when the payload does not fit the tunnel MTU or the
+    /// tunnel is closed. No check that a flow owns `src_port` —
+    /// the demuxer simply drops replies for unknown ports.
+    pub fn send_udp(
+        &self,
+        src_port: u16,
+        dst_ip: Ipv4Addr,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        let frame = udp_frame(self.vip, dst_ip, src_port, dst_port, payload).ok_or_else(|| {
+            format!(
+                "UDP datagram too large for the tunnel ({} bytes, max {})",
+                payload.len(),
+                UDP_MAX_PAYLOAD
+            )
+        })?;
+        self.tx
+            .send(frame)
+            .map_err(|_| "tunnel closed".to_string())
+    }
+
+    /// Close a UDP flow by source port: later replies for it are
+    /// dropped. Idempotent — called by `UdpFlow::drop` and by the
+    /// SOCKS5 relay's idle sweep alike.
+    pub fn close_udp_flow(&self, src_port: u16) {
+        if let Ok(mut map) = self.udp_flows.try_lock() {
+            map.remove(&src_port);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A UDP frame must carry a valid IPv4 header checksum and a
+    /// valid UDP checksum: recomputing either over the finished
+    /// packet (checksum field included) must yield zero.
+    #[test]
+    fn udp_frame_checksums_validate() {
+        let src = Ipv4Addr::new(10, 0, 0, 2);
+        let dst = Ipv4Addr::new(8, 8, 8, 8);
+        let f = udp_frame(src, dst, 20001, 53, b"DNSQUERY").unwrap();
+        // Layout: 4 SSTP + 2 FF03 + 2 proto + 20 IP + 8 UDP + payload.
+        assert_eq!(f.len(), 36 + 8);
+        assert_eq!(f[0], 0x10, "SSTP version/type");
+        assert_eq!(&f[4..6], &[0xFF, 0x03], "PPP address/control");
+        assert_eq!(&f[6..8], &[0x00, 0x21], "PPP IPv4 protocol");
+        assert_eq!(f[8], 0x45, "IPv4 version/IHL");
+        assert_eq!(f[17], 17, "IP protocol is UDP");
+        assert_eq!(&f[20..24], &src.octets(), "IP source");
+        assert_eq!(&f[24..28], &dst.octets(), "IP destination");
+        assert_eq!(checksum(&f[8..28]), 0, "IP header checksum");
+        assert_eq!(u16be(&f, 28), 20001, "UDP source port");
+        assert_eq!(u16be(&f, 30), 53, "UDP destination port");
+        assert_eq!(u16be(&f, 32), 16, "UDP length");
+        // UDP checksum: pseudo-header + UDP header + payload.
+        let mut ps = Vec::new();
+        ps.extend_from_slice(&src.octets());
+        ps.extend_from_slice(&dst.octets());
+        ps.extend_from_slice(&[0, 17]);
+        ps.extend_from_slice(&16u16.to_be_bytes());
+        ps.extend_from_slice(&f[28..]);
+        assert_eq!(checksum(&ps), 0, "UDP checksum");
+        assert_eq!(&f[36..], b"DNSQUERY", "payload intact");
+    }
+
+    #[test]
+    fn udp_frame_size_cap() {
+        let src = Ipv4Addr::new(10, 0, 0, 2);
+        let dst = Ipv4Addr::new(8, 8, 8, 8);
+        let max = vec![0u8; UDP_MAX_PAYLOAD];
+        assert!(
+            udp_frame(src, dst, 20001, 443, &max).is_some(),
+            "1472-byte payload fits the 1500-byte MRU"
+        );
+        let over = vec![0u8; UDP_MAX_PAYLOAD + 1];
+        assert!(
+            udp_frame(src, dst, 20001, 443, &over).is_none(),
+            "1473-byte payload must be refused, not fragmented"
+        );
     }
 }

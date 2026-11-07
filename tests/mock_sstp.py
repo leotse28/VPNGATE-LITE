@@ -28,6 +28,22 @@ def ppp_frame(proto, code, ident, payload=b""):
     body = struct.pack(">HBBH", proto, code, ident, 4 + len(payload)) + payload
     return body
 
+def udp_reply(vip, srv_ip, cli_port, srv_port, payload=b""):
+    # IP packet from "server" (dst ip = cli_ip) to client (vip), UDP.
+    # The source is the target the client sent to, as a real NAT would.
+    udp_len = 8 + len(payload)
+    ip_len = 20 + udp_len
+    ip = bytearray(20)
+    ip[0] = 0x45; ip[2:4] = struct.pack(">H", ip_len); ip[8] = 64; ip[9] = 17
+    ip[12:16] = socket.inet_aton(str(srv_ip)); ip[16:20] = socket.inet_aton(str(vip))
+    ip[10:12] = struct.pack(">H", csum(bytes(ip)))
+    udp = bytearray(8)
+    udp[0:2] = struct.pack(">H", srv_port); udp[2:4] = struct.pack(">H", cli_port)
+    udp[4:6] = struct.pack(">H", udp_len)
+    pseudo = socket.inet_aton(str(srv_ip)) + socket.inet_aton(str(vip)) + bytes([0, 17]) + struct.pack(">H", udp_len)
+    udp[6:8] = struct.pack(">H", csum(pseudo + bytes(udp) + payload))
+    return sstp_data(b"\x00\x21" + bytes(ip) + bytes(udp) + payload)
+
 def tcp_reply(vip, srv_ip, cli_port, srv_port, srv_seq, cli_seq, flags, payload=b""):
     # IP packet from "server" (dst ip = cli_ip) to client (vip)
     tcp_len = 20 + len(payload)
@@ -106,8 +122,16 @@ def handle(conn):
         elif proto == 0x0021:  # IPv4
             ip = ppp[2:]
             ihl = (ip[0] & 0x0F) * 4
+            iproto = ip[9]
             src = socket.inet_ntoa(ip[12:16]); dst = socket.inet_ntoa(ip[16:20])
             sport, dport = struct.unpack(">HH", ip[ihl:ihl+4])
+            if iproto == 17:  # UDP: stateless echo (proves the tunnel carries UDP)
+                udp_len = struct.unpack(">H", ip[ihl+4:ihl+6])[0]
+                end = min(ihl + udp_len, len(ip))
+                payload = ip[ihl+8:end]
+                print(f"  [mock] UDP {src}:{sport} -> {dst}:{dport} paylen={len(payload)}", flush=True)
+                conn.sendall(udp_reply(vip, dst, sport, dport, payload))
+                continue
             seq, ack = struct.unpack(">II", ip[ihl+4:ihl+12])
             flags = ip[ihl+13]
             doff = (ip[ihl+12] >> 4) * 4

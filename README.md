@@ -197,8 +197,12 @@ cargo run --release --bin vpngate-gui
 
 ## 已知限制（实话）
 
-- **只有 TCP 能走隧道，UDP 不走。** DNS 解析在程序里用 DoH（1.1.1.1）做，QUIC/UDP 应用、UDP 的 DNS 都会失败或绕开。
-  这是协议栈本身的限制，和之前那个 Worker 方案一样。
+- **UDP 只能走 SOCKS5，不能走 HTTP，也绕不过浏览器的直连。** v3.9 起，本地代理的 UDP
+  端口（与 TCP 同端口号，默认 10818）提供 SOCKS5 UDP ASSOCIATE（RFC 1928）：手机经
+  v2rayNG 这类把流量全收进代理的客户端上网时，它的 DNS 查询与 QUIC 都走隧道（隧道里传
+  的是 IP 包，UDP 数据报照样能装）。但 PC 上 Chrome 的 QUIC 是直连、不走代理，所以本机
+  上 X 打不开、YouTube 视频放不了的问题仍要靠关 QUIC（`chrome://flags` 关 Experimental
+  QUIC protocol），UDP 中继不改变这一点。HTTP 代理没有 UDP。
 - **志愿者节点极不稳定。** 节点随时下线、过载；同一个节点上午通、下午就可能不通。
   `probe` 活着只代表能拿到虚拟 IP，不代表从它家能打开 Google——以 `generate_204` 回 204 为准。
 - **SSTP 端口没有官方来源。** VPNGate 的官方 API（`api/iphone`）不含 SSTP 端口。
