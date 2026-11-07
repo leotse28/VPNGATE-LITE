@@ -252,3 +252,17 @@ cargo run --release --bin vpngate-gui
 本批测试（本 VM，`cargo test`，CARGO_EXIT=0）：lib 30 项、GUI 23 项（原 22 + 方向键移动单元测试 1 项）、集成 3 项、CLI 0 项，全过，共 56 项。8 个忽略的测试用 `cargo test --bins -- --ignored <名字>` 逐个跑过，全过（新增 `arrow_keys_move_selection_and_follow_scroll` 一次通过；其余 7 个与 v3.3 相同，无回归）。
 **仍未在真节点上验证（实话）**：与 v3.3 相同，本 VM 出口拦截 vpngate.net / *.opengw.net 的 TLS；新加的方向键导航与跟随滚动须 Leo 在 Windows 机器上确认——打开新版，点一行后按 ↓/↑ 试切换，确认选中行跟随滚动、回车仍能连接。
 
+## 11. 2026-11-07 晚 v3.5 这一批改动（抓取带运营商、API 超时 30 秒）
+
+背景：Leo 在 v3.4 上实测（`vpngate-gui-3.log`）：启动在新文件夹、没有 config.toml，前置代理未启用，加载内嵌列表；前置代理测试通过（Google 2670 ms，vpngate.net 6955 ms）；23:23:00 刷新时“官方 API 拉取超时（15 秒内无响应）；已改用网页抓取（100 个节点）”——整列运营商全空。已确诊：抓取路径的节点 isp 和 name 都是空字符串（`parse_web_page` 建节点时 `isp: String::new()`、`name: String::new()`，只对 28 个内嵌节点用 curated 表补 isp），而 GUI 那一格是 isp 为空时退到 name、都空就空白——所以整列全空，渲染本身没问题。另外两个日志事实：① v3.3 的 15 秒超时按设计工作了（没再挂 85 秒）；② vpn<数字> 节点并非全死——23:23:37 `vpn359610091.opengw.net:995` 连上了（虚拟 IP 10.211.1.62）。
+
+36. **抓取带运营商（新增 `row_cell_bodies` + `row_operator_name`，`parse_web_page` 里每行取一次填 `isp`）。** 先弄清了中继列表页的表格结构：Wayback Machine 的 CDX API 与快照页在浏览器里都返回 403，改用浏览器直接读了 www.vpngate.net/cn/ 的实时页面（2026-11-07 15:29 UTC 抓取的副本）。表是 10 列：国家/地区、DDNS 主机名 IP 地址（ISP 主机名）、VPN 会话数、线路质量、SSL-VPN、L2TP/IPsec、OpenVPN、MS-SSTP、**志愿者操作员的名字（+ 操作员的消息）**、总分。结论：页面**没有**单独的 ISP/电信运营商列——ISP 信息只有 DDNS 格括号里的 ISP 主机名（如 `(public-vpn-14-01.vpngate.v4.open.ad.jp)`），只在部分行出现、且是主机名不是名字，所以不用它；运营商文本的来源是第 9 列“志愿者操作员的名字”，与 API 的 Operator（cols[12]）同一字段（同一节点两边值一致，如 `By Daiyuu Nobori, Japan. Academic Use Only.` 对应 Operator "Daiyuu Nobori"、Message "Japan. Academic Use Only."），填进抓取节点的 `isp` 与 API 路径在 GUI 运营商列里显示的值一致，不是硬编。写法：`row_operator_name` 找 stripped 文本以 "By " 开头的格，取 "By " 之后、第一个 ", "（消息分隔）、" E-mail:" 或 ' "'（问候引用）之前的一段并 trim；找不到、格为空或名字为空都返回空串，绝不 panic、不影响现有的主机名/国家解析与去重/端口逻辑。内嵌 28 节点的 curated 补 isp 逻辑不变（只在 isp 为空时补，所以 curated 的真实 ISP 名仍优先于抓取的运营商名，与 API 路径一致）。新增测试：`row_operator_name_edges`（带消息、带 E-mail+问候、无该格、"By " 为空、"Bye" 不误匹配）与 `parse_web_page_extracts_operator`（按实时页面拼的 10 列 fixture：Daiyuu Nobori / MOODLE-SERVER's owner / Japan VPN 三种写法、空运营商格、3 列无运营商格的行、重复主机去重+端口升级不受影响）。
+
+37. **API 超时 15 秒 → 30 秒（网页抓取保持 15 秒）。** `FETCH_TIER_TIMEOUT` 拆成 `API_FETCH_TIMEOUT`（30 秒）与 `WEB_FETCH_TIMEOUT`（15 秒）；`fetch_nodes_with_fallback_timeout` 改为两个超时参数，各档超时文案用各自的秒数（"官方 API 拉取超时（30 秒内无响应）" / "网页抓取超时（15 秒内无响应）"）。理由：API 是更全的数据源（带 Operator、Message、分数、延迟、速度），经 Leo 的前置代理访问它本来就慢（前置代理测试里 vpngate.net 一站就要约 7 秒；v3.2 无超时预算时 API 是能拉到的），15 秒太紧、动不动就掉到抓取档。最坏情况 API 30 秒 + 网页 15 秒 = 45 秒，仍远好于以前挂 85 秒。黑洞代理测试改传两个 2 秒超时（断言不变：两档各跑满超时、总耗时 3–8 秒、两档都报“超时”）。
+
+38. **版本 0.3.4 → 0.3.5**（`Cargo.toml`；User-Agent 与关于窗口仍读 `CARGO_PKG_VERSION`）。README / WINDOWS.md 同步更新（抓取的运营商来源、API 30 秒 / 网页 15 秒）。
+
+本批测试（本 VM，`cargo test`，CARGO_EXIT=0）：lib 32 项（原 30 + 运营商提取 2 项）、GUI 23 项、集成 3 项、CLI 0 项，全过，共 58 项。8 个忽略的测试用 `cargo test --bins -- --ignored <名字>` 逐个跑过，全过（与 v3.4 相同，无回归）。
+**仍未在真节点上验证（实话）**：与 v3.3/v3.4 相同，本 VM 出口拦截 vpngate.net / *.opengw.net 的 TLS；新加的抓取运营商与 API 30 秒超时须 Leo 在 Windows 机器上确认——打开新版确认启动列表有运营商，点刷新节点（API 现在最多等 30 秒），确认刷新后的列表运营商也不空，再看日志里这次走的是 API 还是抓取。
+
+---

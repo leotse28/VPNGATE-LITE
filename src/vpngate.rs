@@ -221,6 +221,60 @@ fn first_cell_text(row: &str) -> String {
     strip_tags_collapse(&body[..end])
 }
 
+/// Inner bodies of the `<td>...</td>` cells in one `<tr ...>...</tr>` row
+/// fragment, in order. A cell without a closing `</td>` ends the scan
+/// (malformed HTML must not panic the parser). Never panics.
+fn row_cell_bodies(row: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = row;
+    while let Some(td) = rest.find("<td") {
+        let after_td = &rest[td..];
+        let Some(gt) = after_td.find('>') else {
+            break;
+        };
+        let body_start = td + gt + 1;
+        let Some(end) = rest[body_start..].find("</td>") else {
+            break;
+        };
+        out.push(&rest[body_start..body_start + end]);
+        rest = &rest[body_start + end + "</td>".len()..];
+    }
+    out
+}
+
+/// Operator name from a relay-table row: the cell whose stripped text
+/// starts with "By " — the "志愿者操作员的名字 (+ 操作员的消息)" column
+/// (column 9 of the live page; the same field the official API calls
+/// Operator, cols[12]). The name is the text after "By " up to the
+/// first ", " (message separator), " E-mail:" or ' "' (greeting quote),
+/// or the end of the cell — e.g. "By Daiyuu Nobori, Japan. Academic
+/// Use Only." -> "Daiyuu Nobori", "By Japan VPN" + E-mail + greeting
+/// -> "Japan VPN". Empty when the row has no such cell, the cell is
+/// empty, or nothing remains after trimming. A missing operator must
+/// never break host/country parsing; it only leaves the ISP cell blank.
+/// Note the page has no separate ISP/telecom column: the only
+/// ISP-identifying text is the ISP hostname in parens in the DDNS cell
+/// (e.g. `(public-vpn-14-01.vpngate.v4.open.ad.jp)`), present only for
+/// some nodes and a hostname, not a name — so the operator column is
+/// the source, matching what the API path already shows in the GUI's
+/// 运营商 column for the same nodes.
+fn row_operator_name(row: &str) -> String {
+    for body in row_cell_bodies(row) {
+        let text = strip_tags_collapse(body);
+        let Some(rest) = text.strip_prefix("By ") else {
+            continue;
+        };
+        let mut name = rest;
+        for term in [", ", " E-mail:", " \""] {
+            if let Some(i) = name.find(term) {
+                name = &name[..i];
+            }
+        }
+        return name.trim().to_string();
+    }
+    String::new()
+}
+
 /// Is `host` a plausible VPNGate DDNS hostname? It must end in
 /// `.opengw.net` with every label alphanumeric-or-hyphen and non-empty.
 /// This accepts the `vpn<digits>` names, the `public-vpn-<n>` names
@@ -291,9 +345,12 @@ fn extract_hosts(row: &str) -> Vec<(String, Option<u16>)> {
 /// Parse the VPNGate relay list page into nodes, in table order,
 /// deduplicated by hostname. A hostname seen first in the DDNS cell
 /// (no port) and again in the MS-SSTP cell with an explicit port keeps
-/// its first-seen position but takes the explicit port. Nodes whose
-/// hostname is in the curated table get their known SSTP port instead
-/// of the scraped 443 default.
+/// its first-seen position but takes the explicit port. The operator
+/// name is taken from the row's "志愿者操作员的名字" cell ("By ...")
+/// into `isp`, so the GUI's 运营商 column is filled for scraped rows
+/// just like for API rows; nodes whose hostname is in the curated table
+/// get their known SSTP port instead of the scraped 443 default (and
+/// the curated ISP fills in only where the scraped operator is empty).
 pub fn parse_web_page(html: &str) -> Vec<Node> {
     let mut out: Vec<Node> = Vec::new();
     for row in html.split("<tr") {
@@ -301,6 +358,7 @@ pub fn parse_web_page(html: &str) -> Vec<Node> {
             continue;
         }
         let country = first_cell_text(row);
+        let isp = row_operator_name(row);
         for (host, port) in extract_hosts(row) {
             // "opengw.net" on its own is not a relay (it is the domain
             // itself, not a DDNS hostname under it). `valid_ddns_host`
@@ -329,7 +387,7 @@ pub fn parse_web_page(html: &str) -> Vec<Node> {
                     country.clone()
                 },
                 country_code: String::new(),
-                isp: String::new(),
+                isp: isp.clone(),
                 name: String::new(),
                 score: 0,
                 ping_ms: 0,
@@ -451,25 +509,32 @@ pub fn pick_node_list(
 /// Full fallback chain: official API first, then the relay list page,
 /// then the local cache, then the bundled curated list. The last two
 /// never fail, so this always returns a list.
-/// Per-tier ceiling for a node-list fetch. `https_get` has no timeout
+/// Per-tier ceilings for a node-list fetch. `https_get` has no timeout
 /// of its own, so without this a refresh with the front proxy off (or
 /// a black-holed target) hangs for over a minute — Leo's v3.2 log
-/// showed 85 s on startup. 15 s per tier keeps a refresh bounded at
-/// ~30 s worst case while still leaving room for a slow proxy.
-pub const FETCH_TIER_TIMEOUT: Duration = Duration::from_secs(15);
+/// showed 85 s on startup.
+/// The API tier gets 30 s: it is the richer source (Operator, Message,
+/// score, ping, speed) and is slow through Leo's front proxy (the
+/// front-proxy test alone takes ~7 s for vpngate.net); 15 s cut it off
+/// mid-flight (Leo's v3.4 log: API timed out at 15 s, fell back to the
+/// 100-node scrape). The web tier stays 15 s. Worst case 30 + 15 = 45 s,
+/// still far below the old 85 s hang.
+pub const API_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+pub const WEB_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub async fn fetch_nodes_with_fallback(connector: &Connector) -> NodeListUpdate {
-    fetch_nodes_with_fallback_timeout(connector, FETCH_TIER_TIMEOUT).await
+    fetch_nodes_with_fallback_timeout(connector, API_FETCH_TIMEOUT, WEB_FETCH_TIMEOUT).await
 }
 
-/// Testable core: the per-tier timeout is a parameter so tests can use
-/// a short one against a black-holed proxy instead of waiting 15 s.
+/// Testable core: the per-tier timeouts are parameters so tests can use
+/// short ones against a black-holed proxy instead of waiting 30 s.
 async fn fetch_nodes_with_fallback_timeout(
     connector: &Connector,
-    tier_timeout: Duration,
+    api_timeout: Duration,
+    web_timeout: Duration,
 ) -> NodeListUpdate {
     let mut api_error = None;
-    let api = match tokio::time::timeout(tier_timeout, fetch_api_nodes(connector)).await {
+    let api = match tokio::time::timeout(api_timeout, fetch_api_nodes(connector)).await {
         Ok(Ok(nodes)) if !nodes.is_empty() => Some(nodes),
         Ok(Ok(_)) => {
             api_error = Some("官方 API 返回了空列表".to_string());
@@ -482,14 +547,14 @@ async fn fetch_nodes_with_fallback_timeout(
         Err(_) => {
             api_error = Some(format!(
                 "官方 API 拉取超时（{} 秒内无响应）",
-                tier_timeout.as_secs()
+                api_timeout.as_secs()
             ));
             None
         }
     };
     let mut web_error = None;
     let web = if api.is_none() {
-        match tokio::time::timeout(tier_timeout, fetch_web_nodes(connector)).await {
+        match tokio::time::timeout(web_timeout, fetch_web_nodes(connector)).await {
             Ok(Ok(nodes)) if !nodes.is_empty() => Some(nodes),
             Ok(Ok(_)) => {
                 web_error = Some("网页抓取解析到 0 个节点".to_string());
@@ -502,7 +567,7 @@ async fn fetch_nodes_with_fallback_timeout(
             Err(_) => {
                 web_error = Some(format!(
                     "网页抓取超时（{} 秒内无响应）",
-                    tier_timeout.as_secs()
+                    web_timeout.as_secs()
                 ));
                 None
             }
@@ -775,6 +840,107 @@ mod tests {
     }
 
     #[test]
+    fn row_operator_name_edges() {
+        // Direct helper checks (rows are `<tr`-split fragments).
+        let row = |cell: &str| format!("<td>Japan</td><td>x.opengw.net</td><td>{}</td>", cell);
+        assert_eq!(
+            row_operator_name(&row("<b><i>By Daiyuu Nobori, Japan. Academic Use Only.</i></b>")),
+            "Daiyuu Nobori"
+        );
+        assert_eq!(
+            row_operator_name(&row("<b><i>By MOODLE-SERVER's owner</i></b>")),
+            "MOODLE-SERVER's owner"
+        );
+        assert_eq!(
+            row_operator_name(&row(
+                "<b><i>By Japan VPN</i></b> <i>E-mail: jdyes2w0a@mozmail.com</i> \
+                 <i>\"こんにちは! Hello!\"</i>"
+            )),
+            "Japan VPN"
+        );
+        assert_eq!(row_operator_name(&row("")), "");
+        assert_eq!(row_operator_name(&row("By ")), "");
+        // No "By " cell at all, and a "Bye" that must not match.
+        assert_eq!(row_operator_name("<td>Japan</td><td>x.opengw.net</td>"), "");
+        assert_eq!(
+            row_operator_name(&row("Bye someone")),
+            "",
+            "\"Bye\" is not the \"By \" marker"
+        );
+    }
+
+    /// Synthetic HTML shaped like the live relay table (10 columns),
+    /// built from the live page text (2026-11-07): operator cells with
+    /// a message, without one, with an E-mail + greeting suffix, an
+    /// empty operator cell, and a 3-column row with no operator cell.
+    fn sample_relay_html_with_operator() -> &'static str {
+        r#"<html><body><table>
+<tr><th>国家 / 地区</th><th>DDNS 主机名 IP 地址</th><th>VPN 会话数</th><th>线路质量</th><th>SSL-VPN</th><th>L2TP/IPsec</th><th>OpenVPN</th><th>MS-SSTP</th><th>志愿者操作员的名字</th><th>总分</th></tr>
+<tr><td>Japan</td>
+<td><b>public-vpn-192.opengw.net</b> 219.100.37.209 (public-vpn-14-01.vpngate.v4.open.ad.jp)</td>
+<td>285 会话 14 天</td><td>261.83 Mbps Ping: 8 ms 日志策略: 两周</td>
+<td>TCP: 443 UDP: 支持</td><td></td><td>TCP: 443 UDP: 1195</td>
+<td>SSTP 主机名 : <b>public-vpn-192.opengw.net</b></td>
+<td><b><i>By Daiyuu Nobori, Japan. Academic Use Only.</i></b></td>
+<td>2,940,710</td></tr>
+<tr><td>India</td>
+<td><b>vpn359610091.opengw.net</b> 103.172.220.133</td>
+<td>70 会话 27 天</td><td>195.31 Mbps Ping: 11 ms 日志策略: 两周</td>
+<td>TCP: 995 UDP: 支持</td><td></td><td>TCP: 995 UDP: 1195</td>
+<td>SSTP 主机名 : <b>vpn359610091.opengw.net</b></td>
+<td><b><i>By MOODLE-SERVER's owner</i></b></td>
+<td>1,486,191</td></tr>
+<tr><td>India</td>
+<td><b>vpn359610091.opengw.net</b> 103.172.220.133</td>
+<td>70 会话 27 天</td><td>195.31 Mbps Ping: 11 ms 日志策略: 两周</td>
+<td>TCP: 995 UDP: 支持</td><td></td><td>TCP: 995 UDP: 1195</td>
+<td>SSTP 主机名 : <b>vpn359610091.opengw.net:995</b></td>
+<td><b><i>By MOODLE-SERVER's owner</i></b></td>
+<td>1,486,191</td></tr>
+<tr><td>Romania</td>
+<td><b>vpn111222333.opengw.net</b> 217.138.212.62</td>
+<td>127 会话 12 天</td><td>149.25 Mbps Ping: 5 ms 日志策略: 两周</td>
+<td>TCP: 443</td><td></td><td>TCP: 443 UDP: 1194</td>
+<td>SSTP 主机名 : <b>vpn111222333.opengw.net</b></td>
+<td><b><i>By Japan VPN</i></b> <i>E-mail: jdyes2w0a@mozmail.com</i> <i>"こんにちは! Hello!"</i></td>
+<td>1,462,238</td></tr>
+<tr><td>Japan</td>
+<td><b>vpn99990120.opengw.net</b> 180.197.121.148 (180-197-121-148.area54c.commufa.jp)</td>
+<td>68 会话 2 天</td><td>670.44 Mbps Ping: 12 ms 日志策略: 两周</td>
+<td></td><td>L2TP/IPsec 连接指南</td><td></td><td></td><td></td>
+<td>965,869</td></tr>
+<tr><td>Thailand</td><td><b>vpn216782972.opengw.net</b> 27.130.188.53</td><td></td></tr>
+</table></body></html>"#
+    }
+
+    #[test]
+    fn parse_web_page_extracts_operator() {
+        let nodes = parse_web_page(sample_relay_html_with_operator());
+        assert_eq!(nodes.len(), 5, "duplicate host deduped, all rows kept");
+        // Operator name, message stripped — same field the API calls
+        // Operator, so the GUI's 运营商 column matches across sources.
+        assert_eq!(nodes[0].host, "public-vpn-192.opengw.net");
+        assert_eq!(nodes[0].isp, "Daiyuu Nobori");
+        assert_eq!(nodes[0].country, "Japan");
+        assert_eq!(nodes[0].port, Some(443));
+        // Duplicate row: first occurrence wins, explicit port upgrades.
+        assert_eq!(nodes[1].host, "vpn359610091.opengw.net");
+        assert_eq!(nodes[1].isp, "MOODLE-SERVER's owner");
+        assert_eq!(nodes[1].port, Some(995));
+        // E-mail + greeting suffix must not leak into the name.
+        assert_eq!(nodes[2].host, "vpn111222333.opengw.net");
+        assert_eq!(nodes[2].isp, "Japan VPN");
+        // Empty operator cell: node still parses, ISP stays empty.
+        assert_eq!(nodes[3].host, "vpn99990120.opengw.net");
+        assert_eq!(nodes[3].isp, "");
+        assert_eq!(nodes[3].port, Some(443), "no SSTP cell -> 443 default");
+        // 3-column row with no operator cell at all: same as before.
+        assert_eq!(nodes[4].host, "vpn216782972.opengw.net");
+        assert_eq!(nodes[4].isp, "");
+        assert_eq!(nodes[4].country, "Thailand");
+    }
+
+    #[test]
     fn fallback_chain_prefers_api_then_web_then_cache() {
         let one = |h: &str| Node {
             host: h.to_string(),
@@ -852,6 +1018,7 @@ mod tests {
         let start = std::time::Instant::now();
         let upd = fetch_nodes_with_fallback_timeout(
             &connector,
+            Duration::from_secs(2),
             Duration::from_secs(2),
         )
         .await;
