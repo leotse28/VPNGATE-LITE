@@ -17,7 +17,8 @@
 //!
 //! [listen]
 //! addr = "127.0.0.1"
-//! port = 10808
+//! local_port = 10808
+//! lan_port = 10809
 //! allow_lan = false
 //!
 //! [system_proxy]
@@ -31,7 +32,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 pub struct Config {
     #[serde(default)]
     pub front_proxy: FrontProxy,
@@ -43,7 +44,7 @@ pub struct Config {
     pub tunnel: Tunnel,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct FrontProxy {
     #[serde(default)]
     pub enabled: bool,
@@ -70,12 +71,18 @@ fn default_front_addr() -> String {
     "127.0.0.1:1080".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Listen {
     #[serde(default = "default_listen_addr")]
     pub addr: String,
-    #[serde(default = "default_listen_port")]
-    pub port: u16,
+    /// Local SOCKS5 port, always listened on. `port` stays accepted as
+    /// an alias so config files written by older versions keep working.
+    #[serde(default = "default_local_port", alias = "port")]
+    pub local_port: u16,
+    /// Extra LAN SOCKS5 port, only listened on when LAN sharing is on.
+    /// Must differ from `local_port` when LAN sharing is on.
+    #[serde(default = "default_lan_port")]
+    pub lan_port: u16,
     #[serde(default)]
     pub allow_lan: bool,
 }
@@ -84,7 +91,8 @@ impl Default for Listen {
     fn default() -> Self {
         Self {
             addr: default_listen_addr(),
-            port: default_listen_port(),
+            local_port: default_local_port(),
+            lan_port: default_lan_port(),
             allow_lan: false,
         }
     }
@@ -94,11 +102,15 @@ fn default_listen_addr() -> String {
     "127.0.0.1".to_string()
 }
 
-fn default_listen_port() -> u16 {
+fn default_local_port() -> u16 {
     10808
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+fn default_lan_port() -> u16 {
+    10809
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SystemProxy {
     #[serde(default)]
     pub enabled: bool,
@@ -115,7 +127,7 @@ impl Default for SystemProxy {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Tunnel {
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
@@ -196,14 +208,25 @@ impl Config {
         std::fs::write(path, text)
             .map_err(|e| format!("cannot write config {}: {}", path.display(), e))
     }
+}
 
-    /// Effective listen address, honouring --allow-lan.
-    pub fn listen_addr(&self, allow_lan: bool) -> String {
-        if allow_lan || self.listen.allow_lan {
-            format!("0.0.0.0:{}", self.listen.port)
-        } else {
-            format!("{}:{}", self.listen.addr, self.listen.port)
+impl Listen {
+    /// Addresses to listen on: always `addr:local_port`, plus
+    /// `0.0.0.0:lan_port` when LAN sharing is on. Both SOCKS5 servers
+    /// share one tunnel. Errors when LAN sharing is on and both ports
+    /// are the same (two binds cannot share one port).
+    pub fn listen_addrs(&self) -> Result<Vec<String>, String> {
+        let mut addrs = vec![format!("{}:{}", self.addr, self.local_port)];
+        if self.allow_lan {
+            if self.lan_port == self.local_port {
+                return Err(format!(
+                    "本地端口和局域网端口不能设成一样（都是 {}），改一个再连。",
+                    self.local_port
+                ));
+            }
+            addrs.push(format!("0.0.0.0:{}", self.lan_port));
         }
+        Ok(addrs)
     }
 }
 
@@ -223,7 +246,9 @@ mod tests {
         cfg.front_proxy.enabled = true;
         cfg.front_proxy.addr = "127.0.0.1:1080".to_string();
         cfg.front_proxy.username = Some("u".to_string());
-        cfg.listen.port = 10809;
+        cfg.front_proxy.password = Some("p".to_string());
+        cfg.listen.local_port = 10809;
+        cfg.listen.lan_port = 10810;
         cfg.listen.allow_lan = true;
         cfg.system_proxy.enabled = true;
         cfg.tunnel.timeout_secs = 15;
@@ -232,11 +257,37 @@ mod tests {
         let back = Config::load(Some(&path)).expect("load works");
         assert!(back.front_proxy.enabled);
         assert_eq!(back.front_proxy.username.as_deref(), Some("u"));
-        assert_eq!(back.listen.port, 10809);
+        assert_eq!(back.front_proxy.password.as_deref(), Some("p"));
+        assert_eq!(back.listen.local_port, 10809);
+        assert_eq!(back.listen.lan_port, 10810);
         assert!(back.listen.allow_lan);
         assert!(back.system_proxy.enabled);
         assert_eq!(back.tunnel.timeout_secs, 15);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn listen_addrs_local_always_lan_extra() {
+        let mut l = Listen::default();
+        assert_eq!(
+            l.listen_addrs().unwrap(),
+            vec!["127.0.0.1:10808".to_string()]
+        );
+        l.allow_lan = true;
+        assert_eq!(
+            l.listen_addrs().unwrap(),
+            vec!["127.0.0.1:10808".to_string(), "0.0.0.0:10809".to_string()]
+        );
+        l.lan_port = 10808;
+        let err = l.listen_addrs().unwrap_err();
+        assert!(err.contains("不能设成一样"), "equal ports must fail loudly: {}", err);
+    }
+
+    #[test]
+    fn old_port_key_still_parses_as_local_port() {
+        let cfg: Config = toml::from_str("[listen]\nport = 10811\n").unwrap();
+        assert_eq!(cfg.listen.local_port, 10811);
+        assert_eq!(cfg.listen.lan_port, 10809, "lan_port keeps its default");
     }
 
     #[test]

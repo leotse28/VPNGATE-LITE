@@ -31,7 +31,7 @@ struct Cli {
     timeout: Option<u64>,
 
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -119,33 +119,41 @@ async fn connect_first(
 
 async fn cmd_list(cli: &Cli, cfg: &Config, country: Option<String>, limit: usize) -> i32 {
     let connector = effective_connector(cfg, cli);
-    let nodes = match vpngate::fetch_api_nodes(&connector).await {
-        Ok(n) => {
-            println!("# VPNGate live list ({} nodes from api/iphone)", n.len());
-            // Best-effort cache for the next failed refresh.
-            let _ = vpngate::save_cached_nodes(&n);
-            n
+    // Fallback chain: official API -> relay list page scrape -> local
+    // cache -> bundled curated list. The last two never fail.
+    let upd = vpngate::fetch_nodes_with_fallback(&connector).await;
+    let nodes = &upd.nodes;
+    match upd.source {
+        vpngate::NodeListSource::Api => {
+            println!("# VPNGate live list ({} nodes from api/iphone)", nodes.len());
+            let _ = vpngate::save_cached_nodes(nodes);
         }
-        Err(e) => {
-            // The API is often unreachable (TLS reset / blocked network):
-            // show the cached list from the last successful fetch, else
-            // the bundled curated list — never a bare error.
-            let (nodes, cache_age) = vpngate::fallback_nodes();
-            match cache_age {
-                Some(age) => eprintln!(
-                    "# WARNING: live API fetch failed ({}); showing cached list ({} nodes, {}h old).",
-                    e,
-                    nodes.len(),
-                    age / 3600
-                ),
-                None => eprintln!(
-                    "# WARNING: live API fetch failed ({}); showing bundled curated list only.",
-                    e
-                ),
-            }
-            nodes
+        vpngate::NodeListSource::WebScrape => {
+            eprintln!(
+                "# WARNING: live API fetch failed ({}); showing {} nodes scraped from {}.",
+                upd.api_error.as_deref().unwrap_or("unknown error"),
+                nodes.len(),
+                vpngate::WEB_URL
+            );
+            let _ = vpngate::save_cached_nodes(nodes);
         }
-    };
+        vpngate::NodeListSource::Cache => {
+            eprintln!(
+                "# WARNING: live API failed ({}) and web scrape failed ({}); showing cached list ({} nodes, {}h old).",
+                upd.api_error.as_deref().unwrap_or("unknown error"),
+                upd.web_error.as_deref().unwrap_or("unknown error"),
+                nodes.len(),
+                upd.cache_age_secs.unwrap_or(0) / 3600
+            );
+        }
+        vpngate::NodeListSource::Curated => {
+            eprintln!(
+                "# WARNING: live API failed ({}) and web scrape failed ({}); showing bundled curated list only.",
+                upd.api_error.as_deref().unwrap_or("unknown error"),
+                upd.web_error.as_deref().unwrap_or("unknown error")
+            );
+        }
+    }
     let mut shown = 0usize;
     println!("{:<4} {:<32} {:<22} {:>8} {:>6} {:>7} {:>5}  {:<6} {}", "idx", "host", "country", "score", "ping", "speed", "sess", "sstp", "isp");
     for (i, n) in nodes.iter().enumerate() {
@@ -166,7 +174,7 @@ async fn cmd_list(cli: &Cli, cfg: &Config, country: Option<String>, limit: usize
         }
     }
     println!("# shown {} nodes. sstp '?' = port unknown: use `probe <host>` to try candidate ports, or enter host:port manually.", shown);
-    println!("# curated list (28 nodes with known SSTP ports) is used when the API is unreachable.");
+    println!("# node sources, in order: official API, then the relay list page ({}), then the local cache, then the bundled curated list (28 nodes with known SSTP ports).", vpngate::WEB_URL);
     0
 }
 
@@ -277,17 +285,38 @@ async fn cmd_connect(cli: &Cli, cfg: &Config, target: &str, listen: Option<Strin
             return 1;
         }
     };
-    let listen_addr = listen.unwrap_or_else(|| cfg.listen_addr(allow_lan));
-    let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("cannot bind SOCKS5 listener {}: {}", listen_addr, e);
-            return 1;
-        }
+    // Listen addresses: --listen overrides the local address (old
+    // single-listener behavior); otherwise always 127.0.0.1:local_port,
+    // plus 0.0.0.0:lan_port when LAN sharing is on. Both SOCKS5 servers
+    // share the one tunnel; the system proxy points at the local port.
+    let addrs: Vec<String> = match &listen {
+        Some(a) => vec![a.clone()],
+        None => match cfg.listen.listen_addrs() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("listen error: {}", e);
+                return 1;
+            }
+        },
     };
+    let mut serves = tokio::task::JoinSet::new();
+    for addr in &addrs {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => {
+                serves.spawn(socks5::serve_socks5(l, tunnel.clone(), timeout));
+            }
+            Err(e) => {
+                eprintln!(
+                    "cannot bind SOCKS5 listener {}: {} (port may be in use, try another port)",
+                    addr, e
+                );
+                return 1;
+            }
+        }
+    }
     let mut guard = None;
     if cfg.system_proxy.enabled {
-        match sysproxy::SystemProxyGuard::set(&listen_addr, cfg.system_proxy.service.as_deref()) {
+        match sysproxy::SystemProxyGuard::set(&addrs[0], cfg.system_proxy.service.as_deref()) {
             Ok(g) => {
                 println!("system proxy: {}", g.applied.as_deref().unwrap_or(""));
                 guard = Some(g);
@@ -296,9 +325,9 @@ async fn cmd_connect(cli: &Cli, cfg: &Config, target: &str, listen: Option<Strin
         }
     }
     println!("tunnel virtual IP: {}", tunnel.vip);
-    let serve = socks5::serve_socks5(listener, tunnel, timeout);
+    println!("SOCKS5 listening on {}", addrs.join(", "));
     tokio::select! {
-        _ = serve => 0,
+        _ = serves.join_next() => 0,
         _ = tokio::signal::ctrl_c() => {
             println!("\nCtrl-C, shutting down...");
             if let Some(g) = &guard {
@@ -309,11 +338,35 @@ async fn cmd_connect(cli: &Cli, cfg: &Config, target: &str, listen: Option<Strin
     }
 }
 
+/// Launched with no subcommand (e.g. double-clicked in Explorer):
+/// explain that this is the command-line build with no window, point
+/// at the GUI exe in the same folder, show the basic usage, and wait
+/// for Enter so the console window does not flash and vanish.
+fn print_no_args_notice() {
+    println!("vpngate-client 是命令行版本，没有窗口。");
+    println!("想用图形界面，请双击同一文件夹里的 vpngate-gui.exe。");
+    println!();
+    println!("基本用法（在命令行里运行）：");
+    println!("  vpngate-client list                    列出节点");
+    println!("  vpngate-client probe <节点>            探测节点是否能连");
+    println!("  vpngate-client connect <节点>          连接并开本地 SOCKS5 代理（默认 127.0.0.1:10808）");
+    println!("  vpngate-client test <节点>             连接并测试隧道");
+    println!("节点可以写 主机名:端口，例如 kanratown.opengw.net:992。");
+    println!();
+    println!("按回车键退出…");
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let Some(cmd) = &cli.cmd else {
+        print_no_args_notice();
+        return;
+    };
     let cfg = load_config(&cli);
-    let code = match &cli.cmd {
+    let code = match cmd {
         Cmd::List { country, limit } => cmd_list(&cli, &cfg, country.clone(), *limit).await,
         Cmd::Probe { target } => cmd_probe(&cli, &cfg, target).await,
         Cmd::Connect {

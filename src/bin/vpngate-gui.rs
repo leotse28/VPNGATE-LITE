@@ -44,20 +44,24 @@ impl Busy {
     }
 }
 
-/// A live connection: tunnel + the SOCKS5 server task + the optional
+/// A live connection: tunnel + the SOCKS5 server task(s) + the optional
 /// system-proxy guard. Dropping the tunnel Arc closes the TLS stream
 /// (the lib's writer task sends close_notify when its channel closes).
+/// With LAN sharing on there are two serve tasks (local + LAN) sharing
+/// the one tunnel; both are aborted together on disconnect.
 struct ActiveConnection {
     tunnel: Arc<SstpTunnel>,
-    serve: tokio::task::JoinHandle<()>,
+    serve: Vec<tokio::task::JoinHandle<()>>,
     proxy_guard: Option<SystemProxyGuard>,
+    /// Display label, e.g. "127.0.0.1:10808" or
+    /// "127.0.0.1:10808 ＋ 0.0.0.0:10809".
     listen_addr: String,
     node_label: String,
     vip: Ipv4Addr,
 }
 
 enum GuiEvent {
-    Nodes(Result<Vec<Node>, String>),
+    Nodes(vpngate::NodeListUpdate),
     Probe {
         host: String,
         result: Result<(Ipv4Addr, Duration), String>,
@@ -85,8 +89,8 @@ fn connector_for(front_enabled: bool, front_addr: &str, user: &str, pass: &str) 
     }
 }
 
-async fn fetch_flow(connector: &Connector) -> Result<Vec<Node>, String> {
-    vpngate::fetch_api_nodes(connector).await
+async fn fetch_flow(connector: &Connector) -> vpngate::NodeListUpdate {
+    vpngate::fetch_nodes_with_fallback(connector).await
 }
 
 async fn probe_flow(connector: &Connector, target: &str, timeout: Duration) -> Result<(Ipv4Addr, Duration), String> {
@@ -101,12 +105,15 @@ async fn probe_flow(connector: &Connector, target: &str, timeout: Duration) -> R
     Err(format!("{} 个候选均失败；最后一次：{}", candidates.len(), last_err))
 }
 
-/// Connect the tunnel, start the local SOCKS5 server, optionally set the
-/// system proxy. Runs on a background task; returns the live connection.
+/// Connect the tunnel, start the local SOCKS5 server(s), optionally set
+/// the system proxy. Runs on a background task; returns the live
+/// connection. `listen_addrs` is always the local address first, plus
+/// the LAN address when LAN sharing is on; both servers share the one
+/// tunnel, and the system proxy (if on) points at the local address.
 async fn connect_flow(
     connector: Connector,
     target: String,
-    listen_addr: String,
+    listen_addrs: Vec<String>,
     timeout: Duration,
     system_proxy: bool,
     service: Option<String>,
@@ -125,16 +132,31 @@ async fn connect_flow(
     }
     let tunnel = tunnel.ok_or_else(|| format!("{} 个候选均失败；最后一次：{}", candidates.len(), last_err))?;
     let vip = tunnel.vip;
-    let listener = tokio::net::TcpListener::bind(&listen_addr)
-        .await
-        .map_err(|e| format!("本地 SOCKS5 无法监听 {}：{}", listen_addr, e))?;
-    let serve = tokio::spawn(vpngate_client::socks5::serve_socks5(listener, tunnel.clone(), timeout));
+    let mut listeners = Vec::new();
+    for addr in &listen_addrs {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("本地 SOCKS5 无法监听 {}：{}（端口可能被占用，换一个端口再试）", addr, e))?;
+        listeners.push(listener);
+    }
+    let mut serve = Vec::new();
+    for listener in listeners {
+        serve.push(tokio::spawn(vpngate_client::socks5::serve_socks5(
+            listener,
+            tunnel.clone(),
+            timeout,
+        )));
+    }
+    let listen_addr = listen_addrs.join(" ＋ ");
     let mut guard = None;
     if system_proxy {
-        match SystemProxyGuard::set(&listen_addr, service.as_deref()) {
+        // System proxy always points at the local port (first address).
+        match SystemProxyGuard::set(&listen_addrs[0], service.as_deref()) {
             Ok(g) => guard = Some(g),
             Err(e) => {
-                serve.abort();
+                for s in &serve {
+                    s.abort();
+                }
                 return Err(format!("系统代理设置失败：{}（隧道已断开）", e));
             }
         }
@@ -330,12 +352,15 @@ struct GuiApp {
     front_user: String,
     front_pass: String,
     local_port: u16,
+    lan_port: u16,
     allow_lan: bool,
     system_proxy: bool,
     manual_host: String,
     manual_error: String,
     show_about: bool,
     font_ok: bool,
+    /// Last auto-save failure message (to show a repeated failure once).
+    last_save_error: String,
     event_tx: mpsc::Sender<GuiEvent>,
     event_rx: Option<mpsc::Receiver<GuiEvent>>,
 }
@@ -360,12 +385,14 @@ impl Default for GuiApp {
             front_user: String::new(),
             front_pass: String::new(),
             local_port: 10808,
+            lan_port: 10809,
             allow_lan: false,
             system_proxy: false,
             manual_host: String::new(),
             manual_error: String::new(),
             show_about: false,
             font_ok: false,
+            last_save_error: String::new(),
             event_tx: tx,
             event_rx: Some(rx),
         }
@@ -454,7 +481,8 @@ impl GuiApp {
         self.front_addr = cfg.front_proxy.addr.clone();
         self.front_user = cfg.front_proxy.username.clone().unwrap_or_default();
         self.front_pass = cfg.front_proxy.password.clone().unwrap_or_default();
-        self.local_port = cfg.listen.port;
+        self.local_port = cfg.listen.local_port;
+        self.lan_port = cfg.listen.lan_port;
         self.allow_lan = cfg.listen.allow_lan;
         self.system_proxy = cfg.system_proxy.enabled;
     }
@@ -474,7 +502,8 @@ impl GuiApp {
         } else {
             Some(self.front_pass.clone())
         };
-        cfg.listen.port = self.local_port;
+        cfg.listen.local_port = self.local_port;
+        cfg.listen.lan_port = self.lan_port;
         cfg.listen.allow_lan = self.allow_lan;
         cfg.system_proxy.enabled = self.system_proxy;
         cfg
@@ -482,6 +511,8 @@ impl GuiApp {
 
     /// Save the current settings to `config.toml` next to the exe
     /// (portable mode). Reports the result in the log and status line.
+    /// With auto-save on, this is normally already done — the button is
+    /// an explicit "save again now" that confirms it.
     fn save_settings(&mut self) {
         let Some(path) = Config::portable_config_path() else {
             self.error = "保存失败：找不到程序所在目录。".to_string();
@@ -489,6 +520,7 @@ impl GuiApp {
         };
         match self.current_config().save(&path) {
             Ok(()) => {
+                self.config = self.current_config();
                 self.config_path = Some(path.clone());
                 self.error.clear();
                 self.status = "设置已保存到程序目录下的 config.toml。".to_string();
@@ -498,6 +530,44 @@ impl GuiApp {
                 self.error = format!("保存设置失败：{}。程序目录可能不可写。", e);
                 self.log_line(format!("保存设置失败：{}。", e));
             }
+        }
+    }
+
+    /// Quiet save used by auto-save: writes the file without touching
+    /// the status line or log (a save per keystroke would spam both).
+    /// A failure is shown once per distinct error message.
+    fn save_settings_quiet(&mut self) {
+        let Some(path) = Config::portable_config_path() else {
+            return;
+        };
+        match self.current_config().save(&path) {
+            Ok(()) => {
+                self.config_path = Some(path);
+                if !self.last_save_error.is_empty() {
+                    self.last_save_error.clear();
+                    self.error.clear();
+                }
+            }
+            Err(e) => {
+                let msg = format!("自动保存设置失败：{}。程序目录可能不可写。", e);
+                if msg != self.last_save_error {
+                    self.last_save_error = msg.clone();
+                    self.error = msg;
+                    self.log_line(format!("自动保存设置失败：{}。", e));
+                }
+            }
+        }
+    }
+
+    /// If any setting differs from the last saved/loaded config, persist
+    /// it now — so closing the app without clicking 保存设置 loses
+    /// nothing (front proxy, LAN sharing, system proxy, local port).
+    /// Called at the end of every frame and on exit.
+    fn auto_save_if_dirty(&mut self) {
+        let cfg = self.current_config();
+        if cfg != self.config {
+            self.config = cfg;
+            self.save_settings_quiet();
         }
     }
 
@@ -557,6 +627,14 @@ impl GuiApp {
         });
     }
 
+    /// Listen addresses for the next connection, from the live UI
+    /// fields: always the local port, plus the LAN port when LAN
+    /// sharing is on. Fails (with a plain message) when LAN sharing
+    /// is on and both ports are the same.
+    fn listen_addrs(&self) -> Result<Vec<String>, String> {
+        self.current_config().listen.listen_addrs()
+    }
+
     fn start_connect(&mut self, ctx: egui::Context) {
         let Some(i) = self.selected else { return };
         let Some(node) = self.nodes.get(i) else { return };
@@ -567,10 +645,14 @@ impl GuiApp {
             Some(p) => format!("{}:{}", node.host, p),
             None => node.host.clone(),
         };
-        let listen_addr = if self.allow_lan {
-            format!("0.0.0.0:{}", self.local_port)
-        } else {
-            format!("127.0.0.1:{}", self.local_port)
+        let listen_addrs = match self.listen_addrs() {
+            Ok(a) => a,
+            Err(e) => {
+                self.status = "连接失败。".to_string();
+                self.error = format!("连接失败：{}。", e);
+                self.log_line(format!("连接失败：{}。", e));
+                return;
+            }
         };
         self.busy = Some(Busy::Connecting);
         self.status = format!("正在连接 {}…", target);
@@ -581,7 +663,7 @@ impl GuiApp {
         let system_proxy = self.system_proxy;
         let service = self.config.system_proxy.service.clone();
         tokio::spawn(async move {
-            match connect_flow(connector, target.clone(), listen_addr, timeout, system_proxy, service).await {
+            match connect_flow(connector, target.clone(), listen_addrs, timeout, system_proxy, service).await {
                 Ok(c) => {
                     let _ = tx.send(GuiEvent::Connected(Box::new(c)));
                 }
@@ -612,7 +694,9 @@ impl GuiApp {
 
     fn disconnect(&mut self) {
         if let Some(c) = self.conn.take() {
-            c.serve.abort();
+            for s in c.serve {
+                s.abort();
+            }
             if let Some(g) = c.proxy_guard {
                 g.unset();
             }
@@ -627,57 +711,55 @@ impl GuiApp {
     /// so headless tests can drive it.
     fn apply_event(&mut self, ev: GuiEvent) {
         match ev {
-            GuiEvent::Nodes(res) => {
+            GuiEvent::Nodes(upd) => {
                 self.busy = None;
-                match res {
-                    Ok(nodes) => {
-                        let n = nodes.len();
-                        // Best-effort cache so the next failed refresh
-                        // still has a recent list to show.
-                        let _ = vpngate::save_cached_nodes(&nodes);
-                        self.nodes = nodes;
-                        self.nodes_source = format!("官方 API（{} 个节点）", n);
-                        self.selected = None;
+                let n = upd.nodes.len();
+                // A fresh list from the API or the web scrape is worth
+                // caching, so the next failed refresh still has a recent
+                // list to show.
+                if matches!(
+                    upd.source,
+                    vpngate::NodeListSource::Api | vpngate::NodeListSource::WebScrape
+                ) {
+                    let _ = vpngate::save_cached_nodes(&upd.nodes);
+                }
+                self.nodes = upd.nodes;
+                self.nodes_source = upd.source.label(n, upd.cache_age_secs);
+                self.selected = None;
+                match upd.source {
+                    vpngate::NodeListSource::Api => {
                         self.status = format!("节点列表已更新：{} 个节点。", n);
                         self.log_line(format!("节点列表已更新：{} 个节点。", n));
                     }
-                    Err(e) => {
-                        // The official API is often unreachable (TLS
-                        // reset / blocked network). Don't show a bare
-                        // error: fall back to the cached list from the
-                        // last successful fetch, else the bundled list.
-                        let (nodes, cache_age) = vpngate::fallback_nodes();
-                        let n = nodes.len();
-                        self.nodes = nodes;
-                        self.selected = None;
-                        match cache_age {
-                            Some(age) => {
-                                let age_text = if age < 3600 {
-                                    format!("约 {} 分钟前保存", age / 60 + 1)
-                                } else {
-                                    format!("约 {} 小时前保存", age / 3600)
-                                };
-                                self.nodes_source =
-                                    format!("缓存列表（{} 个，{}）", n, age_text);
-                                self.status = format!(
-                                    "官方 API 暂时不可用，已显示缓存列表（{} 个）。",
-                                    n
-                                );
-                                self.log_line(format!(
-                                    "官方 API 拉取失败：{}；已改用缓存列表（{} 个，{}）。",
-                                    e, n, age_text
-                                ));
-                            }
-                            None => {
-                                self.nodes_source = "内嵌列表（官方 API 不可用）".to_string();
-                                self.status =
-                                    "官方 API 不可用，显示内嵌列表（28 个）。".to_string();
-                                self.log_line(format!(
-                                    "官方 API 拉取失败：{}；已改用内嵌列表。",
-                                    e
-                                ));
-                            }
-                        }
+                    vpngate::NodeListSource::WebScrape => {
+                        self.status =
+                            format!("官方 API 不可用，已从网页抓取 {} 个节点。", n);
+                        self.log_line(format!(
+                            "官方 API 拉取失败：{}；已改用网页抓取（{} 个节点）。",
+                            upd.api_error.as_deref().unwrap_or("未知原因"),
+                            n
+                        ));
+                    }
+                    vpngate::NodeListSource::Cache => {
+                        self.status = format!(
+                            "官方 API 与网页都不可用，已显示缓存列表（{} 个）。",
+                            n
+                        );
+                        self.log_line(format!(
+                            "官方 API 拉取失败：{}；网页抓取失败：{}；已改用缓存列表（{} 个）。",
+                            upd.api_error.as_deref().unwrap_or("未知原因"),
+                            upd.web_error.as_deref().unwrap_or("未知原因"),
+                            n
+                        ));
+                    }
+                    vpngate::NodeListSource::Curated => {
+                        self.status =
+                            "官方 API 与网页都不可用，显示内嵌列表（28 个）。".to_string();
+                        self.log_line(format!(
+                            "官方 API 拉取失败：{}；网页抓取失败：{}；已改用内嵌列表。",
+                            upd.api_error.as_deref().unwrap_or("未知原因"),
+                            upd.web_error.as_deref().unwrap_or("未知原因")
+                        ));
                     }
                 }
             }
@@ -770,6 +852,8 @@ impl eframe::App for GuiApp {
         // Quitting while connected disconnects first (no confirm needed).
         if ui.ctx().input(|i| i.viewport().close_requested()) {
             self.disconnect();
+            // Persist any unsaved setting change before the window goes.
+            self.auto_save_if_dirty();
         }
 
         egui::Panel::top("menu_bar").show(ui, |ui| {
@@ -802,6 +886,12 @@ impl eframe::App for GuiApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            // egui's default scroll style is "floating": the bar is fully
+            // transparent (dormant opacity 0) until the mouse hovers the
+            // list, so "always visible" alone still shows nothing at rest.
+            // Solid bars are always drawn (6 px, full opacity) in both
+            // themes, which is what the node list needs.
+            ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
             if !self.font_ok {
                 ui.label(
                     egui::RichText::new("未找到系统里的中文字体，中文可能显示为方框。")
@@ -880,8 +970,15 @@ impl eframe::App for GuiApp {
                 ui.label("还没有节点。点右上角“刷新节点”，或在下面“高级设置”里手动添加。");
             } else {
                 egui::ScrollArea::both()
+                    .id_salt("node_list")
                     .max_height(list_h)
                     .auto_shrink([false, false])
+                    // Always show the scroll bars: with 28+ nodes the
+                    // list overflows at 560x420, and a bar that only
+                    // appears while scrolling is easy to miss entirely.
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                    )
                     .show(ui, |ui| {
                         egui::Grid::new("node_grid")
                             .num_columns(4)
@@ -971,6 +1068,44 @@ impl eframe::App for GuiApp {
                     None => ui.label("未选择节点"),
                 };
             });
+            // 常用开关和端口放主面板上，不用展开高级设置也能看到；改动会自动保存。
+            // 端口只在连接时生效：连接中两个端口输入都锁住；局域网端口只在
+            // 勾选局域网分享时可改。
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.allow_lan, "允许局域网分享（绑定 0.0.0.0）")
+                    .on_hover_text("开启后，局域网里的其他设备也能连这个本地代理端口");
+                ui.checkbox(&mut self.system_proxy, "设置系统代理（断开/退出时还原）")
+                    .on_hover_text("开启后，系统代理会指到本地端口；关闭或退出时自动还原。");
+            });
+            ui.horizontal(|ui| {
+                let connected = self.conn.is_some();
+                ui.label("本地端口：");
+                ui.add_enabled(
+                    !connected,
+                    egui::DragValue::new(&mut self.local_port).range(1..=65535),
+                )
+                .on_disabled_hover_text("连接中，断开后才能改端口");
+                ui.label("局域网端口：");
+                ui.add_enabled(
+                    !connected && self.allow_lan,
+                    egui::DragValue::new(&mut self.lan_port).range(1..=65535),
+                )
+                .on_disabled_hover_text(if connected {
+                    "连接中，断开后才能改端口"
+                } else {
+                    "先勾选“允许局域网分享”"
+                });
+                if connected {
+                    ui.label("连接中，断开后才能改。");
+                } else if self.allow_lan && self.local_port == self.lan_port {
+                    ui.label(
+                        egui::RichText::new("两个端口不能相同。")
+                            .color(ui.visuals().error_fg_color),
+                    );
+                } else if !self.allow_lan {
+                    ui.label("（需先勾选局域网分享）");
+                }
+            });
             ui.separator();
 
             // Advanced settings.
@@ -1006,6 +1141,7 @@ impl eframe::App for GuiApp {
                                         ip: String::new(),
                                         backups: Vec::new(),
                                         port_source: "manual".to_string(),
+                                        source: "manual".to_string(),
                                     };
                                     self.nodes.insert(0, node);
                                     self.selected = Some(0);
@@ -1040,13 +1176,6 @@ impl eframe::App for GuiApp {
                             });
                     });
                     ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("本地代理端口：");
-                        ui.add(egui::DragValue::new(&mut self.local_port).range(1..=65535));
-                        ui.checkbox(&mut self.allow_lan, "允许局域网连接（绑定 0.0.0.0）");
-                    });
-                    ui.checkbox(&mut self.system_proxy, "设置系统代理（默认关闭；断开或退出时还原）")
-                        .on_hover_text("开启后，系统代理会指到本地端口；关闭或退出时自动还原。");
                     ui.separator();
                     // Portable save: settings go to config.toml next to
                     // the exe, so the folder stays self-contained.
@@ -1055,7 +1184,7 @@ impl eframe::App for GuiApp {
                             .add(
                                 egui::Button::new("保存设置").min_size(egui::vec2(96.0, 32.0)),
                             )
-                            .on_hover_text("把上面的设置保存到程序目录下的 config.toml，下次打开还在")
+                            .on_hover_text("设置改动会自动保存到程序目录下的 config.toml；点一下是手动再存一次")
                             .clicked()
                         {
                             self.save_settings();
@@ -1076,6 +1205,7 @@ impl eframe::App for GuiApp {
             ui.label("日志");
             let log_text = self.log.join("\n");
             egui::ScrollArea::vertical()
+                .id_salt("log")
                 .max_height(90.0)
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
@@ -1087,6 +1217,11 @@ impl eframe::App for GuiApp {
                     );
                 });
         });
+
+        // Settings auto-save: any change made this frame (front proxy,
+        // LAN sharing, system proxy, local port) is persisted now, so
+        // closing without clicking 保存设置 loses nothing.
+        self.auto_save_if_dirty();
 
         if self.show_about {
             egui::Window::new("关于 VPNGate 客户端")
@@ -1145,6 +1280,7 @@ mod tests {
             ip: "1.2.3.4".to_string(),
             backups: vec![],
             port_source: "curated".to_string(),
+            source: "curated".to_string(),
         }
     }
 
@@ -1172,7 +1308,13 @@ mod tests {
     #[test]
     fn nodes_event_updates_state() {
         let mut app = GuiApp::for_tests();
-        app.apply_event(GuiEvent::Nodes(Ok(vec![node("a.opengw.net"), node("b.opengw.net")])));
+        app.apply_event(GuiEvent::Nodes(vpngate::NodeListUpdate {
+            nodes: vec![node("a.opengw.net"), node("b.opengw.net")],
+            source: vpngate::NodeListSource::Api,
+            cache_age_secs: None,
+            api_error: None,
+            web_error: None,
+        }));
         assert_eq!(app.nodes.len(), 2);
         assert!(app.busy.is_none());
         assert_eq!(app.selected, None);
@@ -1180,12 +1322,34 @@ mod tests {
     }
 
     #[test]
+    fn nodes_event_web_scrape_source_shows_that() {
+        let mut app = GuiApp::for_tests();
+        app.apply_event(GuiEvent::Nodes(vpngate::NodeListUpdate {
+            nodes: vec![node("a.opengw.net")],
+            source: vpngate::NodeListSource::WebScrape,
+            cache_age_secs: None,
+            api_error: Some("TLS reset".to_string()),
+            web_error: None,
+        }));
+        assert_eq!(app.nodes.len(), 1);
+        assert!(app.nodes_source.contains("网页抓取"));
+        assert!(app.log.iter().any(|l| l.contains("TLS reset")));
+    }
+
+    #[test]
     fn nodes_event_falls_back_to_curated_list() {
         let mut app = GuiApp::for_tests();
-        app.apply_event(GuiEvent::Nodes(Err("network down".to_string())));
+        app.apply_event(GuiEvent::Nodes(vpngate::NodeListUpdate {
+            nodes: vpngate::curated_nodes(),
+            source: vpngate::NodeListSource::Curated,
+            cache_age_secs: None,
+            api_error: Some("network down".to_string()),
+            web_error: Some("page changed".to_string()),
+        }));
         assert_eq!(app.nodes.len(), vpngate::curated_nodes().len());
         assert!(app.nodes_source.contains("内嵌列表"));
         assert!(app.log.iter().any(|l| l.contains("network down")));
+        assert!(app.log.iter().any(|l| l.contains("page changed")));
     }
 
     #[test]
@@ -1230,16 +1394,60 @@ mod tests {
         app.front_enabled = true;
         app.front_addr = "127.0.0.1:1081".to_string();
         app.front_user = "u".to_string();
+        app.front_pass = "p".to_string();
         app.local_port = 10809;
+        app.lan_port = 10810;
         app.allow_lan = true;
         app.system_proxy = true;
         let cfg = app.current_config();
         assert!(cfg.front_proxy.enabled);
         assert_eq!(cfg.front_proxy.addr, "127.0.0.1:1081");
         assert_eq!(cfg.front_proxy.username.as_deref(), Some("u"));
-        assert_eq!(cfg.listen.port, 10809);
+        assert_eq!(cfg.front_proxy.password.as_deref(), Some("p"));
+        assert_eq!(cfg.listen.local_port, 10809);
+        assert_eq!(cfg.listen.lan_port, 10810);
         assert!(cfg.listen.allow_lan);
         assert!(cfg.system_proxy.enabled);
+    }
+
+    #[test]
+    fn listen_addrs_local_plus_lan_and_equal_port_error() {
+        let mut app = GuiApp::for_tests();
+        assert_eq!(
+            app.listen_addrs().unwrap(),
+            vec!["127.0.0.1:10808".to_string()]
+        );
+        app.allow_lan = true;
+        assert_eq!(
+            app.listen_addrs().unwrap(),
+            vec!["127.0.0.1:10808".to_string(), "0.0.0.0:10809".to_string()]
+        );
+        app.lan_port = 10808;
+        let err = app.listen_addrs().unwrap_err();
+        assert!(err.contains("不能设成一样"), "equal ports must fail loudly: {}", err);
+    }
+
+    #[test]
+    fn auto_save_if_dirty_persists_front_proxy() {
+        // Auto-save writes next to the test exe (portable dir); verify
+        // the file round-trips the front-proxy fields, then clean up.
+        let mut app = GuiApp::for_tests();
+        app.front_enabled = true;
+        app.front_addr = "127.0.0.1:1081".to_string();
+        app.front_user = "u".to_string();
+        app.front_pass = "p".to_string();
+        app.auto_save_if_dirty();
+        let path = Config::portable_config_path().expect("exe dir known");
+        let back = Config::load(Some(&path)).expect("saved config loads");
+        assert!(back.front_proxy.enabled);
+        assert_eq!(back.front_proxy.addr, "127.0.0.1:1081");
+        assert_eq!(back.front_proxy.username.as_deref(), Some("u"));
+        assert_eq!(back.front_proxy.password.as_deref(), Some("p"));
+        assert_eq!(app.config, back, "saved config becomes the new baseline");
+        let _ = std::fs::remove_file(&path);
+        // Second call with no changes must not rewrite the file.
+        app.auto_save_if_dirty();
+        assert!(!path.exists());
     }
 
     #[test]
@@ -1269,9 +1477,11 @@ mod tests {
             if zoom != 1.0 {
                 harness.ctx.set_zoom_factor(zoom);
             }
-            // ScrollAreas request repaints while settling; step a fixed
-            // number of frames instead of run() (see egui-kittest skill).
-            harness.run_steps(8);
+            // ScrollAreas request repaints while settling, and the
+            // always-visible scroll bars fade in over a few frames;
+            // step a fixed number of frames instead of run() (see
+            // egui-kittest skill).
+            harness.run_steps(30);
             let path = std::env::temp_dir().join(format!("ui-review-{name}.png"));
             harness.render().expect("needs a graphics adapter").save(&path).unwrap();
             eprintln!("{}", path.display());

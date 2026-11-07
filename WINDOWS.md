@@ -5,17 +5,23 @@ Linux 版只用来在本机验证编译和逻辑，不作为交付物。
 
 ## 方式一：直接用编好的程序（推荐）
 
+源码在 GitHub 仓库的 main 分支；编好的 Windows 程序在仓库的 **Releases**
+里下载，里面有这两个文件（放在同一个文件夹里就能用）：
+
 ```
-target\x86_64-pc-windows-gnu\release\vpngate-gui.exe      （约 37 MB，图形界面）
-target\x86_64-pc-windows-gnu\release\vpngate-client.exe   （约 10 MB，命令行版）
+vpngate-gui.exe      （约 38 MB，图形界面）
+vpngate-client.exe   （约 10 MB，命令行版）
 ```
 
 双击 `vpngate-gui.exe` 就能打开，不用装 Rust。注意两点：
 
 - 第一次打开时 Windows Defender SmartScreen 可能会拦（程序没有代码签名），
   点“更多信息”→“仍要运行”即可。
-- 默认只绑 `127.0.0.1:10808`，不会弹防火墙；只有勾了“允许局域网连接”
-  （绑 `0.0.0.0`）时才可能弹防火墙提示。
+- 默认只绑 `127.0.0.1:10808`，不会弹防火墙；只有勾了“允许局域网分享”
+  （额外绑 `0.0.0.0:10809`）时才可能弹防火墙提示。
+- 别双击 `vpngate-client.exe` 指望出窗口：它是命令行版，没有界面，
+  双击只会弹一个黑窗口告诉你去用 `vpngate-gui.exe`，再按回车退出。
+  命令行版要在 PowerShell / 命令提示符里运行，见下面的用法。
 
 ## 方式二：在自己的 Windows 10 机器上自己编
 
@@ -48,7 +54,8 @@ target\x86_64-pc-windows-gnu\release\vpngate-client.exe   （约 10 MB，命令�
 1. 双击能打开窗口，中文正常显示（程序会优先用 `C:\Windows\Fonts\msyh.ttc`
    微软雅黑，依次后备 `msyhbd.ttc`、`simsun.ttc`、`simhei.ttf`；这几个都是
    Windows 自带的字体，不用另外装）。
-2. 节点列表能拉到（启动后自动从官方 API 拉，拉不到就显示内嵌的 28 个节点）。
+2. 节点列表能拉到（启动后自动拉：官方 API → 网页抓取 → 缓存 → 内嵌的 28 个节点，
+   列表上方会写当前是哪一种来源；直连打不开 vpngate.net 时，先开前置 SOCKS5 代理再刷新）。
 3. 选一条节点，先点“探测”——先试日本 NTT `kanratown.opengw.net:992`，
    再点“连接”，最后点“测试隧道”，generate_204 回 204 才算通。
 4. 浏览器把代理设为 SOCKS5 `127.0.0.1:10808`（勾选远程 DNS），打开 Google
@@ -69,11 +76,13 @@ target\x86_64-pc-windows-gnu\release\vpngate-client.exe   （约 10 MB，命令�
 - `config.toml`：配置。启动时按这个顺序找：命令行 `--config` 指定的 → `.exe` 旁边的
   `config.toml` → 工作目录下的 `config.toml`；都没有就用默认值。复制
   `config.example.toml` 改名就能用。
-- 高级设置里有 **“保存设置”** 按钮：点一下，当前窗口里的设置（前置代理、本地端口、
-  允许局域网、系统代理开关）就写到 `.exe` 旁边的 `config.toml`，下次打开还在。
-  不点保存，改的设置只在本次运行有效。高级设置下面会显示当前配置文件的路径。
-- `nodes_cache.json`：上次成功从官方 API 拉到的节点列表。官方 API 拉不到时
-  （经常是网络被挡），先显示这份缓存（列表上会写“缓存列表，约 X 小时前保存”），
-  没有缓存才显示内嵌的 28 个节点。
+- 图形界面里改设置（前置代理、本地端口、局域网端口、允许局域网分享、系统代理开关）**改完就自动保存**
+  到 `.exe` 旁边的 `config.toml`，下次打开还在，不用点保存；高级设置里还有个“保存设置”
+  按钮，点一下是手动再存一次。下面会显示当前配置文件的路径。
+- `nodes_cache.json`：上次成功拉到的节点列表（官方 API 或网页抓取）。官方 API 拉不到时
+  （经常是网络被挡），先试网页抓取（`vpngate.net/cn` 节点表），再显示这份缓存
+  （列表上会写“缓存列表，约 X 小时前保存”），没有缓存才显示内嵌的 28 个节点。
+  注意：API 和网页抓取都走同一个连接——直连打不开 vpngate.net 时，要先开前置 SOCKS5
+  代理（例如连上 Cloady 节点的 NekoBox）再点刷新。
 
 整个文件夹拷到别的电脑、别的目录都能直接用，配置和缓存跟着文件夹走。

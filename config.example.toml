@@ -12,8 +12,12 @@ addr = "127.0.0.1:1080"
 # 本地 SOCKS5 监听（隧道起来后，浏览器/应用连这里）。
 [listen]
 addr = "127.0.0.1"
-port = 10808
-# allow_lan = true 时绑 0.0.0.0:10808，局域网设备也能用（相当于 V2Ray 的允许局域网连接）。
+local_port = 10808
+# lan_port 是局域网分享的端口：allow_lan = true 时额外绑 0.0.0.0:lan_port，
+# 和本地端口可以设成不一样的（默认 10809）；两个端口不能设成一样。
+lan_port = 10809
+# allow_lan = true 时，本地 127.0.0.1:local_port 照常监听，局域网设备
+# 走 0.0.0.0:lan_port（相当于 V2Ray 的允许局域网连接）。
 allow_lan = false
 
 # 系统代理：connect 时把系统代理指到上面的本地端口，退出时还原。
