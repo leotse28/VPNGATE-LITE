@@ -255,14 +255,17 @@ async fn cmd_test(cli: &Cli, cfg: &Config, target: &str) -> i32 {
     println!("-- google https (https://www.google.com/) --");
     match tunnel.open_stream("www.google.com", 443, timeout).await {
         Ok(stream) => {
-            let server_name =
-                tokio_rustls::rustls::pki_types::ServerName::try_from("www.google.com".to_string())
-                    .expect("valid server name");
-            let tls = tokio_rustls::TlsConnector::from(net::verified_tls_config());
-            match tokio::time::timeout(timeout, tls.connect(server_name, stream)).await {
+            match tokio::time::timeout(
+                timeout,
+                net::verified_tls_connect(stream, "www.google.com"),
+            )
+            .await {
                 Ok(Ok(mut tls)) => {
-                    let req = b"GET / HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\nUser-Agent: vpngate-client/0.1\r\n\r\n";
-                    if let Err(e) = tls.write_all(req).await {
+                    let req = format!(
+                        "GET / HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\nUser-Agent: vpngate-client/{}\r\n\r\n",
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    if let Err(e) = tls.write_all(req.as_bytes()).await {
                         println!("TLS write failed: {}", e);
                         return 1;
                     }

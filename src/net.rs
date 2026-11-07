@@ -1,22 +1,29 @@
 //! Transport plumbing: TCP connect (direct or via a front SOCKS5 proxy)
-//! and a minimal HTTPS GET client built on tokio-rustls.
+//! and a minimal HTTPS GET client.
 //!
 //! Two TLS modes exist on purpose:
-//! * **Verified** (Mozilla roots **plus the OS system certificate
-//!   store**) for `vpngate.net` and DoH endpoints. The system store
-//!   matters because a network that intercepts TLS with a locally
-//!   trusted CA (browsers trust it — they read the system store)
-//!   would otherwise fail Mozilla-roots-only verification.
+//! * **Verified** for `vpngate.net` and DoH endpoints. On Windows the
+//!   handshake goes through the OS TLS stack (SChannel, via
+//!   native-tls / tokio-native-tls), so the ClientHello matches the
+//!   browser's — rustls' ClientHello was getting a fatal
+//!   HandshakeFailure from a middlebox on Leo's network path while
+//!   Chrome through the same front proxy opened the same URLs fine.
+//!   On other platforms verified TLS is rustls with Mozilla roots
+//!   **plus the OS system certificate store** (see
+//!   `verified_tls_config`).
 //! * **Accept-any** for VPNGate nodes: SoftEther nodes use self-signed
 //!   certificates, so verification would always fail (the Python reference
 //!   probe also disables verification). This is documented in the README.
+//!   Accept-any stays rustls on every platform, including Windows.
 
 use crate::config::FrontProxy;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::rustls::ClientConfig;
+#[cfg(not(windows))]
+use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::TlsConnector;
 
 /// A TCP connector that optionally routes through a front SOCKS5 proxy.
@@ -59,9 +66,9 @@ impl Connector {
     }
 }
 
-/// Build a verified rustls client config: Mozilla roots **plus** the OS
-/// system certificate store (Windows: the Windows certificate store;
-/// other platforms: the usual system bundle, when one exists).
+/// Build a verified rustls client config (non-Windows only): Mozilla
+/// roots **plus** the OS system certificate store (Linux/macOS: the
+/// usual system bundle, when one exists).
 ///
 /// Why the system store: Leo's network path intercepts TLS with a CA
 /// that is trusted by the OS — Chrome trusts it because browsers read
@@ -73,6 +80,11 @@ impl Connector {
 /// Mozilla roots still apply, so verification is never weakened — it
 /// only gains roots the OS already trusts. The accept-any config used
 /// for VPNGate nodes is untouched by this change.
+///
+/// On Windows this function is not used: verified HTTPS goes through
+/// SChannel (`tls_connect_verified`), which reads the Windows store
+/// natively and — more importantly — sends a browser-like handshake.
+#[cfg(not(windows))]
 pub fn verified_tls_config() -> Arc<ClientConfig> {
     let cfg = ClientConfig::builder()
         .with_root_certificates(verified_roots())
@@ -84,6 +96,7 @@ pub fn verified_tls_config() -> Arc<ClientConfig> {
 /// then every certificate the OS system store provides. Duplicates
 /// (a root in both sets) are ignored — `add` fails on them and the
 /// error is dropped on purpose.
+#[cfg(not(windows))]
 fn verified_roots() -> RootCertStore {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -94,6 +107,71 @@ fn verified_roots() -> RootCertStore {
         let _ = roots.add(cert);
     }
     roots
+}
+
+/// A TLS stream from a verified handshake. The concrete type differs
+/// per platform (SChannel on Windows, rustls elsewhere), so callers
+/// only see this boxed trait. A combined supertrait is needed because
+/// a trait object can only name one non-auto trait directly.
+pub trait TlsStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> TlsStream for T {}
+
+/// Verified TLS handshake over an already-connected stream: the
+/// Google check inside an established tunnel, and the verified leg of
+/// `https_get`. Windows: SChannel (native-tls) — the handshake
+/// (ClientHello, cipher suites, extensions) matches the browser's,
+/// and the Windows certificate store is used, so trust matches the
+/// browser too. Other platforms: rustls with Mozilla roots plus the
+/// system store (see `verified_tls_config`). The returned error is
+/// already worded; callers prefix it with the host.
+pub async fn verified_tls_connect<S>(
+    stream: S,
+    host: &str,
+) -> Result<Box<dyn TlsStream>, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    #[cfg(windows)]
+    {
+        let connector = tokio_native_tls::TlsConnector::from(
+            native_tls::TlsConnector::new().map_err(|e| e.to_string())?,
+        );
+        let stream = connector
+            .connect(host, stream)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Box::new(stream))
+    }
+    #[cfg(not(windows))]
+    {
+        let cfg = verified_tls_config();
+        let server_name =
+            tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|e| format!("bad server name {}: {}", host, e))?;
+        let stream = TlsConnector::from(cfg)
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Box::new(stream))
+    }
+}
+
+/// TLS handshake for `https_get`. `verify = false` (accept-any) stays
+/// rustls on every platform; `verify = true` uses the platform's
+/// verified stack via `verified_tls_connect`.
+async fn tls_connect(tcp: TcpStream, host: &str, verify: bool) -> Result<Box<dyn TlsStream>, String> {
+    if !verify {
+        let cfg = accept_any_tls_config();
+        let server_name =
+            tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|e| format!("bad server name {}: {}", host, e))?;
+        let stream = TlsConnector::from(cfg)
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(Box::new(stream));
+    }
+    verified_tls_connect(tcp, host).await
 }
 
 /// Build an accept-any rustls client config (self-signed VPNGate nodes).
@@ -190,20 +268,14 @@ pub async fn https_get(
         .connect_tcp(host, port)
         .await
         .map_err(|e| format!("TCP connect to {}:{} failed: {}", host, port, e))?;
-    let tls_cfg = if verify {
-        verified_tls_config()
-    } else {
-        accept_any_tls_config()
-    };
-    let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
-        .map_err(|e| format!("bad server name {}: {}", host, e))?;
-    let mut tls = TlsConnector::from(tls_cfg)
-        .connect(server_name, tcp)
+    let mut tls = tls_connect(tcp, host, verify)
         .await
         .map_err(|e| format!("TLS handshake to {} failed: {}", host, e))?;
     let mut req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: vpngate-client/0.1\r\n",
-        path, authority
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: vpngate-client/{}\r\n",
+        path,
+        authority,
+        env!("CARGO_PKG_VERSION")
     );
     for (k, v) in extra_headers {
         req.push_str(&format!("{}: {}\r\n", k, v));
@@ -414,6 +486,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn verified_roots_add_system_store_on_top_of_mozilla() {
         let mozilla = webpki_roots::TLS_SERVER_ROOTS.len();
         let roots = verified_roots();

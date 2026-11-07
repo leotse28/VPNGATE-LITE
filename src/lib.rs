@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod doh;
+pub mod filelog;
 pub mod net;
 pub mod socks5;
 pub mod sstp;

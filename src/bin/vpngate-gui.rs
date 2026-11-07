@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vpngate_client::config::Config;
+use vpngate_client::filelog::{self, FileLogger, LogLevel};
 use vpngate_client::net::{self, Connector};
 use vpngate_client::sstp::SstpTunnel;
 use vpngate_client::sysproxy::SystemProxyGuard;
@@ -260,14 +261,17 @@ async fn test_flow(tunnel: &Arc<SstpTunnel>, timeout: Duration) -> (bool, bool, 
     }
     match tunnel.open_stream("www.google.com", 443, timeout).await {
         Ok(stream) => {
-            let name =
-                tokio_rustls::rustls::pki_types::ServerName::try_from("www.google.com".to_string())
-                    .expect("valid server name");
-            let tls = tokio_rustls::TlsConnector::from(net::verified_tls_config());
-            match tokio::time::timeout(timeout, tls.connect(name, stream)).await {
+            match tokio::time::timeout(
+                timeout,
+                net::verified_tls_connect(stream, "www.google.com"),
+            )
+            .await {
                 Ok(Ok(mut tls)) => {
-                    let req = b"GET / HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\nUser-Agent: vpngate-client/0.1\r\n\r\n";
-                    if tls.write_all(req).await.is_ok() {
+                    let req = format!(
+                        "GET / HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\nUser-Agent: vpngate-client/{}\r\n\r\n",
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    if tls.write_all(req.as_bytes()).await.is_ok() {
                         let mut buf = vec![0u8; 4096];
                         match tokio::time::timeout(timeout, tls.read(&mut buf)).await {
                             Ok(Ok(n)) => {
@@ -454,6 +458,13 @@ struct GuiApp {
     font_ok: bool,
     /// Last auto-save failure message (to show a repeated failure once).
     last_save_error: String,
+    /// File logger (`vpngate-gui.log` next to the exe). `None` until
+    /// `init_file_log` runs in `new()`; the logger itself no-ops when
+    /// its file could not be opened. `for_tests` apps have none.
+    file_logger: Option<FileLogger>,
+    /// The log file's path (shown in the UI log at startup and next to
+    /// the save button). `Some` even when the file could not be opened.
+    log_path: Option<std::path::PathBuf>,
     event_tx: mpsc::Sender<GuiEvent>,
     event_rx: Option<mpsc::Receiver<GuiEvent>>,
 }
@@ -489,6 +500,8 @@ impl Default for GuiApp {
             show_about: false,
             font_ok: false,
             last_save_error: String::new(),
+            file_logger: None,
+            log_path: None,
             event_tx: tx,
             event_rx: Some(rx),
         }
@@ -551,12 +564,8 @@ impl GuiApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::default();
         app.font_ok = Self::setup_visuals(cc);
-        if !app.font_ok {
-            app.log
-                .push("未找到系统里的中文字体，中文可能显示为方框。".to_string());
-        }
-        // Portable config: config.toml next to the exe first, then
-        // ./config.toml in the working directory, else defaults.
+        // Portable config first: the session header in the file log
+        // records the config path and the front-proxy setting it loaded.
         // Nothing is read from or written to the user profile.
         let cfg_path = Config::resolve_config_path(None);
         if let Some(p) = &cfg_path {
@@ -565,6 +574,12 @@ impl GuiApp {
             }
         }
         app.config_path = cfg_path;
+        // File log: from here on every log_line / log_warn / log_error
+        // (and every set_error) is also appended to vpngate-gui.log.
+        app.init_file_log();
+        if !app.font_ok {
+            app.log_warn("未找到系统里的中文字体，中文可能显示为方框。".to_string());
+        }
         // Fetch the live node list in the background.
         app.start_fetch(cc.egui_ctx.clone());
         app
@@ -641,7 +656,7 @@ impl GuiApp {
     /// an explicit "save again now" that confirms it.
     fn save_settings(&mut self) {
         let Some(path) = Config::portable_config_path() else {
-            self.error = "保存失败：找不到程序所在目录。".to_string();
+            self.set_error("保存失败：找不到程序所在目录。".to_string());
             return;
         };
         match self.current_config().save(&path) {
@@ -653,8 +668,7 @@ impl GuiApp {
                 self.log_line(format!("设置已保存到 {}。", path.display()));
             }
             Err(e) => {
-                self.error = format!("保存设置失败：{}。程序目录可能不可写。", e);
-                self.log_line(format!("保存设置失败：{}。", e));
+                self.set_error(format!("保存设置失败：{}。程序目录可能不可写。", e));
             }
         }
     }
@@ -678,8 +692,7 @@ impl GuiApp {
                 let msg = format!("自动保存设置失败：{}。程序目录可能不可写。", e);
                 if msg != self.last_save_error {
                     self.last_save_error = msg.clone();
-                    self.error = msg;
-                    self.log_line(format!("自动保存设置失败：{}。", e));
+                    self.set_error(msg);
                 }
             }
         }
@@ -710,12 +723,74 @@ impl GuiApp {
         )
     }
 
+    /// Start the file log (`vpngate-gui.log` next to the exe, same
+    /// portable dir as config.toml; `./vpngate-gui.log` when the exe
+    /// dir is unknown). Writes the session header (start time,
+    /// version, exe path, config path, front proxy enabled + address —
+    /// never the password) and replays the lines already on screen, so
+    /// the file covers the whole run from startup. A file that cannot
+    /// be opened warns once in the on-screen log and disables file
+    /// logging for this run; the GUI never crashes over it.
+    fn init_file_log(&mut self) {
+        let path = Config::portable_dir()
+            .map(|d| filelog::log_path_for_dir(&d))
+            .unwrap_or_else(|| std::path::PathBuf::from("vpngate-gui.log"));
+        self.log_path = Some(path.clone());
+        let mut logger = FileLogger::new(&path);
+        let exe = std::env::current_exe().ok();
+        logger.write_header(&self.config, exe.as_deref(), self.config_path.as_deref());
+        // Replay what is already on screen (the "就绪…" startup line),
+        // so the file covers the run from the start.
+        for line in self.log.clone() {
+            logger.log(LogLevel::Info, &line);
+        }
+        if logger.open_failed {
+            let err = logger.open_error.clone().unwrap_or_default();
+            self.file_logger = Some(logger);
+            self.log_warn(format!(
+                "日志文件打不开（{}）：{}。本次运行不写文件日志，界面日志不受影响。",
+                path.display(),
+                err
+            ));
+        } else {
+            self.file_logger = Some(logger);
+            self.log_line(format!("日志文件：{}。报问题时请附上它。", path.display()));
+        }
+    }
+
+    /// Info: on-screen log + file log at [INFO].
     fn log_line(&mut self, line: String) {
+        self.log_line_at(LogLevel::Info, line);
+    }
+
+    /// Warning: on-screen log + file log at [WARN].
+    fn log_warn(&mut self, line: String) {
+        self.log_line_at(LogLevel::Warn, line);
+    }
+
+    /// Error: on-screen log + file log at [ERROR].
+    fn log_error(&mut self, line: String) {
+        self.log_line_at(LogLevel::Error, line);
+    }
+
+    fn log_line_at(&mut self, level: LogLevel, line: String) {
+        if let Some(fl) = self.file_logger.as_mut() {
+            fl.log(level, &line);
+        }
         self.log.push(line);
         if self.log.len() > 100 {
             let excess = self.log.len() - 100;
             self.log.drain(..excess);
         }
+    }
+
+    /// Set the error banner AND log it at [ERROR] (both logs). Use
+    /// this instead of assigning `self.error` directly — a bare
+    /// assignment is invisible in the file log, which is exactly how
+    /// a failure ends up with no trace to debug from.
+    fn set_error(&mut self, msg: String) {
+        self.error = msg.clone();
+        self.log_error(msg);
     }
 
     fn start_fetch(&mut self, ctx: egui::Context) {
@@ -798,8 +873,7 @@ impl GuiApp {
             Ok(a) => a,
             Err(e) => {
                 self.status = "连接失败。".to_string();
-                self.error = format!("连接失败：{}。", e);
-                self.log_line(format!("连接失败：{}。", e));
+                self.set_error(format!("连接失败：{}。", e));
                 return;
             }
         };
@@ -963,10 +1037,10 @@ impl GuiApp {
                     Err(ProbeFailure::ProxyDown(e)) => {
                         self.probes.insert(host.clone(), "代理不通".to_string());
                         self.status = "探测失败：前置代理连不上。".to_string();
-                        self.error = format!(
+                        self.set_error(format!(
                             "探测 {} 失败：前置代理 {} 连不上（{}）。节点还没连上——问题在代理不在节点：刷新、探测、连接都走这条代理，代理不通时会一起失败，换节点没用。先点高级设置里的“测试前置代理”确认。",
                             host, self.front_addr, e
-                        );
+                        ));
                         self.log_line(format!(
                             "探测 {}：失败：前置代理 {} 连不上（{}）。提示：刷新节点、探测、连接都走前置代理，代理不通时它们会一起失败。",
                             host, self.front_addr, e
@@ -976,17 +1050,16 @@ impl GuiApp {
                         self.probes.insert(host.clone(), "失败".to_string());
                         self.status = format!("{} 探测失败。", host);
                         if self.front_enabled {
-                            self.error = format!(
+                            self.set_error(format!(
                                 "探测 {} 失败：前置代理 {} 能连上，但节点不通（{}）。换一个节点再试。",
                                 host, self.front_addr, e
-                            );
+                            ));
                             self.log_line(format!(
                                 "探测 {}：失败：前置代理 {} 能连上，节点不通（{}）。",
                                 host, self.front_addr, e
                             ));
                         } else {
-                            self.error = format!("探测 {} 失败：{}。换一个节点再试。", host, e);
-                            self.log_line(format!("探测 {}：失败：{}。", host, e));
+                            self.set_error(format!("探测 {} 失败：{}。换一个节点再试。", host, e));
                         }
                     }
                 }
@@ -1004,8 +1077,7 @@ impl GuiApp {
             GuiEvent::ConnectFailed(e) => {
                 self.busy = None;
                 self.status = "连接失败。".to_string();
-                self.error = format!("连接失败：{}。换一个节点，或检查前置 SOCKS5 设置。", e);
-                self.log_line(format!("连接失败：{}。", e));
+                self.set_error(format!("连接失败：{}。换一个节点，或检查前置 SOCKS5 设置。", e));
             }
             GuiEvent::TestResult {
                 gen204,
@@ -1025,10 +1097,12 @@ impl GuiApp {
                     detail, gen204, google
                 ));
                 if !gen204 {
-                    self.error = format!("测试未通过：{} 换一个节点再试。", detail);
+                    self.set_error(format!("测试未通过：{} 换一个节点再试。", detail));
                 } else if !google {
-                    self.error =
-                        format!("Google 不通：{} 可能是出口被挡，换一个节点再试。", detail);
+                    self.set_error(format!(
+                        "Google 不通：{} 可能是出口被挡，换一个节点再试。",
+                        detail
+                    ));
                 } else {
                     self.error.clear();
                 }
@@ -1054,21 +1128,21 @@ impl GuiApp {
                 }
                 if let Some(d) = proxy_detail {
                     self.status = "前置代理测试：前置代理连不上。".to_string();
-                    self.error = format!(
+                    self.set_error(format!(
                         "前置代理 {} 连不上（{}）。刷新、探测、连接都走这条代理，代理不通时会一起失败：检查前置代理（NekoBox）开没开、地址对不对。",
                         self.front_addr, d
-                    );
+                    ));
                 } else if target_down.is_empty() {
                     self.status = format!("前置代理测试：{}；{}。", g, v);
                     self.error.clear();
                 } else {
                     let labels: Vec<&str> = target_down.iter().map(|(l, _)| *l).collect();
                     self.status = format!("前置代理测试：前置代理通，{}不通。", labels.join("、"));
-                    self.error = format!(
+                    self.set_error(format!(
                         "前置代理能连上，但 {} 通过它打不开（{}）。刷新节点要走 vpngate.net，这个不通就拉不到新节点；Google 不通则是出口的问题。",
                         labels.join("、"),
                         target_down[0].1
-                    );
+                    ));
                 }
             }
         }
@@ -1520,7 +1594,10 @@ impl eframe::App for GuiApp {
                                     self.log_line(format!("手动添加节点：{}。", target));
                                     self.manual_host.clear();
                                 }
-                                Err(e) => self.manual_error = e,
+                                Err(e) => {
+                                    self.log_warn(format!("手动添加节点失败：{}。", e));
+                                    self.manual_error = e;
+                                }
                             }
                         }
                     });
@@ -1595,6 +1672,17 @@ impl eframe::App for GuiApp {
                             ),
                         };
                     });
+                    // Log file location: next to the exe, same folder as
+                    // config.toml. Shown here so Leo can find it when
+                    // reporting a problem (startup also logs the path).
+                    match &self.log_path {
+                        Some(p) => ui.label(
+                            egui::RichText::new(format!("日志文件：{}", p.display())).small(),
+                        ),
+                        None => ui.label(
+                            egui::RichText::new("日志文件：未开启").small(),
+                        ),
+                    };
                 });
             ui.separator();
 
@@ -1626,7 +1714,10 @@ impl eframe::App for GuiApp {
                 .collapsible(false)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
-                    ui.label("VPNGate 客户端 0.1.0（Rust / egui）");
+                    ui.label(format!(
+                        "VPNGate 客户端 {}（Rust / egui）",
+                        env!("CARGO_PKG_VERSION")
+                    ));
                     ui.label("连 VPNGate 志愿者节点（MS-SSTP + PPP），本地开一个 SOCKS5 端口。");
                     ui.label("没有虚拟网卡，不改系统路由；系统代理默认关闭。");
                     ui.label("节点是陌生人家的宽带，随时可能下线，仅供试用。");
@@ -1976,6 +2067,47 @@ mod tests {
         assert_eq!(cfg.listen.lan_port, 10810);
         assert!(cfg.listen.allow_lan);
         assert!(cfg.system_proxy.enabled);
+    }
+
+    #[test]
+    fn log_lines_go_to_file_log_with_levels() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("vpngate-gui-test-{}.log", n));
+        let old = path.with_file_name(vpngate_client::filelog::OLD_LOG_FILE_NAME);
+        let mut app = GuiApp::for_tests();
+        // No logger yet: log calls only touch the on-screen log.
+        app.log_line("info before logger".to_string());
+        assert!(!path.exists(), "no file without a logger");
+        app.file_logger = Some(FileLogger::new(&path));
+        app.log_line("info line".to_string());
+        app.log_warn("warn line".to_string());
+        app.set_error("error line".to_string());
+        // set_error also sets the banner.
+        assert_eq!(app.error, "error line");
+        drop(app);
+        let text = std::fs::read_to_string(&path).expect("file log written");
+        assert!(text.contains("[INFO] info line"), "info: {}", text);
+        assert!(text.contains("[WARN] warn line"), "warn: {}", text);
+        assert!(text.contains("[ERROR] error line"), "error: {}", text);
+        assert!(
+            !text.contains("info before logger"),
+            "lines before the logger started stay out of the file: {}",
+            text
+        );
+        for l in text.lines() {
+            assert_eq!(
+                l.as_bytes()[4],
+                b'-',
+                "every line starts with a YYYY-MM-DD timestamp: {}",
+                l
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old);
     }
 
     #[test]
