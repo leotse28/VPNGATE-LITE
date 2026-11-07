@@ -122,8 +122,12 @@ pub fn parse_api_csv(text: &str) -> Vec<Node> {
             port: None,
             country: cols[5].to_string(),
             country_code: cols[6].to_string(),
-            isp: cols[11].to_string(),
-            name: cols[11].to_string(),
+            // cols[11] is LogType ("2weeks", "0", ...) — not the ISP.
+            // Operator is cols[12] (e.g. "SoftBank BB"). The name stays
+            // empty, like the web-scrape path: the Chinese display name
+            // comes only from the curated table.
+            isp: cols[12].to_string(),
+            name: String::new(),
             score: num(2),
             ping_ms: num(3),
             speed_mbps: num(4),
@@ -298,6 +302,13 @@ pub fn parse_web_page(html: &str) -> Vec<Node> {
         }
         let country = first_cell_text(row);
         for (host, port) in extract_hosts(row) {
+            // "opengw.net" on its own is not a relay (it is the domain
+            // itself, not a DDNS hostname under it). `valid_ddns_host`
+            // already rejects it, but filter it explicitly so a bare
+            // domain can never become a node entry.
+            if host == "opengw.net" {
+                continue;
+            }
             if let Some(existing) = out.iter_mut().find(|n| n.host == host) {
                 // Seen again (DDNS cell, then MS-SSTP cell): an explicit
                 // port beats the 443 default from the first sighting.
@@ -566,6 +577,70 @@ mod tests {
         assert_eq!(nodes[0].country, "Japan");
         assert_eq!(nodes[0].score, 1000000);
         assert_eq!(nodes[0].port, None);
+        // cols[11] is LogType ("0" here, "2weeks" in the live list) —
+        // the ISP is Operator, cols[12]. Before the fix both isp and
+        // name read cols[11], so the ISP column showed "2weeks".
+        assert_eq!(nodes[0].isp, "SoftBank BB");
+        assert!(nodes[0].name.is_empty(), "API nodes carry no display name");
+    }
+
+    #[test]
+    fn resolve_target_completes_bare_ddns_labels() {
+        // Leo's v3.1 log: API nodes arrived as bare labels
+        // ("public-vpn-192", "vpn321359264") and the probe dialled
+        // them as-is. The suffix is completed here, at the single
+        // choke point probe/connect (GUI + CLI) both use.
+        let c = resolve_target("public-vpn-192");
+        assert_eq!(c.len(), 3, "candidate SSTP ports");
+        assert!(c.iter().all(|(h, _)| h == "public-vpn-192.opengw.net"));
+        assert_eq!(
+            c.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+            vec![443, 992, 995]
+        );
+        assert_eq!(
+            resolve_target("public-vpn-192:995"),
+            vec![("public-vpn-192.opengw.net".to_string(), 995)]
+        );
+        // A bare "opengw" completes to a name that cleanly fails DNS
+        // instead of dialling whatever the proxy makes of the label.
+        assert_eq!(
+            resolve_target("opengw"),
+            vec![
+                ("opengw.opengw.net".to_string(), 443),
+                ("opengw.opengw.net".to_string(), 992),
+                ("opengw.opengw.net".to_string(), 995),
+            ]
+        );
+        // FQDNs and IPs are untouched.
+        assert_eq!(
+            resolve_target("kanratown.opengw.net:992"),
+            vec![("kanratown.opengw.net".to_string(), 992)]
+        );
+        assert_eq!(
+            resolve_target("127.0.0.1:8443"),
+            vec![("127.0.0.1".to_string(), 8443)]
+        );
+        // Curated hosts keep their known port and backups.
+        let c = resolve_target("kanratown.opengw.net");
+        assert_eq!(c[0], ("kanratown.opengw.net".to_string(), 992));
+        assert_eq!(c.len(), 3, "known port + 2 curated backups");
+    }
+
+    #[test]
+    fn parse_web_page_never_yields_bare_domain() {
+        // A page that merely mentions the domain must not produce a
+        // node whose host is "opengw.net" itself.
+        let html = r#"<table>
+<tr><td>Japan</td><td>DDNS hostnames end with opengw.net — see <b>vpn1.opengw.net</b></td><td>SSTP 主机名 : <b>opengw.net</b></td></tr>
+<tr><td>Japan</td><td><b>vpn2.opengw.net</b> 1.1.1.1</td><td>SSTP 主机名 : <b>vpn2.opengw.net</b></td></tr>
+</table>"#;
+        let nodes = parse_web_page(html);
+        // vpn1 (mentioned in the text) and vpn2 (the real row) both
+        // parse; the bare "opengw.net" in the SSTP cell must not.
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].host, "vpn1.opengw.net");
+        assert_eq!(nodes[1].host, "vpn2.opengw.net");
+        assert!(nodes.iter().all(|n| n.host != "opengw.net"));
     }
 
     #[test]
@@ -724,7 +799,7 @@ pub fn resolve_target(target: &str) -> Vec<(String, u16)> {
     if let Some((h, p)) = target.rsplit_once(':') {
         if let Ok(port) = p.parse::<u16>() {
             if !h.is_empty() {
-                return vec![(h.to_string(), port)];
+                return vec![(complete_ddns_host(h), port)];
             }
         }
     }
@@ -761,6 +836,22 @@ pub fn resolve_target(target: &str) -> Vec<(String, u16)> {
     // Unknown hostname: try the common SSTP ports.
     CANDIDATE_SSTP_PORTS
         .iter()
-        .map(|p| (target.to_string(), *p))
+        .map(|p| (complete_ddns_host(target), *p))
         .collect()
+}
+
+/// A bare VPNGate label with no dot is a DDNS hostname whose
+/// ".opengw.net" suffix is missing. Leo's v3.1 log showed API nodes
+/// arriving as "public-vpn-192" / "vpn321359264" (and even "opengw"),
+/// and the probe then dialled the bare label — whatever the front
+/// proxy's DNS made of it — instead of the real relay. Complete it
+/// defensively; FQDNs (they contain a dot) and IP addresses are
+/// untouched. Public so the GUI can log the completed host:port in
+/// its probe/connect start lines.
+pub fn complete_ddns_host(host: &str) -> String {
+    if host.contains('.') {
+        host.to_string()
+    } else {
+        format!("{}.opengw.net", host)
+    }
 }

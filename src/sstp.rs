@@ -19,7 +19,7 @@
 //!    Only TCP is tunnelled; UDP is not (same limitation as the JS code).
 
 use crate::doh::resolve_ipv4;
-use crate::net::{accept_any_tls_config, Connector};
+use crate::net::Connector;
 use crate::util::{checksum, random_bytes, random_uuid, u16be, u32be};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -29,7 +29,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, Mutex, Notify};
-use tokio_rustls::TlsConnector;
 
 const SSTP_PATH: &str = "/sra_{BA195980-CD49-458b-9E23-C84EE0ADCD75}/";
 const PPP_LCP: u16 = 0xC021;
@@ -646,16 +645,13 @@ impl SstpTunnel {
             .connect_tcp(host, port)
             .await
             .map_err(|e| format!("TCP connect to {}:{} failed: {}", host, port, e))?;
-        let server_name = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            tokio_rustls::rustls::pki_types::ServerName::IpAddress(
-                tokio_rustls::rustls::pki_types::IpAddr::from(ip),
-            )
-        } else {
-            tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
-                .map_err(|e| format!("bad server name {}: {}", host, e))?
-        };
-        let tls = TlsConnector::from(accept_any_tls_config())
-            .connect(server_name, tcp)
+        // Accept-any TLS for the node (self-signed certs). On Windows
+        // this goes through SChannel, not rustls: Leo's v3.1 log showed
+        // rustls SSTP handshakes dying with "tls handshake eof" while
+        // SChannel HTTPS through the same front proxy worked, so the
+        // difference is the TLS stack, not the proxy. SNI is still the
+        // target hostname; verification stays off on every platform.
+        let tls = crate::net::accept_any_tls_connect(tcp, host)
             .await
             .map_err(|e| format!("TLS handshake to {}:{} failed: {}", host, port, e))?;
         let (read_half, mut write_half) = tokio::io::split(tls);

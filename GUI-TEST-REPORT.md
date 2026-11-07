@@ -186,3 +186,21 @@ cargo run --release --bin vpngate-gui
 渲染检查：`cargo test --bin vpngate-gui -- --ignored render_for_review` 通过，5 张截图已更新（560×420，双主题 + 150% 缩放 + 滚到底两张）；滚到底的浅色截图里能看到保存设置按钮下面新加的“日志文件：未开启”一行（渲染测试不走 `new()`，所以没有真的日志器，显示未开启是正确的）。
 `cargo build --release` 与 `cargo build --release --target x86_64-pc-windows-gnu` 均通过，无警告；Windows 版 `vpngate-gui.exe`（PE32+ GUI，39,283,029 字节）、`vpngate-client.exe`（PE32+ console，10,555,909 字节），图标仍在（两 exe 都有 `.rsrc` 段，10,376 字节，与 v3 相同）。Linux 版 `vpngate-client` 实测：无参数打印中文说明（注意：无参数时会等按回车才退出，这是 v2 故意改的，`head` 截断会让它一直等，别误以为卡死）；`list` 在 0.07 秒内完成，API 与抓取都以 `received corrupt message of type InvalidContentType` 失败后正确落到内嵌 28 节点（VM 出口中间件根本不完成 TLS 握手，和 v3 时一样）。
 **仍未在真节点上验证（实话）**：本 VM 出口拦截 vpngate.net / *.opengw.net 的 TLS，SChannel 握手是否绕过 Leo 网络上那个 HandshakeFailure 只能在他 Windows 机器上验证——点“测试前置代理”看 Google 与 vpngate.net 是否变通；真节点连接、抓取、双端口同时监听同样须他试；文件日志也要在他机器上确认 `vpngate-gui.log` 出现在 exe 旁边、且里面没有密码。
+
+---
+
+## 8. 2026-11-07 晚 v3.2 这一批改动（运营商列、测试超时、SSTP 走 SChannel、短主机名）
+
+背景：Leo 在 v3.1 上实测（`vpngate-gui.log`）：SChannel 的已校验 HTTPS 已生效——前置代理测试通过（Google HTTP 200 约 2.7 秒，vpngate.net HTTP 302 约 4.4 秒），刷新拉到 95 个节点；但探测与连接仍失败，每个节点都是 `TLS handshake to <host>:995 failed: tls handshake eof`；运营商列全是 "2weeks"；前置代理测试有一次 30 秒以上没反应（地址栏先填成 12.0.0.1，测试中改回 127.0.0.1，开始行与结果行的地址对不上）。
+
+17. **运营商列读错列（`src/vpngate.rs` `parse_api_csv`）。** `isp` 与 `name` 都取了 cols[11]，那是 LogType（现网值就是 "2weeks"），运营商 Operator 在 cols[12]。改成 `isp = cols[12]`；API 节点的 `name` 置空（与网页抓取路径一致，中文展示名只来自 curated 表）。测试用现有的 sample CSV 断言 `isp == "SoftBank BB"` 且 `name` 为空。
+
+18. **前置代理测试加超时与进度。** 原来测试用隧道超时（默认 10 秒），TCP 预检与 HTTPS 各占一份超时、两个站串行，最坏 40 秒才出结果，中间无反馈（Leo 那次 40 秒正好是这个上限）。改成测试专用的每站 10 秒总超时（`FRONT_PROXY_TEST_TIMEOUT`，TCP 预检不超过 5 秒，含在 10 秒预算内——`net::test_url_through_proxy` 现在按 deadline 算，预检预算是纯函数 `front_proxy_precheck_budget`，10 秒总预算给预检 5 秒）；两个站之间发进度事件，状态栏显示“正在测试前置代理… Google / vpngate.net”；点击时把前置代理地址快照下来（`GuiEvent::FrontProxyTest` 新增 `addr` 字段），开始行与全部结果/报错行都用这个快照地址，不再读实时字段；超时按现有分类报不通（“连接前置代理超时”/“请求超时，目标站无响应”）。新增测试：预检预算上限纯函数、黑洞代理（握手成功后永不回应）3 秒总预算内返回且分类为目标站不通、无应答代理地址 8 秒预算内返回且分类为代理不通、快照地址事件、进度事件。
+
+19. **SSTP 的 TLS 在 Windows 上也走 SChannel（本次主修，`src/net.rs` 新增 `accept_any_tls_connect`，`src/sstp.rs` 的 `SstpTunnel::connect` 改调它）。** v3.1 的日志证明：同一条代理上 SChannel 的 HTTPS 能通、rustls 的 SSTP 在握手中途被掐掉（EOF），问题在 TLS 栈/握手特征，不在代理本身。Windows 上用 `native-tls` + `tokio-native-tls`（已是 Windows-only 依赖，无新增依赖），`danger_accept_invalid_certs(true)` + `danger_accept_invalid_hostnames(true)`,保持 accept-any 语义；SNI 仍用目标主机名；非 Windows 继续 rustls accept-any。Connector 与前置代理路由不动，默认端口不动（本地 10818、局域网 10809）。`Cargo.toml` 注释同步更新。验证靠集成测试 `gui_connect_flow_against_mock`（mock SSTP 服务器 + 自签证书，Linux 上走改动后的 rustls accept-any 路径全过）与 Windows 交叉编译（SChannel 路径只编过，没法在本 VM 跑）。
+
+20. **主机名诊断与防御。** 先确认的事实：探测开始行用的 `target_str` 与连接的目标就是传给 `resolve_target` 的完整字符串（显示时才去掉 `.opengw.net` 后缀），但 API 返回的节点里混着不带后缀的短主机名（Leo 日志里的 `public-vpn-192`、`vpn321359264`，甚至 `opengw`），短名的来源在代码里找不到——只做防御，不硬猜。`resolve_target` 里对不含 "." 的裸标签主机名补 ".opengw.net" 后缀（`complete_ddns_host`，公开函数，GUI 的探测/连接开始行也用它拼完整 host:port 再记日志；FQDN 与 IP 不受影响）；网页抓取里把 host 恰好等于 "opengw.net" 本身的条目过滤掉（`valid_ddns_host` 本来就拒掉它，这里是显式防线）。连接开始行原来没有日志，现在补一条（“开始连接 …（经前置代理 …）”），与探测开始行一致。新增测试：短标签补后缀（带端口与不带端口、`opengw`、FQDN/IP 不动、curated 节点端口与备用不变）、网页抓取不产出 "opengw.net"。
+
+21. **版本 0.3.1 → 0.3.2**（`Cargo.toml`；User-Agent 与关于窗口仍读 `CARGO_PKG_VERSION`）。README / WINDOWS.md 同步更新（运营商来源、测试超时、SSTP 走 SChannel）。版本 bump 顺带修了一个测试里的硬编码版本号：`session_header_never_logs_password` 断言头里含 "0.3.1"，改成读 `CARGO_PKG_VERSION`，否则每次升版本都会误报。
+
+本批测试（本 VM，`cargo test`，CARGO_EXIT=0）：lib 29 项（原 24 + vpngate 2 项、net 3 项）、GUI 18 项（原 16 + 快照地址、进度事件，+3 个忽略的：渲染测试、列宽拖拽测试、拖拽冒烟测试）、集成 1 项，全过，共 48 项。

@@ -370,7 +370,13 @@ mod tests {
         );
         assert!(joined.contains("192.168.236.197:10808"), "addr: {}", joined);
         assert!(joined.contains("已启用"), "enabled flag: {}", joined);
-        assert!(joined.contains("0.3.1"), "version: {}", joined);
+        // The version in the header tracks the package version; never
+        // hardcode it here, or the next version bump breaks this test.
+        assert!(
+            joined.contains(env!("CARGO_PKG_VERSION")),
+            "version: {}",
+            joined
+        );
         // Disabled proxy: no address at all.
         let cfg2 = Config::default();
         let lines2 = session_header_lines(&cfg2, None, None);

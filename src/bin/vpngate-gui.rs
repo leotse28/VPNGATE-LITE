@@ -88,9 +88,20 @@ enum GuiEvent {
         detail: String,
     },
     FrontProxyTest {
+        /// Front-proxy address snapshotted when the test was clicked
+        /// (the live field may have changed by the time the result
+        /// arrives — Leo once typed 12.0.0.1, fixed it mid-test to
+        /// 127.0.0.1, and the start line and the result line named
+        /// different addresses).
+        addr: String,
         google: net::FrontProxyCheck,
         vpngate: net::FrontProxyCheck,
     },
+    /// Progress of a running front-proxy test: which site is being
+    /// tested right now ("Google" / "vpngate.net"). Updates the
+    /// status line only; the full result still comes as
+    /// `FrontProxyTest`.
+    FrontProxyTestProgress { site: String },
 }
 
 /// Build a Connector from the current settings.
@@ -153,14 +164,35 @@ fn classify_probe_failure(last_err: String, proxy_tcp: Option<bool>) -> ProbeFai
 /// through it (SOCKS5 connectivity, not ICMP ping). Runs on a
 /// background task; the result distinguishes "the proxy is down" from
 /// "the proxy is up but the target does not answer through it".
+///
+/// `timeout` is the TOTAL budget per site (see
+/// `net::test_url_through_proxy`): pre-check + HTTPS together, so two
+/// sites take at most 2 × `timeout`. A progress event is sent before
+/// each site so the status line shows which one is being tested
+/// instead of going silent for the whole run.
 async fn front_proxy_test_flow(
     connector: &Connector,
     timeout: Duration,
+    tx: &std::sync::mpsc::Sender<GuiEvent>,
 ) -> (net::FrontProxyCheck, net::FrontProxyCheck) {
+    let _ = tx.send(GuiEvent::FrontProxyTestProgress {
+        site: "Google".to_string(),
+    });
     let google = net::test_url_through_proxy(connector, "https://www.google.com", timeout).await;
+    let _ = tx.send(GuiEvent::FrontProxyTestProgress {
+        site: "vpngate.net".to_string(),
+    });
     let vpngate = net::test_url_through_proxy(connector, "https://www.vpngate.net", timeout).await;
     (google, vpngate)
 }
+
+/// Dedicated per-site budget for the front-proxy test (10 s total per
+/// site: TCP pre-check at most 5 s, HTTPS gets the rest). This is NOT
+/// the tunnel timeout: the tunnel timeout is for SSTP/PPP establish,
+/// and a proxy test must not inherit a long one (or a short one) —
+/// Leo's v3.1 test once sat silent for 40 s because each leg had its
+/// own 10 s timeout, twice over, for two sites.
+const FRONT_PROXY_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connect the tunnel, start the local SOCKS5 server(s), optionally set
 /// the system proxy. Runs on a background task; returns the live
@@ -818,9 +850,15 @@ impl GuiApp {
         }
         let target = node.host.clone();
         let port = node.port;
+        // The dialled target (and the start line) uses the completed
+        // hostname: a bare DDNS label from the node list
+        // ("public-vpn-192") becomes its full FQDN, so the log shows
+        // exactly which host:port is being dialled. `target` itself
+        // stays raw: it is the probes-map key and the table looks the
+        // status up by the node's stored host.
         let target_str = match port {
-            Some(p) => format!("{}:{}", target, p),
-            None => target.clone(),
+            Some(p) => format!("{}:{}", vpngate::complete_ddns_host(&target), p),
+            None => vpngate::complete_ddns_host(&target),
         };
         self.busy = Some(Busy::Probing);
         // Probing goes through the front proxy when it is on (same
@@ -866,8 +904,11 @@ impl GuiApp {
             return;
         }
         let target = match node.port {
-            Some(p) => format!("{}:{}", node.host, p),
-            None => node.host.clone(),
+            // Complete a bare DDNS label, like start_probe does, so
+            // the start line and the connection label show the full
+            // host:port actually dialled.
+            Some(p) => format!("{}:{}", vpngate::complete_ddns_host(&node.host), p),
+            None => vpngate::complete_ddns_host(&node.host),
         };
         let listen_addrs = match self.listen_addrs() {
             Ok(a) => a,
@@ -880,6 +921,19 @@ impl GuiApp {
         self.busy = Some(Busy::Connecting);
         self.status = format!("正在连接 {}…", target);
         self.error.clear();
+        // Log the start line with the full target (host:port when the
+        // port is known, bare host otherwise — the candidates are
+        // resolved inside connect_flow). The probe start line already
+        // logs its target; the connect had none, so a failed connect
+        // left no trace of which host:port it actually dialled.
+        if self.front_enabled {
+            self.log_line(format!(
+                "开始连接 {}（经前置代理 {}）。",
+                target, self.front_addr
+            ));
+        } else {
+            self.log_line(format!("开始连接 {}。", target));
+        }
         let tx = self.event_tx.clone();
         let connector = self.connector();
         let timeout = self.timeout();
@@ -931,22 +985,30 @@ impl GuiApp {
     /// Test the front proxy (button next to the front-proxy settings).
     /// Only runs when the front proxy is on — with it off there is
     /// nothing to test and a "direct" result would be misleading.
+    /// The address is snapshotted at click time: the start line, the
+    /// progress and the result must all name the address the test
+    /// actually used, even if the field is edited mid-test.
     fn start_test_front_proxy(&mut self, ctx: egui::Context) {
         if !self.front_enabled || self.busy.is_some() {
             return;
         }
+        let addr = self.front_addr.clone();
         self.busy = Some(Busy::TestingFrontProxy);
-        self.status = format!("正在测试前置代理 {}…", self.front_addr);
+        self.status = format!("正在测试前置代理 {}…", addr);
         self.log_line(format!(
-            "开始测试前置代理 {}（到 Google 与 vpngate.net）。",
-            self.front_addr
+            "开始测试前置代理 {}（到 Google 与 vpngate.net，每站最多 10 秒）。",
+            addr
         ));
         let tx = self.event_tx.clone();
         let connector = self.connector();
-        let timeout = self.timeout();
         tokio::spawn(async move {
-            let (google, vpngate) = front_proxy_test_flow(&connector, timeout).await;
-            let _ = tx.send(GuiEvent::FrontProxyTest { google, vpngate });
+            let (google, vpngate) =
+                front_proxy_test_flow(&connector, FRONT_PROXY_TEST_TIMEOUT, &tx).await;
+            let _ = tx.send(GuiEvent::FrontProxyTest {
+                addr,
+                google,
+                vpngate,
+            });
             ctx.request_repaint();
         });
     }
@@ -1107,7 +1169,16 @@ impl GuiApp {
                     self.error.clear();
                 }
             }
-            GuiEvent::FrontProxyTest { google, vpngate } => {
+            GuiEvent::FrontProxyTestProgress { site } => {
+                // Which site is being tested right now; the busy flag
+                // stays set until the FrontProxyTest result arrives.
+                self.status = format!("正在测试前置代理… {}", site);
+            }
+            GuiEvent::FrontProxyTest {
+                addr,
+                google,
+                vpngate,
+            } => {
                 self.busy = None;
                 let g = front_proxy_check_line("Google", &google);
                 let v = front_proxy_check_line("vpngate.net", &vpngate);
@@ -1130,7 +1201,7 @@ impl GuiApp {
                     self.status = "前置代理测试：前置代理连不上。".to_string();
                     self.set_error(format!(
                         "前置代理 {} 连不上（{}）。刷新、探测、连接都走这条代理，代理不通时会一起失败：检查前置代理（NekoBox）开没开、地址对不对。",
-                        self.front_addr, d
+                        addr, d
                     ));
                 } else if target_down.is_empty() {
                     self.status = format!("前置代理测试：{}；{}。", g, v);
@@ -1932,6 +2003,7 @@ mod tests {
         app.busy = Some(Busy::TestingFrontProxy);
         // Both reachable: status carries latencies, error clears.
         app.apply_event(GuiEvent::FrontProxyTest {
+            addr: "192.168.236.197:10808".to_string(),
             google: FrontProxyCheck::Reachable {
                 status: 200,
                 ms: 312,
@@ -1956,6 +2028,7 @@ mod tests {
         // Proxy down: status + error blame the proxy and its address.
         app.busy = Some(Busy::TestingFrontProxy);
         app.apply_event(GuiEvent::FrontProxyTest {
+            addr: "192.168.236.197:10808".to_string(),
             google: FrontProxyCheck::ProxyUnreachable("连前置代理端口失败".to_string()),
             vpngate: FrontProxyCheck::ProxyUnreachable("连前置代理端口失败".to_string()),
         });
@@ -1977,6 +2050,7 @@ mod tests {
         // Proxy up, vpngate.net down through it: distinct wording.
         app.busy = Some(Busy::TestingFrontProxy);
         app.apply_event(GuiEvent::FrontProxyTest {
+            addr: "192.168.236.197:10808".to_string(),
             google: FrontProxyCheck::Reachable {
                 status: 200,
                 ms: 300,
@@ -1999,6 +2073,7 @@ mod tests {
         // unsigned exe and a dead target look identical otherwise.
         app.busy = Some(Busy::TestingFrontProxy);
         app.apply_event(GuiEvent::FrontProxyTest {
+            addr: "192.168.236.197:10808".to_string(),
             google: FrontProxyCheck::TargetUnreachable(
                 "代理建好连接后目标站无响应：TLS handshake to www.google.com failed: invalid peer certificate: UnknownIssuer".to_string(),
             ),
@@ -2016,6 +2091,51 @@ mod tests {
             "log must name the failing stage: {:?}",
             app.log
         );
+    }
+
+    #[test]
+    fn front_proxy_test_event_uses_snapshot_address() {
+        use vpngate_client::net::FrontProxyCheck;
+        let mut app = GuiApp::for_tests();
+        // The address field was edited mid-test (Leo typed 12.0.0.1,
+        // fixed it to 127.0.0.1 while the test was running): the
+        // result must name the address the test actually used
+        // (12.0.0.1), not the field's current value.
+        app.front_addr = "127.0.0.1:2080".to_string();
+        app.busy = Some(Busy::TestingFrontProxy);
+        app.apply_event(GuiEvent::FrontProxyTest {
+            addr: "12.0.0.1:2080".to_string(),
+            google: FrontProxyCheck::ProxyUnreachable("连接前置代理超时".to_string()),
+            vpngate: FrontProxyCheck::ProxyUnreachable("连接前置代理超时".to_string()),
+        });
+        assert!(
+            app.error.contains("12.0.0.1:2080"),
+            "error must name the snapshotted address: {}",
+            app.error
+        );
+        assert!(
+            !app.error.contains("127.0.0.1:2080"),
+            "error must not name the edited-in address: {}",
+            app.error
+        );
+    }
+
+    #[test]
+    fn front_proxy_test_progress_shows_site() {
+        let mut app = GuiApp::for_tests();
+        app.busy = Some(Busy::TestingFrontProxy);
+        app.apply_event(GuiEvent::FrontProxyTestProgress {
+            site: "Google".to_string(),
+        });
+        assert_eq!(app.status, "正在测试前置代理… Google");
+        assert!(
+            app.busy.is_some(),
+            "a progress event must not clear the busy flag"
+        );
+        app.apply_event(GuiEvent::FrontProxyTestProgress {
+            site: "vpngate.net".to_string(),
+        });
+        assert_eq!(app.status, "正在测试前置代理… vpngate.net");
     }
 
     #[test]

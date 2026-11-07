@@ -14,7 +14,13 @@
 //! * **Accept-any** for VPNGate nodes: SoftEther nodes use self-signed
 //!   certificates, so verification would always fail (the Python reference
 //!   probe also disables verification). This is documented in the README.
-//!   Accept-any stays rustls on every platform, including Windows.
+//!   On Windows accept-any goes through SChannel too
+//!   (`accept_any_tls_connect`, verification disabled in native-tls),
+//!   because rustls' ClientHello was getting its handshake killed
+//!   mid-flight (EOF) by a middlebox on Leo's network path while
+//!   SChannel HTTPS through the same front proxy worked — the
+//!   difference is the TLS stack, not the proxy. Other platforms keep
+//!   rustls accept-any.
 
 use crate::config::FrontProxy;
 use std::sync::Arc;
@@ -182,6 +188,49 @@ pub fn accept_any_tls_config() -> Arc<ClientConfig> {
         .with_custom_certificate_verifier(Arc::new(AcceptAnyVerifier))
         .with_no_client_auth();
     Arc::new(cfg)
+}
+
+/// Accept-any TLS handshake over an already-connected stream, for
+/// VPNGate nodes (self-signed certs — verification is off by design).
+/// Windows: SChannel via native-tls with both verification switches
+/// disabled, so the handshake (ClientHello, cipher suites, extensions)
+/// matches the browser's; SNI is still the target hostname. Other
+/// platforms: rustls accept-any (same as before). The returned error
+/// is already worded; callers prefix it with the host.
+pub async fn accept_any_tls_connect<S>(
+    stream: S,
+    host: &str,
+) -> Result<Box<dyn TlsStream>, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    #[cfg(windows)]
+    {
+        let connector = tokio_native_tls::TlsConnector::from(
+            native_tls::TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true)
+                .build()
+                .map_err(|e| e.to_string())?,
+        );
+        let stream = connector
+            .connect(host, stream)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Box::new(stream))
+    }
+    #[cfg(not(windows))]
+    {
+        let cfg = accept_any_tls_config();
+        let server_name =
+            tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|e| format!("bad server name {}: {}", host, e))?;
+        let stream = TlsConnector::from(cfg)
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Box::new(stream))
+    }
 }
 
 #[derive(Debug)]
@@ -381,17 +430,35 @@ pub fn classify_https_get_error(err: &str, proxy_tcp: Option<bool>) -> FrontProx
     FrontProxyCheck::TargetUnreachable(format!("代理建好连接后目标站无响应：{}", err))
 }
 
+/// How much of a front-proxy test's total budget the TCP pre-check
+/// may consume: at most 5 s, so a dead proxy address cannot eat the
+/// whole budget before the HTTPS leg even starts. Pure, so the cap is
+/// unit-testable without network timing.
+fn front_proxy_precheck_budget(total: Duration) -> Duration {
+    total.min(Duration::from_secs(5))
+}
+
 /// Test one HTTPS URL through `connector`, distinguishing "the front
 /// proxy itself is down" from "the proxy is up but the target does not
 /// answer through it". This is SOCKS5-proxy connectivity, not ICMP ping.
+///
+/// `timeout` is the TOTAL budget for this one site (pre-check +
+/// HTTPS together, not one budget each): the TCP pre-check gets at
+/// most 5 s of it, the HTTPS leg gets whatever is left. Two sites
+/// tested in series therefore take at most 2 × `timeout` overall,
+/// and the caller can report progress between them instead of going
+/// silent for 40 s.
 pub async fn test_url_through_proxy(
     connector: &Connector,
     url: &str,
     timeout: Duration,
 ) -> FrontProxyCheck {
     let start = Instant::now();
-    let proxy_tcp = check_front_proxy_tcp(connector, timeout).await;
-    match tokio::time::timeout(timeout, https_get(connector, url, &[], true)).await {
+    let deadline = start + timeout;
+    let proxy_tcp =
+        check_front_proxy_tcp(connector, front_proxy_precheck_budget(timeout)).await;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match tokio::time::timeout(remaining, https_get(connector, url, &[], true)).await {
         Ok(Ok((status, _))) => FrontProxyCheck::Reachable {
             status,
             ms: start.elapsed().as_millis(),
@@ -431,8 +498,10 @@ mod tests {
 
     /// Fake SOCKS5 proxy: accepts connections (a real proxy serves many;
     /// the test below also opens a TCP pre-check connection first), then
-    /// per connection either refuses the CONNECT (`"refuse"`) or drops
-    /// the connection mid-handshake (`"hangup"`). Returns its port.
+    /// per connection either refuses the CONNECT (`"refuse"`), drops
+    /// the connection mid-handshake (`"hangup"`), or completes the
+    /// SOCKS5 handshake and then never answers again (`"blackhole"`).
+    /// Returns its port.
     async fn fake_socks5(mode: &'static str) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -476,6 +545,12 @@ mod tests {
         };
         let mut rest = vec![0u8; skip + 2];
         if s.read_exact(&mut rest).await.is_err() {
+            return;
+        }
+        if mode == "blackhole" {
+            // CONNECT accepted, then silence: the client's TLS
+            // handshake (and everything after it) gets no answer.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
             return;
         }
         // CONNECT refused (0x05): the proxy is up, the target is not.
@@ -610,6 +685,78 @@ mod tests {
             test_url_through_proxy(&refusing, "https://www.google.com", timeout).await,
             FrontProxyCheck::TargetUnreachable(_)
         ));
+    }
+
+    #[test]
+    fn front_proxy_precheck_budget_caps_at_five_seconds() {
+        assert_eq!(
+            front_proxy_precheck_budget(Duration::from_secs(2)),
+            Duration::from_secs(2),
+            "a short total budget is used as-is"
+        );
+        assert_eq!(
+            front_proxy_precheck_budget(Duration::from_secs(10)),
+            Duration::from_secs(5),
+            "a 10 s total budget gives the pre-check 5 s, not 10"
+        );
+        assert_eq!(
+            front_proxy_precheck_budget(Duration::from_secs(30)),
+            Duration::from_secs(5),
+            "the pre-check never takes more than 5 s"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_url_through_proxy_total_budget_is_shared() {
+        // Blackhole proxy: the TCP pre-check answers instantly, the
+        // SOCKS5 CONNECT is accepted, then nothing ever comes back.
+        // The whole site must finish within its total budget (not
+        // pre-check budget + HTTPS budget), classified as the target
+        // not answering — Leo's v3.1 test sat silent for 40 s because
+        // each leg had its own 10 s timeout, twice over, for two sites.
+        let blackhole =
+            connector_with_proxy(&format!("127.0.0.1:{}", fake_socks5("blackhole").await));
+        let total = Duration::from_secs(3);
+        let start = Instant::now();
+        let res = test_url_through_proxy(&blackhole, "https://www.google.com", total).await;
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(
+                res,
+                FrontProxyCheck::TargetUnreachable(ref d)
+                    if d.contains("请求超时，目标站无响应")
+            ),
+            "blackhole proxy must time out as target-unreachable, got {:?}",
+            res
+        );
+        assert!(
+            elapsed < total + Duration::from_secs(2),
+            "one site must finish within its total budget, took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_url_through_proxy_silent_proxy_address_times_out() {
+        // An address that never answers TCP at all (SYN dropped, or
+        // rejected outright in this sandbox): the pre-check may take
+        // at most 5 s of the total budget, and the result blames the
+        // proxy with a timeout, within the total budget.
+        let silent = connector_with_proxy("10.255.255.1:80");
+        let total = Duration::from_secs(8);
+        let start = Instant::now();
+        let res = test_url_through_proxy(&silent, "https://www.google.com", total).await;
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(res, FrontProxyCheck::ProxyUnreachable(_)),
+            "silent proxy address must be proxy-unreachable, got {:?}",
+            res
+        );
+        assert!(
+            elapsed < total + Duration::from_secs(2),
+            "must finish within the total budget, took {:?}",
+            elapsed
+        );
     }
 }
 
