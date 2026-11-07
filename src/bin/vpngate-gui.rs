@@ -27,12 +27,33 @@ use vpngate_client::vpngate::{self, Node};
 
 /// What the UI is waiting for right now (at most one job at a time).
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum Busy {
     Fetching,
     Probing,
     Connecting,
     Testing,
     TestingFrontProxy,
+}
+
+/// Country-column sort direction, toggled by clicking the 国家/地区
+/// header. Chinese country names sort by string (Unicode code-point)
+/// order — deterministic, and same-country rows stay grouped — with
+/// the hostname as the tie-breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortDir {
+    Asc,
+    Desc,
+}
+
+impl SortDir {
+    /// Arrow shown in the 国家/地区 header for the current direction.
+    fn arrow(self) -> &'static str {
+        match self {
+            SortDir::Asc => "▲",
+            SortDir::Desc => "▼",
+        }
+    }
 }
 
 impl Busy {
@@ -136,13 +157,12 @@ async fn probe_flow(
     timeout: Duration,
 ) -> Result<(Ipv4Addr, Duration), ProbeFailure> {
     let candidates = vpngate::resolve_target(target);
-    let mut last_err = String::new();
-    for (host, port) in &candidates {
-        match SstpTunnel::probe(connector, host, *port, timeout).await {
-            Ok(v) => return Ok(v),
-            Err(e) => last_err = e,
-        }
-    }
+    // One race over all candidate ports (first success wins); a dead
+    // node costs about one timeout, not one per port in series.
+    let last_err = match SstpTunnel::probe_any(connector, &candidates, timeout).await {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
     // All candidates failed. If a front proxy is configured, find out
     // whether the proxy itself is the problem: a direct TCP connect to
     // the proxy separates "proxy down" from "node down".
@@ -208,19 +228,11 @@ async fn connect_flow(
     service: Option<String>,
 ) -> Result<ActiveConnection, String> {
     let candidates = vpngate::resolve_target(&target);
-    let mut last_err = String::new();
-    let mut tunnel = None;
-    for (host, port) in &candidates {
-        match SstpTunnel::connect(&connector, host, *port, timeout).await {
-            Ok(t) => {
-                tunnel = Some(t);
-                break;
-            }
-            Err(e) => last_err = e,
-        }
-    }
-    let tunnel = tunnel
-        .ok_or_else(|| format!("{} 个候选均失败；最后一次：{}", candidates.len(), last_err))?;
+    // One race over all candidate ports (first success wins); a dead
+    // node costs about one timeout, not one per port in series.
+    let tunnel = SstpTunnel::connect_any(&connector, &candidates, timeout)
+        .await
+        .map_err(|e| format!("{} 个候选均失败；最后一次：{}", candidates.len(), e))?;
     let vip = tunnel.vip;
     let mut listeners = Vec::new();
     for addr in &listen_addrs {
@@ -476,7 +488,22 @@ struct GuiApp {
     /// Node-list column widths in pixels (country, ISP, host:port,
     /// latency/status). Draggable at the header separators; persisted
     /// to config.toml with the rest of the settings via auto-save.
+    /// The status column (∞ for the connected node) is a fixed 28 px
+    /// and is NOT in this array — it has no separator and is not
+    /// resizable, so old config files keep loading as-is.
     col_widths: [u16; 4],
+    /// Country-column sort: `None` = fetch order (startup default),
+    /// `Some` = the direction the user picked by clicking the
+    /// 国家/地区 header. Kept across refreshes; session-only, not
+    /// persisted to config.toml.
+    country_sort: Option<SortDir>,
+    /// Where the mouse was pressed while selecting a row (`None` when
+    /// no press is in flight). egui only counts a click when the
+    /// pointer moves under `max_click_dist` (6 px); a real mouse
+    /// drifts past that while clicking a row, and the ScrollArea
+    /// turns the gesture into a scroll drag — so the row loop also
+    /// accepts a press-and-release on the same row within 12 px.
+    row_press_pos: Option<egui::Pos2>,
     /// Whether 高级设置 starts open. Production default is closed;
     /// the render test opens it so the review screenshots show the
     /// front-proxy section and the log.
@@ -514,7 +541,7 @@ impl Default for GuiApp {
             busy: None,
             status: "未连接".to_string(),
             error: String::new(),
-            log: vec!["就绪。正在拉取最新节点列表…".to_string()],
+            log: vec!["就绪。".to_string()],
             conn: None,
             front_enabled: false,
             front_addr: "127.0.0.1:1080".to_string(),
@@ -525,6 +552,8 @@ impl Default for GuiApp {
             allow_lan: false,
             system_proxy: false,
             col_widths: vpngate_client::config::UiSettings::default().node_col_widths,
+            country_sort: None,
+            row_press_pos: None,
             advanced_open: false,
             render_scroll_bottom: false,
             manual_host: String::new(),
@@ -540,11 +569,78 @@ impl Default for GuiApp {
     }
 }
 
+/// Brand palette, coordinated with the app icon (indigo #1E40AF →
+/// cyan #0891B2). Restrained on purpose: one accent (indigo), one
+/// success accent (cyan/teal, used for the ∞ connected-node mark),
+/// muted amber for warnings, soft red for errors — no multi-colour
+/// mixing. Both themes follow the OS setting; these are per-theme
+/// overrides on egui's defaults. Contrast checked (WCAG):
+/// * light ink #1F2937 on warm off-white #F7F6F3 ≈ 13:1
+/// * dark warm-white #F1F5F9 on deep slate #0F172A ≈ 15:1
+/// * white on indigo selection #1E40AF ≈ 8.7:1, on #2563EB ≈ 5.1:1
+/// * cyan ∞ #0E7490 on #F7F6F3 ≈ 4.9:1, #22D3EE on #0F172A ≈ 10:1
+/// * error #B91C1C on #F7F6F3 ≈ 5.9:1, warn #B45309 ≈ 4.6:1
+fn branded_visuals(theme: egui::Theme) -> egui::Visuals {
+    use egui::Color32;
+    let mut v = match theme {
+        egui::Theme::Dark => egui::Visuals::dark(),
+        egui::Theme::Light => egui::Visuals::light(),
+    };
+    match theme {
+        egui::Theme::Dark => {
+            v.override_text_color = Some(Color32::from_rgb(0xF1, 0xF5, 0xF9));
+            v.panel_fill = Color32::from_rgb(0x0F, 0x17, 0x2A); // deep slate
+            v.window_fill = Color32::from_rgb(0x1E, 0x29, 0x3B); // slate-800
+            v.extreme_bg_color = Color32::from_rgb(0x0B, 0x12, 0x20);
+            v.faint_bg_color = Color32::from_rgb(0x1E, 0x29, 0x3B);
+            v.selection.bg_fill = Color32::from_rgb(0x25, 0x63, 0xEB);
+            v.selection.stroke = egui::Stroke::new(1.0, Color32::WHITE);
+            v.hyperlink_color = Color32::from_rgb(0x93, 0xC5, 0xFD);
+            v.error_fg_color = Color32::from_rgb(0xFC, 0xA5, 0xA5);
+            v.warn_fg_color = Color32::from_rgb(0xFC, 0xD3, 0x4D);
+            v.widgets.hovered.bg_fill = Color32::from_rgb(0x1E, 0x3A, 0x8A);
+            v.widgets.active.bg_fill = Color32::from_rgb(0x1E, 0x40, 0xAF);
+            v.widgets.inactive.bg_fill = Color32::from_rgb(0x1E, 0x29, 0x3B);
+        }
+        egui::Theme::Light => {
+            v.override_text_color = Some(Color32::from_rgb(0x1F, 0x29, 0x37)); // ink
+            v.panel_fill = Color32::from_rgb(0xF7, 0xF6, 0xF3); // warm off-white
+            v.window_fill = Color32::WHITE;
+            v.extreme_bg_color = Color32::from_rgb(0xF8, 0xFA, 0xFC);
+            v.faint_bg_color = Color32::from_rgb(0xF1, 0xF5, 0xF9);
+            v.selection.bg_fill = Color32::from_rgb(0x1E, 0x40, 0xAF);
+            v.selection.stroke = egui::Stroke::new(1.0, Color32::WHITE);
+            v.hyperlink_color = Color32::from_rgb(0x1E, 0x40, 0xAF);
+            v.error_fg_color = Color32::from_rgb(0xB9, 0x1C, 0x1C);
+            v.warn_fg_color = Color32::from_rgb(0xB4, 0x53, 0x09);
+            v.widgets.hovered.bg_fill = Color32::from_rgb(0xE0, 0xE7, 0xFF);
+            v.widgets.active.bg_fill = Color32::from_rgb(0xC7, 0xD2, 0xFE);
+            v.widgets.inactive.bg_fill = Color32::WHITE;
+        }
+    }
+    v
+}
+
+/// Accent colour for the ∞ connected-node mark (not the only signal —
+/// the glyph itself marks the row). Darker cyan on light so the
+/// contrast stays above 4.5:1; bright cyan on dark.
+fn infinity_accent(dark_mode: bool) -> egui::Color32 {
+    if dark_mode {
+        egui::Color32::from_rgb(0x22, 0xD3, 0xEE)
+    } else {
+        egui::Color32::from_rgb(0x0E, 0x74, 0x90)
+    }
+}
+
 impl GuiApp {
     /// Fonts + text sizes + theme, set up once. Returns whether a CJK
     /// font was found. Shared by `new` and the render test constructor.
     fn setup_visuals(cc: &eframe::CreationContext<'_>) -> bool {
         cc.egui_ctx.set_theme(egui::ThemePreference::System);
+        cc.egui_ctx
+            .set_visuals_of(egui::Theme::Dark, branded_visuals(egui::Theme::Dark));
+        cc.egui_ctx
+            .set_visuals_of(egui::Theme::Light, branded_visuals(egui::Theme::Light));
         cc.egui_ctx.all_styles_mut(|style| {
             style.text_styles = [
                 (
@@ -612,8 +708,37 @@ impl GuiApp {
         if !app.font_ok {
             app.log_warn("未找到系统里的中文字体，中文可能显示为方框。".to_string());
         }
-        // Fetch the live node list in the background.
-        app.start_fetch(cc.egui_ctx.clone());
+        // No config file at all (fresh folder, e.g. a new portable
+        // version unzipped next to the old one): say so once, and tell
+        // the user how to carry their settings over. The portable
+        // storage design is unchanged — config stays next to the exe.
+        if app.config_path.is_none() {
+            app.log_line(
+                "未找到 config.toml：如从旧版升级，把旧文件夹里的 config.toml 与 nodes_cache.json 复制到新版 exe 旁边即可保留设置。"
+                    .to_string(),
+            );
+        }
+        // No auto-refresh on startup: a refresh with the front proxy
+        // off once hung for 85 s (direct fetch to vpngate.net, no
+        // timeout). Load the cached list if there is one, else the
+        // bundled 28 — no network at all — and let the user refresh
+        // manually. `start_fetch` is still what the 刷新节点 button
+        // runs; only the startup call is gone.
+        let (nodes, cache_age) = vpngate::fallback_nodes();
+        let source = if cache_age.is_some() {
+            vpngate::NodeListSource::Cache
+        } else {
+            vpngate::NodeListSource::Curated
+        };
+        let n = nodes.len();
+        app.nodes = nodes;
+        app.nodes_source = source.label(n, cache_age);
+        let loaded = format!(
+            "已加载{}。点右上角“刷新节点”获取最新。",
+            app.nodes_source
+        );
+        app.status = loaded.clone();
+        app.log_line(loaded);
         app
     }
 
@@ -840,6 +965,20 @@ impl GuiApp {
         });
     }
 
+    /// Spawn a background task. No-ops when there is no tokio runtime
+    /// (the kittest harness has none): the busy flag stays set and the
+    /// caller observes it, which is exactly what the shortcut tests
+    /// assert. Production always runs inside the runtime `main`
+    /// creates (`rt.enter()`), so this never skips there.
+    fn spawn_task<F>(f: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(f);
+        }
+    }
+
     fn start_probe(&mut self, ctx: egui::Context) {
         let Some(i) = self.selected else { return };
         let Some(node) = self.nodes.get(i) else {
@@ -877,7 +1016,7 @@ impl GuiApp {
         let tx = self.event_tx.clone();
         let connector = self.connector();
         let timeout = self.timeout();
-        tokio::spawn(async move {
+        Self::spawn_task(async move {
             let res = probe_flow(&connector, &target_str, timeout).await;
             let _ = tx.send(GuiEvent::Probe {
                 host: target,
@@ -939,7 +1078,7 @@ impl GuiApp {
         let timeout = self.timeout();
         let system_proxy = self.system_proxy;
         let service = self.config.system_proxy.service.clone();
-        tokio::spawn(async move {
+        Self::spawn_task(async move {
             match connect_flow(
                 connector,
                 target.clone(),
@@ -1237,6 +1376,81 @@ impl GuiApp {
             None => n.host.clone(),
         })
     }
+
+    /// Node indices in display order: fetch order by default, or
+    /// sorted by country name (hostname breaks ties) once the user
+    /// has clicked the 国家/地区 header. A refresh replaces
+    /// `self.nodes` and the sort re-applies automatically, since the
+    /// order is computed here, not stored.
+    fn display_indices(&self) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..self.nodes.len()).collect();
+        if let Some(dir) = self.country_sort {
+            idx.sort_by(|&a, &b| {
+                let (na, nb) = (&self.nodes[a], &self.nodes[b]);
+                let ord = na
+                    .country
+                    .cmp(&nb.country)
+                    .then_with(|| na.host.cmp(&nb.host));
+                match dir {
+                    SortDir::Asc => ord,
+                    SortDir::Desc => ord.reverse(),
+                }
+            });
+        }
+        idx
+    }
+
+    /// Host of the currently connected node, if any (the `node_label`
+    /// is the target string, "host" or "host:port", with the DDNS
+    /// suffix already completed). The status column shows ∞ for the
+    /// node whose completed host matches this.
+    fn connected_node_host(&self) -> Option<String> {
+        let label = self.conn.as_ref()?.node_label.clone();
+        let host = match label.rsplit_once(':') {
+            Some((h, p))
+                if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                h.to_string()
+            }
+            _ => label,
+        };
+        Some(host)
+    }
+
+    /// Keyboard shortcuts (Enter = connect, Ctrl+R = probe): the pure
+    /// guard half, unit-testable. `enter` / `ctrl_r` are whether the
+    /// key was pressed this frame; `text_edit_focused` is whether a
+    /// text field (manual-add, port, front-proxy address…) has focus
+    /// — typing there must never trigger a connect or a probe.
+    fn shortcut_action(
+        &self,
+        enter: bool,
+        ctrl_r: bool,
+        text_edit_focused: bool,
+    ) -> Option<ShortcutAction> {
+        if text_edit_focused
+            || self.show_about
+            || self.conn.is_some()
+            || self.busy.is_some()
+            || self.selected.is_none()
+        {
+            return None;
+        }
+        if enter {
+            Some(ShortcutAction::Connect)
+        } else if ctrl_r {
+            Some(ShortcutAction::Probe)
+        } else {
+            None
+        }
+    }
+}
+
+/// What a keyboard shortcut asks for (see `shortcut_action`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortcutAction {
+    Connect,
+    Probe,
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,6 +1465,27 @@ impl eframe::App for GuiApp {
         // Escape closes the About window.
         if self.show_about && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
             self.show_about = false;
+        }
+        // Keyboard shortcuts on the node list: Enter connects the
+        // selected node, Ctrl+R probes it (same flows as the buttons).
+        // `text_edit_focused` covers the manual-add, port and
+        // front-proxy fields — typing there must not trigger anything.
+        // A focused row also fires its own `clicked()` on Enter (egui
+        // activates focused click widgets with Enter/Space); that only
+        // re-selects the same row, and the busy guard below blocks a
+        // second connect/probe from a focused button in the same frame.
+        let ctx = ui.ctx().clone();
+        let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let ctrl_r = ctx.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::R,
+            ))
+        });
+        match self.shortcut_action(enter, ctrl_r, ctx.text_edit_focused()) {
+            Some(ShortcutAction::Connect) => self.start_connect(ctx),
+            Some(ShortcutAction::Probe) => self.start_probe(ctx),
+            None => {}
         }
         // Quitting while connected disconnects first (no confirm needed).
         if ui.ctx().input(|i| i.viewport().close_requested()) {
@@ -1344,48 +1579,67 @@ impl eframe::App for GuiApp {
             });
             ui.separator();
 
-            // Node list (4 columns; host:port merged so the grid fits a
-            // 560 px window — hostnames alone are ~200 px wide).
-            // Each row: (country, isp, host:port shown, status, host:port full).
-            let rows: Vec<(String, String, String, String, String)> = self
-                .nodes
-                .iter()
-                .map(|n| {
-                    let status = self
-                        .probes
-                        .get(&n.host)
-                        .cloned()
-                        .unwrap_or_else(|| "未探测".to_string());
-                    let full = match n.port {
-                        Some(p) => format!("{}:{}", n.host, p),
-                        None => n.host.clone(),
-                    };
-                    (
-                        // Full text here: the cells truncate with "…" to
-                        // the current column width (see below), so
-                        // widening a column shows more instead of a
-                        // fixed 12/14-character cut.
-                        n.country.clone(),
-                        if n.isp.is_empty() { n.name.clone() } else { n.isp.clone() },
-                        // All curated hosts end in .opengw.net; drop the
-                        // suffix for display (full host is in the tooltip).
-                        match n.port {
-                            Some(p) => format!(
-                                "{}:{}",
-                                n.host.strip_suffix(".opengw.net").unwrap_or(&n.host),
-                                p
-                            ),
-                            None => n
-                                .host
-                                .strip_suffix(".opengw.net")
-                                .unwrap_or(&n.host)
-                                .to_string(),
-                        },
-                        status,
-                        full,
-                    )
-                })
-                .collect();
+            // Node list (5 columns: a fixed 28 px status column with ∞
+            // for the connected node, then country / ISP / host:port /
+            // latency-status; host:port merged so the grid fits a 560 px
+            // window — hostnames alone are ~200 px wide).
+            // Each row: (node index, status icon, country, isp,
+            // host:port shown, status, host:port full). Rows are built
+            // in display order (see display_indices): fetch order by
+            // default, or sorted by country once the user clicks the
+            // 国家/地区 header. `selected` still stores a node index.
+            let connected_host = self.connected_node_host();
+            let rows: Vec<(usize, String, String, String, String, String, String)> =
+                self.display_indices()
+                    .into_iter()
+                    .map(|idx| {
+                        let n = &self.nodes[idx];
+                        let status = self
+                            .probes
+                            .get(&n.host)
+                            .cloned()
+                            .unwrap_or_else(|| "未探测".to_string());
+                        let full = match n.port {
+                            Some(p) => format!("{}:{}", n.host, p),
+                            None => n.host.clone(),
+                        };
+                        let status_icon =
+                            if connected_host.as_deref().is_some_and(|h| {
+                                vpngate::complete_ddns_host(&n.host) == h
+                            }) {
+                                "∞".to_string()
+                            } else {
+                                String::new()
+                            };
+                        (
+                            idx,
+                            status_icon,
+                            // Full text here: the cells truncate with "…"
+                            // to the current column width (see below), so
+                            // widening a column shows more instead of a
+                            // fixed 12/14-character cut.
+                            n.country.clone(),
+                            if n.isp.is_empty() { n.name.clone() } else { n.isp.clone() },
+                            // All curated hosts end in .opengw.net; drop
+                            // the suffix for display (full host is in
+                            // the tooltip).
+                            match n.port {
+                                Some(p) => format!(
+                                    "{}:{}",
+                                    n.host.strip_suffix(".opengw.net").unwrap_or(&n.host),
+                                    p
+                                ),
+                                None => n
+                                    .host
+                                    .strip_suffix(".opengw.net")
+                                    .unwrap_or(&n.host)
+                                    .to_string(),
+                            },
+                            status,
+                            full,
+                        )
+                    })
+                    .collect();
             let list_h = (panel_h - 250.0).max(120.0);
             if rows.is_empty() {
                 ui.label("还没有节点。点右上角“刷新节点”，或在下面“高级设置”里手动添加。");
@@ -1401,21 +1655,61 @@ impl eframe::App for GuiApp {
                         egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
                     )
                     .show(ui, |ui| {
-                        // Tighter gaps so the four columns fit a 560 px
+                        // Tighter gaps so the columns fit a 560 px
                         // window at the default widths.
                         ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
-                        let widths: [f32; 4] = self.col_widths.map(|w| w as f32);
-                        let row_h = 22.0;
-                        // One row is 4 cells + 3 six-pixel separators +
-                        // the 6 gaps between the 7 items.
+                        // Status column (∞) is fixed 28 px and never
+                        // resizable; the other four come from config.
+                        const STATUS_COL_W: f32 = 28.0;
+                        let widths: [f32; 5] = [
+                            STATUS_COL_W,
+                            self.col_widths[0] as f32,
+                            self.col_widths[1] as f32,
+                            self.col_widths[2] as f32,
+                            self.col_widths[3] as f32,
+                        ];
+                        // 30 px rows: 22 px was easy to miss, and a
+                        // click that drifts a few pixels is lost to the
+                        // scroll drag (see the tolerant-click note in
+                        // the row loop below).
+                        let row_h = 30.0;
+                        // One row is 5 cells + 4 six-pixel separators +
+                        // the 8 gaps between the 9 items. The status
+                        // column has no separator (its gap is the same
+                        // width, so the columns stay aligned).
                         let handle_w = 6.0f32;
                         let gap = ui.spacing().item_spacing.x;
                         let total_w =
-                            widths.iter().sum::<f32>() + 3.0 * handle_w + 6.0 * gap;
+                            widths.iter().sum::<f32>() + 4.0 * handle_w + 8.0 * gap;
+                        // Rows span the full available width, not just
+                        // the columns: at 800 px the old 554 px rows
+                        // left ~200 px of dead space on the right of
+                        // every row, and clicks there selected nothing.
+                        let row_w = total_w.max(ui.available_width());
+                        // Manual click tolerance: record the press
+                        // position (frame-level) so the row loop can
+                        // accept a press-and-release on the same row
+                        // within 12 px — egui's own click needs under
+                        // 6 px of movement (max_click_dist), and a real
+                        // mouse easily drifts past that.
+                        let (pressed, released, ptr_pos) = ui.input(|i| {
+                            (
+                                i.pointer.any_pressed(),
+                                i.pointer.any_released(),
+                                i.pointer.interact_pos(),
+                            )
+                        });
+                        if pressed {
+                            self.row_press_pos = ptr_pos;
+                        }
                         // Header row: labels plus a draggable separator
-                        // after each column but the last. Dragging resizes
-                        // that column (40–400 px); the width is remembered
-                        // in the settings and auto-saved to config.toml.
+                        // after each resizable column but the last.
+                        // Dragging resizes that column (40–400 px); the
+                        // width is remembered in the settings and
+                        // auto-saved to config.toml. The status column
+                        // (index 0) has an empty header and no
+                        // separator; the country column (index 1) is
+                        // clickable to sort A-Z / Z-A (see below).
                         // NOTE: the cells are placed at exact rects (like
                         // the data rows below), not via
                         // allocate_ui_with_layout: that advances the parent
@@ -1425,14 +1719,17 @@ impl eframe::App for GuiApp {
                         // drift out of line with the data columns.
                         // Handles get explicit stable ids (not auto ids).
                         let (header_rect, _) = ui.allocate_exact_size(
-                            egui::vec2(total_w, row_h),
+                            egui::vec2(row_w, row_h),
                             egui::Sense::hover(),
                         );
+                        let country_label = match self.country_sort {
+                            None => "国家/地区".to_string(),
+                            Some(dir) => format!("国家/地区 {}", dir.arrow()),
+                        };
+                        let header_labels =
+                            ["", country_label.as_str(), "运营商", "主机:端口", "延迟/状态"];
                         let mut x = header_rect.left();
-                        for (i, label) in ["国家/地区", "运营商", "主机:端口", "延迟/状态"]
-                            .iter()
-                            .enumerate()
-                        {
+                        for (i, label) in header_labels.iter().enumerate() {
                             let cell_rect = egui::Rect::from_min_size(
                                 egui::pos2(x, header_rect.top()),
                                 egui::vec2(widths[i], row_h),
@@ -1442,41 +1739,69 @@ impl eframe::App for GuiApp {
                                 cell_rect,
                                 egui::RichText::new(*label).strong(),
                             );
-                            x += widths[i];
-                            if i < 3 {
-                                x += gap;
-                                let handle_rect = egui::Rect::from_min_size(
-                                    egui::pos2(x, header_rect.top()),
-                                    egui::vec2(handle_w, row_h),
-                                );
-                                let resp = ui.interact(
-                                    handle_rect,
-                                    egui::Id::new(("node_col_sep", i)),
-                                    egui::Sense::drag(),
-                                );
-                                let active = resp.hovered() || resp.dragged();
-                                // Apply the per-frame delta while
-                                // dragging, and also on release: a
-                                // drag whose pointer only moved in the
-                                // release event still carries its delta
-                                // then (kittest teleports this way).
-                                if resp.dragged() || resp.drag_stopped() {
-                                    self.col_widths[i] = (self.col_widths[i] as f32
-                                        + resp.drag_delta().x)
-                                        .clamp(40.0, 400.0)
-                                        as u16;
+                            // Country header: click toggles A-Z / Z-A.
+                            // The label is drawn first and the interact
+                            // sits on top of it (a Label has no sense,
+                            // so it cannot eat the click).
+                            if i == 1 {
+                                let resp = ui
+                                    .interact(
+                                        cell_rect,
+                                        egui::Id::new("sort_country"),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text("点击按国家排序（A-Z / Z-A 切换）");
+                                if resp.clicked() {
+                                    self.country_sort = Some(match self.country_sort {
+                                        None | Some(SortDir::Desc) => SortDir::Asc,
+                                        Some(SortDir::Asc) => SortDir::Desc,
+                                    });
                                 }
-                                let stroke = if active {
-                                    ui.visuals().widgets.active.bg_stroke
-                                } else {
-                                    ui.visuals().widgets.noninteractive.bg_stroke
-                                };
-                                ui.painter().vline(
-                                    handle_rect.center().x,
-                                    handle_rect.y_range(),
-                                    stroke,
-                                );
-                                resp.on_hover_cursor(egui::CursorIcon::ResizeColumn);
+                            }
+                            x += widths[i];
+                            if i < 4 {
+                                x += gap;
+                                // Separator after the country, ISP and
+                                // host columns only (indices 1..=3 in
+                                // the 5-column layout); the status
+                                // column keeps the same gap but no
+                                // handle, and the last column has none.
+                                if (1..=3).contains(&i) {
+                                    let handle_rect = egui::Rect::from_min_size(
+                                        egui::pos2(x, header_rect.top()),
+                                        egui::vec2(handle_w, row_h),
+                                    );
+                                    let resp = ui.interact(
+                                        handle_rect,
+                                        egui::Id::new(("node_col_sep", i - 1)),
+                                        egui::Sense::drag(),
+                                    );
+                                    let active = resp.hovered() || resp.dragged();
+                                    // Apply the per-frame delta while
+                                    // dragging, and also on release: a
+                                    // drag whose pointer only moved in the
+                                    // release event still carries its delta
+                                    // then (kittest teleports this way).
+                                    if resp.dragged() || resp.drag_stopped() {
+                                        self.col_widths[i - 1] =
+                                            (self.col_widths[i - 1] as f32
+                                                + resp.drag_delta().x)
+                                                .clamp(40.0, 400.0)
+                                                as u16;
+                                    }
+                                    let stroke = if active {
+                                        ui.visuals().widgets.active.bg_stroke
+                                    } else {
+                                        ui.visuals().widgets.noninteractive.bg_stroke
+                                    };
+                                    ui.painter().vline(
+                                        handle_rect.center().x,
+                                        handle_rect.y_range(),
+                                        stroke,
+                                    );
+                                    resp.on_hover_cursor(egui::CursorIcon::ResizeColumn);
+                                }
                                 x += handle_w + gap;
                             }
                         }
@@ -1484,33 +1809,72 @@ impl eframe::App for GuiApp {
                         // truncates with "…" to the current column width,
                         // and widening a column shows more of it (the
                         // horizontal scroll bar reveals the rest).
-                        for (i, (country, isp, hostport, status, full)) in
+                        // The row rect spans the full available width
+                        // (row_w, not just total_w) so clicks on the
+                        // empty right part of a row still select it.
+                        for (display_i, (node_idx, status_icon, country, isp, hostport, status, full)) in
                             rows.iter().enumerate()
                         {
                             let (row_rect, row_resp) = ui.allocate_exact_size(
-                                egui::vec2(total_w, row_h),
+                                egui::vec2(row_w, row_h),
                                 egui::Sense::click(),
                             );
-                            let fill = if self.selected == Some(i) {
+                            let selected = self.selected == Some(*node_idx);
+                            let fill = if selected {
                                 ui.visuals().selection.bg_fill
-                            } else if i % 2 == 0 {
+                            } else if row_resp.hovered() {
+                                ui.visuals().widgets.hovered.bg_fill
+                            } else if display_i % 2 == 0 {
                                 ui.visuals().faint_bg_color
                             } else {
                                 egui::Color32::TRANSPARENT
                             };
                             ui.painter().rect_filled(row_rect, 0.0, fill);
+                            // Selected-row text goes white (the indigo
+                            // fill would swallow the default ink text).
+                            let sel_text = ui.visuals().selection.stroke.color;
+                            let cell_text = |t: &str| {
+                                if selected {
+                                    egui::RichText::new(t).color(sel_text)
+                                } else {
+                                    egui::RichText::new(t)
+                                }
+                            };
                             // Place each cell label at its exact rect
                             // (egui 0.36 has no allocate_ui_at_rect).
-                            let cells = [country, isp, hostport, status];
+                            let cells = [status_icon, country, isp, hostport, status];
                             let mut x = row_rect.left();
                             for (j, text) in cells.iter().enumerate() {
                                 let cell_rect = egui::Rect::from_min_size(
                                     egui::pos2(x, row_rect.top()),
                                     egui::vec2(widths[j], row_h),
                                 );
-                                put_cell_label(ui, cell_rect, *text);
+                                if j == 0 {
+                                    // Status column: the ∞ mark for the
+                                    // connected node, centred in the
+                                    // 28 px cell, slightly larger than
+                                    // body text so the glyph reads at
+                                    // 30 px row height. (The glyph's
+                                    // rendering is verified by the
+                                    // render_infinity_glyph test — the
+                                    // system CJK font must carry U+221E.)
+                                    let accent =
+                                        infinity_accent(ui.visuals().dark_mode);
+                                    let color = if selected { sel_text } else { accent };
+                                    ui.put(
+                                        cell_rect,
+                                        egui::Label::new(
+                                            egui::RichText::new(text.as_str())
+                                                .size(17.0)
+                                                .color(color),
+                                        )
+                                        .halign(egui::Align::Center),
+                                    );
+                                } else {
+                                    put_cell_label(ui, cell_rect, cell_text(text));
+                                }
                                 x += widths[j];
-                                if j < 3 {
+                                if j < 4 {
                                     // Gap, separator, gap — the same
                                     // symmetric spacing as the header row.
                                     x += gap + handle_w + gap;
@@ -1522,8 +1886,30 @@ impl eframe::App for GuiApp {
                                 .on_hover_text(full)
                                 .on_hover_cursor(egui::CursorIcon::PointingHand);
                             if row_resp.clicked() {
-                                self.selected = Some(i);
+                                self.selected = Some(*node_idx);
                             }
+                            // Tolerant click: egui only counts a click
+                            // when the pointer moves under 6 px, and a
+                            // press that drifts further becomes a scroll
+                            // drag instead — so a press and a release on
+                            // the same row within 12 px also selects it.
+                            // (The press position was recorded above the
+                            // row loop, on the press frame.)
+                            if released {
+                                if let (Some(origin), Some(pos)) =
+                                    (self.row_press_pos, ptr_pos)
+                                {
+                                    if origin.distance(pos) < 12.0
+                                        && row_rect.contains(origin)
+                                        && row_rect.contains(pos)
+                                    {
+                                        self.selected = Some(*node_idx);
+                                    }
+                                }
+                            }
+                        }
+                        if released {
+                            self.row_press_pos = None;
                         }
                     });
             }
@@ -1549,6 +1935,7 @@ impl eframe::App for GuiApp {
                     .min_size(btn_size);
                     if ui
                         .add_enabled(can_act, connect)
+                        .on_hover_text("连接选中节点（回车）")
                         .on_disabled_hover_text(if self.selected.is_none() {
                             "请先在上面选择一个节点"
                         } else {
@@ -1561,6 +1948,7 @@ impl eframe::App for GuiApp {
                 }
                 if ui
                     .add_enabled(can_act, egui::Button::new("探测").min_size(btn_size))
+                    .on_hover_text("探测选中节点（Ctrl+R）")
                     .on_disabled_hover_text(if self.selected.is_none() {
                         "请先在上面选择一个节点"
                     } else {
@@ -1864,6 +2252,144 @@ mod tests {
         assert!(parse_manual_target("host:70000", 28).is_err());
         assert!(parse_manual_target("host:notaport", 28).is_err());
         assert!(parse_manual_target("99", 28).is_err());
+    }
+
+    fn node_in(host: &str, country: &str) -> Node {
+        let mut n = node(host);
+        n.country = country.to_string();
+        n
+    }
+
+    #[test]
+    fn country_sort_orders_by_country_then_host() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_in("b.opengw.net", "美国"),
+            node_in("a.opengw.net", "日本"),
+            node_in("c.opengw.net", "日本"),
+            node_in("d.opengw.net", "德国"),
+        ];
+        // Default: fetch order, no sorting.
+        assert_eq!(app.display_indices(), vec![0, 1, 2, 3]);
+        app.country_sort = Some(SortDir::Asc);
+        // Chinese names sort by string (Unicode code-point) order:
+        // 德国 U+5FB7 < 日本 U+65E5 < 美国 U+7F8E; same-country rows
+        // break ties by hostname (a before c).
+        assert_eq!(app.display_indices(), vec![3, 1, 2, 0]);
+        app.country_sort = Some(SortDir::Desc);
+        assert_eq!(app.display_indices(), vec![0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn country_sort_survives_refresh() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_in("b.opengw.net", "美国"),
+            node_in("a.opengw.net", "日本"),
+        ];
+        app.country_sort = Some(SortDir::Asc);
+        assert_eq!(app.display_indices(), vec![1, 0]);
+        app.apply_event(GuiEvent::Nodes(vpngate::NodeListUpdate {
+            nodes: vec![
+                node_in("z.opengw.net", "美国"),
+                node_in("y.opengw.net", "德国"),
+            ],
+            source: vpngate::NodeListSource::Api,
+            cache_age_secs: None,
+            api_error: None,
+            web_error: None,
+        }));
+        // New list, same chosen direction (德国 < 美国).
+        assert_eq!(app.country_sort, Some(SortDir::Asc));
+        assert_eq!(app.display_indices(), vec![1, 0]);
+    }
+
+    #[test]
+    fn shortcut_action_guards() {
+        let mut app = GuiApp::for_tests();
+        // Nothing selected: neither shortcut fires.
+        assert_eq!(app.shortcut_action(true, false, false), None);
+        assert_eq!(app.shortcut_action(false, true, false), None);
+        app.selected = Some(0);
+        assert_eq!(
+            app.shortcut_action(true, false, false),
+            Some(ShortcutAction::Connect),
+            "Enter connects the selected node"
+        );
+        assert_eq!(
+            app.shortcut_action(false, true, false),
+            Some(ShortcutAction::Probe),
+            "Ctrl+R probes the selected node"
+        );
+        assert_eq!(
+            app.shortcut_action(true, true, false),
+            Some(ShortcutAction::Connect),
+            "Enter wins when both are pressed"
+        );
+        // A text field has focus: typing must never trigger either.
+        assert_eq!(app.shortcut_action(true, false, true), None);
+        assert_eq!(app.shortcut_action(false, true, true), None);
+        // Busy or About open: blocked.
+        app.busy = Some(Busy::Fetching);
+        assert_eq!(app.shortcut_action(true, false, false), None);
+        app.busy = None;
+        app.show_about = true;
+        assert_eq!(app.shortcut_action(true, false, false), None);
+        assert_eq!(app.shortcut_action(false, true, false), None);
+    }
+
+    #[test]
+    fn branded_visuals_meet_text_contrast() {
+        // WCAG contrast for the pairs a user actually reads: body
+        // text on the panel, white on the indigo selection fill, the
+        // cyan ∞ mark on the panel, error/warning text on the panel.
+        // The palette comment above `branded_visuals` states the
+        // expected ratios; this test pins them.
+        fn luminance(c: egui::Color32) -> f32 {
+            let f = |v: u8| {
+                let s = v as f32 / 255.0;
+                if s <= 0.04045 {
+                    s / 12.92
+                } else {
+                    ((s + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+        }
+        fn contrast(a: egui::Color32, b: egui::Color32) -> f32 {
+            let (l1, l2) = (luminance(a), luminance(b));
+            (l1.max(l2) + 0.05) / (l1.min(l2) + 0.05)
+        }
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            let v = branded_visuals(theme);
+            let text = v.override_text_color.expect("text colour set");
+            assert!(
+                contrast(text, v.panel_fill) >= 4.5,
+                "{theme:?} body text on panel: {:.2}",
+                contrast(text, v.panel_fill)
+            );
+            assert!(
+                contrast(egui::Color32::WHITE, v.selection.bg_fill) >= 4.5,
+                "{theme:?} white on selection: {:.2}",
+                contrast(egui::Color32::WHITE, v.selection.bg_fill)
+            );
+            let accent = infinity_accent(v.dark_mode);
+            assert!(
+                contrast(accent, v.panel_fill) >= 4.5,
+                "{theme:?} infinity accent on panel: {:.2}",
+                contrast(accent, v.panel_fill)
+            );
+            assert!(
+                contrast(v.error_fg_color, v.panel_fill) >= 4.5,
+                "{theme:?} error text on panel: {:.2}",
+                contrast(v.error_fg_color, v.panel_fill)
+            );
+            assert!(
+                contrast(v.warn_fg_color, v.panel_fill) >= 4.5,
+                "{theme:?} warning text on panel: {:.2}",
+                contrast(v.warn_fg_color, v.panel_fill)
+            );
+        }
     }
 
     #[test]
@@ -2332,24 +2858,27 @@ mod tests {
     }
 
     /// Render the smallest window (560x420) in both themes for visual
-    /// review, plus a 150% zoom render and scrolled-to-bottom renders
-    /// (they must show the end of 高级设置 and the log — that is the
-    /// outer-scroll fix being verified). Needs a wgpu adapter (software
-    /// lavapipe is enough); on a machine without one this test fails and
-    /// must be skipped, not faked.
+    /// review, plus the 800x600 window in both themes, a 150% zoom
+    /// render and scrolled-to-bottom renders (they must show the end
+    /// of 高级设置 and the log — that is the outer-scroll fix being
+    /// verified). Needs a wgpu adapter (software lavapipe is enough);
+    /// on a machine without one this test fails and must be skipped,
+    /// not faked.
     #[test]
     #[ignore = "renders PNGs for review; needs a graphics adapter"]
     fn render_for_review() {
         use egui_kittest::{kittest::Queryable, Harness};
-        for (theme, name, zoom, scrolled) in [
-            (egui::Theme::Dark, "dark", 1.0, false),
-            (egui::Theme::Light, "light", 1.0, false),
-            (egui::Theme::Dark, "dark-zoom150", 1.5, false),
-            (egui::Theme::Dark, "dark-scrolled", 1.0, true),
-            (egui::Theme::Light, "light-scrolled", 1.0, true),
+        for (theme, name, zoom, scrolled, w, h) in [
+            (egui::Theme::Dark, "dark", 1.0, false, 560.0, 420.0),
+            (egui::Theme::Light, "light", 1.0, false, 560.0, 420.0),
+            (egui::Theme::Dark, "dark-800x600", 1.0, false, 800.0, 600.0),
+            (egui::Theme::Light, "light-800x600", 1.0, false, 800.0, 600.0),
+            (egui::Theme::Dark, "dark-zoom150", 1.5, false, 560.0, 420.0),
+            (egui::Theme::Dark, "dark-scrolled", 1.0, true, 560.0, 420.0),
+            (egui::Theme::Light, "light-scrolled", 1.0, true, 560.0, 420.0),
         ] {
             let mut harness = Harness::builder()
-                .with_size(egui::vec2(560.0, 420.0))
+                .with_size(egui::vec2(w, h))
                 .with_theme(theme)
                 .build_eframe(|cc| {
                     if scrolled {
@@ -2514,5 +3043,204 @@ mod tests {
             before,
             after
         );
+    }
+
+    /// A plain click selects the row, and a press that drifts 8 px
+    /// (past egui's 6 px max_click_dist) and releases on the same row
+    /// still selects it — the tolerant-click fix for "rows are hard
+    /// to select". Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn row_click_selects_and_drag_tolerance_selects() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        // Taller than the 560x420 minimum so all three test rows (and
+        // the selected-row screenshot at the end) fit the list.
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        // Plain click on the 美国 row's country cell.
+        let cell = harness.get_by_label("美国");
+        let center = cell.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(
+            harness.state().selected,
+            Some(1),
+            "clicking a row must select it"
+        );
+        // Drag tolerance: press on the 德国 row, drift 8 px down
+        // (past egui's 6 px click limit), release on the same row.
+        // Vertical drift keeps the row rect still (no vertical
+        // overflow to scroll), so the release lands in the row.
+        let cell = harness.get_by_label("德国");
+        let start = cell.rect().center();
+        harness.drag_at(start);
+        harness.run();
+        let moved = egui::pos2(start.x, start.y + 8.0);
+        harness.hover_at(moved);
+        harness.run();
+        harness.drop_at(moved);
+        harness.run();
+        assert_eq!(
+            harness.state().selected,
+            Some(2),
+            "an 8 px press-drag-release on a row must still select it"
+        );
+        // Save a screenshot of the selected row for visual review
+        // (white text on the indigo selection fill).
+        let path = std::env::temp_dir().join("ui-review-selected-row.png");
+        harness
+            .render()
+            .expect("needs a graphics adapter")
+            .save(&path)
+            .unwrap();
+        eprintln!("{}", path.display());
+    }
+
+    /// Clicking the 国家/地区 header toggles the sort A-Z / Z-A.
+    /// Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn country_header_click_toggles_sort() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 420.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("b.opengw.net", "美国"),
+                    node_in("a.opengw.net", "日本"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        assert_eq!(harness.state().country_sort, None);
+        let header = harness.get_by_label("国家/地区");
+        let center = header.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(
+            harness.state().country_sort,
+            Some(SortDir::Asc),
+            "first header click sorts A-Z"
+        );
+        assert_eq!(
+            harness.state().display_indices(),
+            vec![1, 0],
+            "日本 before 美国 in A-Z order"
+        );
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(
+            harness.state().country_sort,
+            Some(SortDir::Desc),
+            "second header click sorts Z-A"
+        );
+        assert_eq!(harness.state().display_indices(), vec![0, 1]);
+    }
+
+    /// Enter connects the selected node and Ctrl+R probes it (the
+    /// same flows as the buttons). The harness has no tokio runtime,
+    /// so the background task is skipped and the busy flag stays set
+    /// — that is what is asserted. Needs a graphics adapter.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn keyboard_shortcuts_connect_and_probe() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 420.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![node_in("a.opengw.net", "日本")];
+                app
+            });
+        harness.run_steps(10);
+        // No selection yet: Enter must do nothing.
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(3);
+        assert!(harness.state().busy.is_none());
+        // Select the row, then Enter: connect starts.
+        let cell = harness.get_by_label("日本");
+        let center = cell.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(harness.state().selected, Some(0));
+        harness.key_press(egui::Key::Enter);
+        // run_steps, not run(): the spinner shown while busy requests
+        // a repaint every frame, so run() never settles.
+        harness.run_steps(3);
+        assert!(
+            matches!(harness.state().busy, Some(Busy::Connecting)),
+            "Enter must start a connect, busy={:?}",
+            harness.state().busy
+        );
+        // Reset the busy flag (the harness never clears it — no
+        // runtime, no background task), then Ctrl+R: probe starts.
+        harness.state_mut().busy = None;
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::R);
+        harness.run_steps(3);
+        assert!(
+            matches!(harness.state().busy, Some(Busy::Probing)),
+            "Ctrl+R must start a probe, busy={:?}",
+            harness.state().busy
+        );
+    }
+
+    /// The ∞ mark (U+221E) must render as a glyph, not a missing-glyph
+    /// box, in both themes, at the 17 pt size the status column uses.
+    /// The PNGs are the proof — check them, don't trust this test
+    /// alone (it only asserts the render pipeline ran).
+    #[test]
+    #[ignore = "renders PNGs for review; needs a graphics adapter"]
+    fn render_infinity_glyph() {
+        use egui_kittest::Harness;
+        struct GlyphApp;
+        impl eframe::App for GlyphApp {
+            fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("∞")
+                            .size(17.0)
+                            .color(infinity_accent(ui.visuals().dark_mode)),
+                    );
+                    ui.label(egui::RichText::new("∞ 已连接 public-vpn-192").size(15.0));
+                    ui.label("∞ ∞ ∞ — 17 pt / 15 pt: must be the infinity glyph, not a box.");
+                });
+            }
+        }
+        for (theme, name) in [(egui::Theme::Dark, "dark"), (egui::Theme::Light, "light")] {
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(320.0, 160.0))
+                .with_theme(theme)
+                .build_eframe(|cc| {
+                    GuiApp::setup_visuals(cc);
+                    GlyphApp
+                });
+            harness.run_steps(10);
+            let path = std::env::temp_dir().join(format!("ui-review-infinity-{name}.png"));
+            harness
+                .render()
+                .expect("needs a graphics adapter")
+                .save(&path)
+                .unwrap();
+            eprintln!("{}", path.display());
+        }
     }
 }

@@ -634,13 +634,14 @@ pub struct SstpTunnel {
 }
 
 impl SstpTunnel {
-    /// Establish a tunnel to `host:port` (direct or via front SOCKS5).
-    pub async fn connect(
+    /// TCP + TLS handshake only, no tasks spawned. The returned stream
+    /// is closed when dropped, so a losing candidate in a race leaves
+    /// nothing behind.
+    async fn handshake(
         connector: &Connector,
         host: &str,
         port: u16,
-        timeout: Duration,
-    ) -> Result<Arc<Self>, String> {
+    ) -> Result<Box<dyn crate::net::TlsStream>, String> {
         let tcp = connector
             .connect_tcp(host, port)
             .await
@@ -651,9 +652,21 @@ impl SstpTunnel {
         // SChannel HTTPS through the same front proxy worked, so the
         // difference is the TLS stack, not the proxy. SNI is still the
         // target hostname; verification stays off on every platform.
-        let tls = crate::net::accept_any_tls_connect(tcp, host)
+        crate::net::accept_any_tls_connect(tcp, host)
             .await
-            .map_err(|e| format!("TLS handshake to {}:{} failed: {}", host, port, e))?;
+            .map_err(|e| format!("TLS handshake to {}:{} failed: {}", host, port, e))
+    }
+
+    /// Second half of `connect`: split the TLS stream, run SSTP/PPP
+    /// establish under the remaining budget, then spawn the reader and
+    /// writer tasks. Only called for the race winner.
+    async fn establish(
+        tls: Box<dyn crate::net::TlsStream>,
+        connector: &Connector,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<Arc<Self>, String> {
         let (read_half, mut write_half) = tokio::io::split(tls);
         let mut reader = PacketReader::new(read_half);
         let vip = tokio::time::timeout(timeout, ppp_establish(&mut reader, &mut write_half, host))
@@ -710,6 +723,87 @@ impl SstpTunnel {
         Ok(tunnel)
     }
 
+    /// Establish a tunnel to `host:port` (direct or via front SOCKS5).
+    pub async fn connect(
+        connector: &Connector,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<Arc<Self>, String> {
+        let tls = Self::handshake(connector, host, port).await?;
+        Self::establish(tls, connector, host, port, timeout).await
+    }
+
+    /// Race all candidates' TCP+TLS handshakes in parallel under ONE
+    /// total deadline; the first success goes on to PPP establish with
+    /// the remaining time. A dead node used to cost one timeout per
+    /// candidate port in series (~20 s for three ports); now the whole
+    /// race costs about one timeout at most. Losers are aborted and
+    /// their streams dropped, so no leftover tasks remain. On total
+    /// failure the last error received is returned (or a timeout error
+    /// when nothing answered at all).
+    pub async fn connect_any(
+        connector: &Connector,
+        candidates: &[(String, u16)],
+        timeout: Duration,
+    ) -> Result<Arc<Self>, String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut set = tokio::task::JoinSet::new();
+        for (host, port) in candidates {
+            let c = connector.clone();
+            let h = host.clone();
+            let p = *port;
+            set.spawn(async move {
+                let r = Self::handshake(&c, &h, p).await;
+                (h, p, r)
+            });
+        }
+        let mut last_err = String::new();
+        let mut won: Option<(String, u16, Box<dyn crate::net::TlsStream>)> = None;
+        while !set.is_empty() {
+            match tokio::time::timeout_at(deadline, set.join_next()).await {
+                Ok(Some(Ok((host, port, Ok(tls))))) => {
+                    won = Some((host, port, tls));
+                    break;
+                }
+                Ok(Some(Ok((_, _, Err(e))))) => last_err = e,
+                Ok(Some(Err(_))) => {
+                    last_err = "候选连接任务异常结束".to_string();
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    if last_err.is_empty() {
+                        last_err = format!(
+                            "连接超时（{} 秒内无候选端口应答）",
+                            timeout.as_secs()
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        // Abort whatever is still hanging; their streams close on drop.
+        set.abort_all();
+        let (host, port, tls) = won.ok_or(last_err)?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        Self::establish(tls, connector, &host, port, remaining).await
+    }
+
+    /// Probe all candidates in parallel: returns the virtual IP and the
+    /// time the race took. Same failure classification as `probe` —
+    /// callers still distinguish "proxy down" from "node down" from
+    /// the error text.
+    pub async fn probe_any(
+        connector: &Connector,
+        candidates: &[(String, u16)],
+        timeout: Duration,
+    ) -> Result<(Ipv4Addr, Duration), String> {
+        let start = std::time::Instant::now();
+        let t = Self::connect_any(connector, candidates, timeout).await?;
+        let vip = t.vip;
+        Ok((vip, start.elapsed()))
+    }
+
     fn mark_dead(&self) {
         self.dead.store(true, Ordering::SeqCst);
     }
@@ -725,10 +819,7 @@ impl SstpTunnel {
         port: u16,
         timeout: Duration,
     ) -> Result<(Ipv4Addr, Duration), String> {
-        let start = std::time::Instant::now();
-        let t = Self::connect(connector, host, port, timeout).await?;
-        let vip = t.vip;
-        Ok((vip, start.elapsed()))
+        Self::probe_any(connector, &[(host.to_string(), port)], timeout).await
     }
 
     async fn handle_packet(&self, ctrl: bool, body: &[u8]) -> Result<(), String> {

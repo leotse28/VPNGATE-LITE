@@ -104,25 +104,26 @@ async fn connect_first(
     candidates: &[(String, u16)],
     timeout: Duration,
 ) -> Result<std::sync::Arc<sstp::SstpTunnel>, String> {
-    let mut last_err = String::new();
-    for (host, port) in candidates {
-        println!("connecting to {}:{} ...", host, port);
-        match sstp::SstpTunnel::connect(connector, host, *port, timeout).await {
-            Ok(t) => {
-                println!("tunnel up: {}:{} virtual IP {}", host, port, t.vip);
-                return Ok(t);
-            }
-            Err(e) => {
-                eprintln!("  failed: {}", e);
-                last_err = e;
-            }
+    // One race over all candidate ports (first success wins); a dead
+    // node costs about one timeout, not one per port in series.
+    println!(
+        "trying {} candidate(s) in parallel ...",
+        candidates.len()
+    );
+    match sstp::SstpTunnel::connect_any(connector, candidates, timeout).await {
+        Ok(t) => {
+            println!(
+                "tunnel up: {}:{} virtual IP {}",
+                t.host, t.port, t.vip
+            );
+            Ok(t)
         }
+        Err(e) => Err(format!(
+            "all {} candidate(s) failed; last error: {}",
+            candidates.len(),
+            e
+        )),
     }
-    Err(format!(
-        "all {} candidate(s) failed; last error: {}",
-        candidates.len(),
-        last_err
-    ))
 }
 
 async fn cmd_list(cli: &Cli, cfg: &Config, country: Option<String>, limit: usize) -> i32 {
@@ -200,18 +201,22 @@ async fn cmd_probe(cli: &Cli, cfg: &Config, target: &str) -> i32 {
     let connector = effective_connector(cfg, cli);
     let timeout = effective_timeout(cfg, cli);
     let candidates = vpngate::resolve_target(target);
-    for (host, port) in &candidates {
-        print!("probe {}:{} ... ", host, port);
-        match sstp::SstpTunnel::probe(&connector, host, *port, timeout).await {
-            Ok((vip, ms)) => {
-                println!("ALIVE virtual-ip={} in {}ms", vip, ms.as_millis());
-                return 0;
-            }
-            Err(e) => println!("dead: {}", e),
+    print!(
+        "probe {} ({} candidate(s) in parallel) ... ",
+        target,
+        candidates.len()
+    );
+    match sstp::SstpTunnel::probe_any(&connector, &candidates, timeout).await {
+        Ok((vip, ms)) => {
+            println!("ALIVE virtual-ip={} in {}ms", vip, ms.as_millis());
+            0
+        }
+        Err(e) => {
+            println!("dead: {}", e);
+            eprintln!("all candidates failed");
+            1
         }
     }
-    eprintln!("all candidates failed");
-    1
 }
 
 async fn cmd_test(cli: &Cli, cfg: &Config, target: &str) -> i32 {

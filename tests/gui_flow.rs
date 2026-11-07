@@ -60,6 +60,16 @@ fn ensure_cert() {
 }
 
 fn start_mock() -> Option<MockServer> {
+    // Reuse a mock that is already listening (another test in this
+    // binary may have started it; pkill would break it mid-test).
+    if std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:8443".parse().unwrap(),
+        Duration::from_millis(300),
+    )
+    .is_ok()
+    {
+        return Some(MockServer(None));
+    }
     // Clear any stale mock from an earlier run (pkill's own cmdline does
     // not contain "mock_sstp", so it cannot match itself here).
     let _ = Command::new("pkill").args(["-f", "mock_sstp.py"]).output();
@@ -89,12 +99,23 @@ async fn wait_for_port() -> bool {
     false
 }
 
+/// The mock SSTP server is shared by the tests in this binary, but
+/// its lifetime is tied to one test's `MockServer` handle: if the
+/// owner finishes first, its Drop kills the mock under the other
+/// test, and a parallel `start_mock` can pkill a mock that is just
+/// starting (or already in use). Serialize the mock-using tests
+/// instead — each holds this lock for its whole body, so the mock is
+/// never started twice at once and never killed mid-test.
+static MOCK_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 #[tokio::test]
 async fn gui_connect_flow_against_mock() {
     if !tool_exists("python3") || !tool_exists("openssl") {
         eprintln!("SKIP: python3/openssl not available; mock SSTP server cannot run");
         return;
     }
+    let _mock_guard = MOCK_LOCK.lock().await;
     let _mock = match start_mock() {
         Some(m) => m,
         None => {
@@ -175,4 +196,95 @@ async fn gui_connect_flow_against_mock() {
 
     serve.abort();
     drop(tunnel); // last tunnel ref: writer task shuts TLS down
+}
+
+/// A TCP listener that accepts and holds connections forever, never
+/// sending a byte — a hanging candidate port (a dead node whose TLS
+/// handshake never answers).
+fn black_hole_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || loop {
+        let Ok((s, _)) = listener.accept() else {
+            break;
+        };
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3600));
+            drop(s);
+        });
+    });
+    port
+}
+
+/// One candidate port answers (the mock SSTP server), the others hang:
+/// the parallel race must return the good one fast — a serial walk
+/// would burn the whole timeout on the hanging port listed first.
+/// Regression test for Leo's v3.2 log (dead-node probe ~20 s).
+#[tokio::test]
+async fn parallel_candidate_race_is_fast() {
+    if !tool_exists("python3") || !tool_exists("openssl") {
+        eprintln!("SKIP: python3/openssl not available; mock SSTP server cannot run");
+        return;
+    }
+    let _mock_guard = MOCK_LOCK.lock().await;
+    let _mock = match start_mock() {
+        Some(m) => m,
+        None => {
+            eprintln!("SKIP: could not start mock SSTP server");
+            return;
+        }
+    };
+    assert!(
+        wait_for_port().await,
+        "mock SSTP server did not listen on 8443"
+    );
+
+    let connector = Connector::new(None);
+    let timeout = Duration::from_secs(5);
+    // Hanging ports first: serial order would hang on them before
+    // ever reaching the mock.
+    let candidates = vec![
+        ("127.0.0.1".to_string(), black_hole_port()),
+        ("127.0.0.1".to_string(), black_hole_port()),
+        ("127.0.0.1".to_string(), 8443),
+    ];
+    let start = std::time::Instant::now();
+    let (vip, ms) = SstpTunnel::probe_any(&connector, &candidates, timeout)
+        .await
+        .expect("race must find the live mock port");
+    let elapsed = start.elapsed();
+    assert_eq!(vip.to_string(), "10.0.0.2", "mock assigns 10.0.0.2");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "parallel race must beat the 5 s timeout, took {:?} (probe said {} ms)",
+        elapsed,
+        ms.as_millis()
+    );
+}
+
+/// Every candidate hangs: the race must still return, within about
+/// one total timeout — not one timeout per candidate.
+#[tokio::test]
+async fn parallel_candidate_race_all_hanging_returns_within_timeout() {
+    let connector = Connector::new(None);
+    let timeout = Duration::from_secs(3);
+    let candidates = vec![
+        ("127.0.0.1".to_string(), black_hole_port()),
+        ("127.0.0.1".to_string(), black_hole_port()),
+        ("127.0.0.1".to_string(), black_hole_port()),
+    ];
+    let start = std::time::Instant::now();
+    let res = SstpTunnel::probe_any(&connector, &candidates, timeout).await;
+    let elapsed = start.elapsed();
+    assert!(res.is_err(), "all-hanging race must fail");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "three hanging candidates must cost about one 3 s timeout, took {:?}",
+        elapsed
+    );
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "the race must actually wait out the deadline, took {:?}",
+        elapsed
+    );
 }

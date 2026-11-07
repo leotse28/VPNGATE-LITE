@@ -18,7 +18,7 @@
 use crate::net::{https_get, Connector};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const API_URL: &str = "https://www.vpngate.net/api/iphone/";
 
@@ -451,29 +451,59 @@ pub fn pick_node_list(
 /// Full fallback chain: official API first, then the relay list page,
 /// then the local cache, then the bundled curated list. The last two
 /// never fail, so this always returns a list.
+/// Per-tier ceiling for a node-list fetch. `https_get` has no timeout
+/// of its own, so without this a refresh with the front proxy off (or
+/// a black-holed target) hangs for over a minute — Leo's v3.2 log
+/// showed 85 s on startup. 15 s per tier keeps a refresh bounded at
+/// ~30 s worst case while still leaving room for a slow proxy.
+pub const FETCH_TIER_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub async fn fetch_nodes_with_fallback(connector: &Connector) -> NodeListUpdate {
+    fetch_nodes_with_fallback_timeout(connector, FETCH_TIER_TIMEOUT).await
+}
+
+/// Testable core: the per-tier timeout is a parameter so tests can use
+/// a short one against a black-holed proxy instead of waiting 15 s.
+async fn fetch_nodes_with_fallback_timeout(
+    connector: &Connector,
+    tier_timeout: Duration,
+) -> NodeListUpdate {
     let mut api_error = None;
-    let api = match fetch_api_nodes(connector).await {
-        Ok(nodes) if !nodes.is_empty() => Some(nodes),
-        Ok(_) => {
+    let api = match tokio::time::timeout(tier_timeout, fetch_api_nodes(connector)).await {
+        Ok(Ok(nodes)) if !nodes.is_empty() => Some(nodes),
+        Ok(Ok(_)) => {
             api_error = Some("官方 API 返回了空列表".to_string());
             None
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             api_error = Some(e);
+            None
+        }
+        Err(_) => {
+            api_error = Some(format!(
+                "官方 API 拉取超时（{} 秒内无响应）",
+                tier_timeout.as_secs()
+            ));
             None
         }
     };
     let mut web_error = None;
     let web = if api.is_none() {
-        match fetch_web_nodes(connector).await {
-            Ok(nodes) if !nodes.is_empty() => Some(nodes),
-            Ok(_) => {
+        match tokio::time::timeout(tier_timeout, fetch_web_nodes(connector)).await {
+            Ok(Ok(nodes)) if !nodes.is_empty() => Some(nodes),
+            Ok(Ok(_)) => {
                 web_error = Some("网页抓取解析到 0 个节点".to_string());
                 None
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 web_error = Some(e);
+                None
+            }
+            Err(_) => {
+                web_error = Some(format!(
+                    "网页抓取超时（{} 秒内无响应）",
+                    tier_timeout.as_secs()
+                ));
                 None
             }
         }
@@ -789,6 +819,68 @@ mod tests {
         let (nodes, src, _) = pick_node_list(None, None, None);
         assert_eq!(src, NodeListSource::Curated);
         assert_eq!(nodes.len(), 28);
+    }
+
+    /// A black-holed front proxy (accepts TCP, never answers) must not
+    /// hang a refresh: each tier is capped, so the whole fallback
+    /// returns in about two tier timeouts with the timeout wording.
+    /// Regression test for Leo's v3.2 startup hang (85 s, no proxy).
+    #[tokio::test]
+    async fn fetch_fallback_bounds_black_holed_proxy() {
+        // Black hole: accept and hold, never send a byte.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    // Hold the socket open forever; the TLS/SOCKS5
+                    // handshake on it never completes.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    drop(s);
+                });
+            }
+        });
+        let mut fp = crate::config::FrontProxy::default();
+        fp.enabled = true;
+        fp.addr = format!("127.0.0.1:{}", port);
+        let connector = Connector::new(Some(fp));
+        let start = std::time::Instant::now();
+        let upd = fetch_nodes_with_fallback_timeout(
+            &connector,
+            Duration::from_secs(2),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "two 2 s tiers must finish well inside 8 s, took {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed >= Duration::from_secs(3),
+            "both tiers must actually run their timeouts, took {:?}",
+            elapsed
+        );
+        assert!(
+            matches!(upd.source, NodeListSource::Curated | NodeListSource::Cache),
+            "a timed-out fetch must fall back to a local list, got {:?}",
+            upd.source
+        );
+        assert!(
+            upd.api_error.as_deref().unwrap_or("").contains("超时"),
+            "API tier must report a timeout, got {:?}",
+            upd.api_error
+        );
+        assert!(
+            upd.web_error.as_deref().unwrap_or("").contains("超时"),
+            "web tier must report a timeout, got {:?}",
+            upd.web_error
+        );
     }
 }
 
