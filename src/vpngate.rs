@@ -275,6 +275,80 @@ fn row_operator_name(row: &str) -> String {
     String::new()
 }
 
+/// Parse the first number in `s` (digits with optional thousands
+/// commas and one decimal point, e.g. "1,234", "261.83") as f64.
+/// None when there is no digit at all. Used by the sessions /
+/// line-quality cells, whose numbers carry units ("会话", "Mbps",
+/// "ms") and thousands separators.
+fn first_number(s: &str) -> Option<f64> {
+    let mut buf = String::new();
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    for c in s.chars() {
+        match c {
+            '0'..='9' => {
+                buf.push(c);
+                seen_digit = true;
+            }
+            ',' if seen_digit => {
+                // Thousands separator inside a number: skip.
+            }
+            '.' if seen_digit && !seen_dot => {
+                buf.push(c);
+                seen_dot = true;
+            }
+            _ if seen_digit => break,
+            _ => {}
+        }
+    }
+    if !seen_digit {
+        return None;
+    }
+    buf.parse::<f64>().ok()
+}
+
+/// Sessions count from a relay-table row: the "VPN 会话数" cell
+/// (column 3 of the live page) reads like "285 会话 14 天" — the
+/// integer before "会话". 0 when the cell is missing, empty or has
+/// no number (unknown, not "zero sessions").
+fn row_sessions(row: &str) -> u64 {
+    let cells = row_cell_bodies(row);
+    let Some(cell) = cells.get(2) else {
+        return 0;
+    };
+    let text = strip_tags_collapse(cell);
+    let Some(i) = text.find("会话") else {
+        return 0;
+    };
+    first_number(&text[..i])
+        .map(|v| v.round() as u64)
+        .unwrap_or(0)
+}
+
+/// Line quality from a relay-table row: the "线路质量" cell
+/// (column 4) reads like "261.83 Mbps Ping: 8 ms ..." — speed is
+/// the number before "Mbps" (decimal, rounded to whole Mbps), ping
+/// the number after "Ping:" before "ms". (0, 0) when the cell is
+/// missing or unparsable; a missing Ping still yields the speed.
+fn row_line_quality(row: &str) -> (u64, u64) {
+    let cells = row_cell_bodies(row);
+    let Some(cell) = cells.get(3) else {
+        return (0, 0);
+    };
+    let text = strip_tags_collapse(cell);
+    let speed = text
+        .find("Mbps")
+        .and_then(|i| first_number(&text[..i]))
+        .map(|v| v.round() as u64)
+        .unwrap_or(0);
+    let ping = text
+        .find("Ping:")
+        .and_then(|i| first_number(&text[i + "Ping:".len()..]))
+        .map(|v| v.round() as u64)
+        .unwrap_or(0);
+    (speed, ping)
+}
+
 /// Is `host` a plausible VPNGate DDNS hostname? It must end in
 /// `.opengw.net` with every label alphanumeric-or-hyphen and non-empty.
 /// This accepts the `vpn<digits>` names, the `public-vpn-<n>` names
@@ -359,6 +433,8 @@ pub fn parse_web_page(html: &str) -> Vec<Node> {
         }
         let country = first_cell_text(row);
         let isp = row_operator_name(row);
+        let sessions = row_sessions(row);
+        let (speed_mbps, ping_ms) = row_line_quality(row);
         for (host, port) in extract_hosts(row) {
             // "opengw.net" on its own is not a relay (it is the domain
             // itself, not a DDNS hostname under it). `valid_ddns_host`
@@ -390,9 +466,9 @@ pub fn parse_web_page(html: &str) -> Vec<Node> {
                 isp: isp.clone(),
                 name: String::new(),
                 score: 0,
-                ping_ms: 0,
-                speed_mbps: 0,
-                sessions: 0,
+                ping_ms,
+                speed_mbps,
+                sessions,
                 ip: String::new(),
                 backups: Vec::new(),
                 port_source: "web-scrape".to_string(),
@@ -911,6 +987,105 @@ mod tests {
 <td>965,869</td></tr>
 <tr><td>Thailand</td><td><b>vpn216782972.opengw.net</b> 27.130.188.53</td><td></td></tr>
 </table></body></html>"#
+    }
+
+    #[test]
+    fn row_sessions_and_line_quality_edges() {
+        // Direct helper checks (rows are `<tr`-split fragments).
+        // The 10-column layout: cell 3 = VPN 会话数, cell 4 = 线路质量.
+        let row = |sessions: &str, quality: &str| {
+            format!(
+                "<td>Japan</td><td><b>x.opengw.net</b> 1.1.1.1</td><td>{}</td><td>{}</td>",
+                sessions, quality
+            )
+        };
+        assert_eq!(
+            row_sessions(&row("285 会话 14 天", "")),
+            285,
+            "integer before 会话"
+        );
+        assert_eq!(
+            row_sessions(&row("1,234 会话 30 天", "")),
+            1234,
+            "thousands comma in the count"
+        );
+        assert_eq!(row_sessions(&row("", "")), 0, "empty sessions cell");
+        assert_eq!(
+            row_sessions(&row("285", "")),
+            0,
+            "number without 会话 is not a session count"
+        );
+        assert_eq!(
+            row_sessions("<td>Japan</td><td><b>x.opengw.net</b></td>"),
+            0,
+            "row with no sessions cell at all"
+        );
+        assert_eq!(
+            row_line_quality(&row("", "261.83 Mbps Ping: 8 ms 日志策略: 两周")),
+            (262, 8),
+            "decimal speed rounds, ping after Ping:"
+        );
+        assert_eq!(
+            row_line_quality(&row("", "572.32 Mbps Ping: 3 ms")),
+            (572, 3),
+            "the doc example: 572M@3ms"
+        );
+        assert_eq!(
+            row_line_quality(&row("", "47.44 Mbps Ping: 26 ms")),
+            (47, 26),
+            "sub-50 Mbps rounds down"
+        );
+        assert_eq!(
+            row_line_quality(&row("", "1,024.5 Mbps Ping: 12 ms")),
+            (1025, 12),
+            "thousands comma in the speed"
+        );
+        assert_eq!(
+            row_line_quality(&row("", "670.44 Mbps 日志策略: 两周")),
+            (670, 0),
+            "speed without a Ping still parses"
+        );
+        assert_eq!(
+            row_line_quality(&row("", "")),
+            (0, 0),
+            "empty quality cell"
+        );
+        assert_eq!(
+            row_line_quality("<td>Japan</td><td><b>x.opengw.net</b></td>"),
+            (0, 0),
+            "row with no quality cell at all"
+        );
+    }
+
+    #[test]
+    fn parse_web_page_extracts_sessions_and_quality() {
+        // Same 10-column fixture as the operator test: sessions and
+        // line quality come from columns 3 and 4 of each row.
+        let nodes = parse_web_page(sample_relay_html_with_operator());
+        assert_eq!(nodes.len(), 5);
+        assert_eq!(nodes[0].host, "public-vpn-192.opengw.net");
+        assert_eq!(nodes[0].sessions, 285);
+        assert_eq!(nodes[0].speed_mbps, 262, "261.83 Mbps rounds to 262");
+        assert_eq!(nodes[0].ping_ms, 8);
+        assert_eq!(nodes[1].host, "vpn359610091.opengw.net");
+        assert_eq!(nodes[1].sessions, 70);
+        assert_eq!(nodes[1].speed_mbps, 195);
+        assert_eq!(nodes[1].ping_ms, 11);
+        assert_eq!(nodes[2].host, "vpn111222333.opengw.net");
+        assert_eq!(nodes[2].sessions, 127);
+        assert_eq!(nodes[2].speed_mbps, 149);
+        assert_eq!(nodes[2].ping_ms, 5);
+        assert_eq!(nodes[3].host, "vpn99990120.opengw.net");
+        assert_eq!(nodes[3].sessions, 68);
+        assert_eq!(nodes[3].speed_mbps, 670);
+        assert_eq!(nodes[3].ping_ms, 12);
+        // 3-column row with no sessions/quality cells: all zero
+        // (unknown), and host/country parsing is unaffected.
+        assert_eq!(nodes[4].host, "vpn216782972.opengw.net");
+        assert_eq!(nodes[4].sessions, 0);
+        assert_eq!(nodes[4].speed_mbps, 0);
+        assert_eq!(nodes[4].ping_ms, 0);
+        assert_eq!(nodes[4].country, "Thailand");
     }
 
     #[test]

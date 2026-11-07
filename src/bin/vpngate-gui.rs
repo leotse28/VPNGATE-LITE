@@ -10,6 +10,7 @@
 use eframe::egui;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,12 +32,43 @@ use vpngate_client::vpngate::{self, Node};
 enum Busy {
     Fetching,
     Probing,
+    ProbingAll,
     Connecting,
     Testing,
     TestingFrontProxy,
 }
 
-/// Country-column sort direction, toggled by clicking the 国家/地区
+/// Which node-list column the list is sorted by. Only the country,
+/// sessions (当前人数）, line-quality （线路质量） and latency/status
+/// （延迟/状态） columns are sortable; the status (∞), ISP and
+/// host:port columns are not. One column at a time: clicking a
+/// header sorts by that column and clears the previous column's
+/// arrow; clicking the same column again reverses the direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortCol {
+    Country,
+    Sessions,
+    Quality,
+    Latency,
+}
+
+impl SortCol {
+    /// First-click direction for the column — the most useful order:
+    /// countries A-Z, fewest sessions first (lightest load), fastest
+    /// line first (speed primary, ping secondary), and for latency
+    /// the available nodes by ms ascending, unprobed in the middle,
+    /// failed last (see `latency_key`).
+    fn default_dir(self) -> SortDir {
+        match self {
+            SortCol::Country => SortDir::Asc,
+            SortCol::Sessions => SortDir::Asc,
+            SortCol::Quality => SortDir::Desc,
+            SortCol::Latency => SortDir::Asc,
+        }
+    }
+}
+
+/// Country-column sort direction, toggled by clicking a sortable
 /// header. Chinese country names sort by string (Unicode code-point)
 /// order — deterministic, and same-country rows stay grouped — with
 /// the hostname as the tie-breaker.
@@ -47,7 +79,8 @@ enum SortDir {
 }
 
 impl SortDir {
-    /// Arrow shown in the 国家/地区 header for the current direction.
+    /// Arrow shown in the sorted column's header for the current
+    /// direction: ▲ = the column's first-click order, ▼ = reversed.
     fn arrow(self) -> &'static str {
         match self {
             SortDir::Asc => "▲",
@@ -56,11 +89,56 @@ impl SortDir {
     }
 }
 
+/// Sort key for the 线路质量 column: (has data, speed, ping
+/// reversed). No-data nodes (sessions, speed and ping all zero —
+/// the curated 28) count as smallest, so they sort first in
+/// ascending order and last in descending order, never mixed in
+/// with nodes that have data. Speed is primary, ping secondary:
+/// in the ascending key a larger ping sorts later (Reverse), so
+/// reversing the whole key (descending, the first click) is
+/// fastest-first with smaller ping first on ties, and ascending is
+/// slowest-first with larger ping first.
+fn quality_key(n: &vpngate::Node) -> (bool, u64, std::cmp::Reverse<u64>) {
+    let has_data = n.sessions != 0 || n.speed_mbps != 0 || n.ping_ms != 0;
+    (
+        has_data,
+        n.speed_mbps,
+        std::cmp::Reverse(n.ping_ms),
+    )
+}
+
+/// Does this node carry listed stats (sessions / speed / ping)?
+/// The curated 28 have all three zero — no data, not "zero
+/// sessions" or "zero speed".
+fn has_listed_stats(n: &vpngate::Node) -> bool {
+    n.sessions != 0 || n.speed_mbps != 0 || n.ping_ms != 0
+}
+
+/// 当前人数 cell: "47人" ("0人" for a node with data but zero
+/// sessions); "—" when the node carries no listed stats at all.
+fn sessions_cell(n: &vpngate::Node) -> String {
+    if has_listed_stats(n) {
+        format!("{}人", n.sessions)
+    } else {
+        "—".to_string()
+    }
+}
+
+/// 线路质量 cell: "572M@3ms" (speed Mbps @ ping ms); "—" with no data.
+fn quality_cell(n: &vpngate::Node) -> String {
+    if has_listed_stats(n) {
+        format!("{}M@{}ms", n.speed_mbps, n.ping_ms)
+    } else {
+        "—".to_string()
+    }
+}
+
 impl Busy {
     fn label(self) -> &'static str {
         match self {
             Busy::Fetching => "正在拉取节点列表…",
             Busy::Probing => "正在探测节点…",
+            Busy::ProbingAll => "正在探测全部节点…",
             Busy::Connecting => "正在连接…",
             Busy::Testing => "正在测试隧道…",
             Busy::TestingFrontProxy => "正在测试前置代理…",
@@ -100,6 +178,33 @@ enum GuiEvent {
     Probe {
         host: String,
         result: Result<(Ipv4Addr, Duration), ProbeFailure>,
+    },
+    /// Probe-all sweep: the task is about to probe `current` (the
+    /// (done+1)-th of `total`). The row shows "探测中…" and the
+    /// status line names it; the outcome still arrives as
+    /// `ProbeAllResult` below.
+    ProbeAllProgress {
+        current: String,
+        done: usize,
+        total: usize,
+    },
+    /// Probe-all sweep: one node's outcome. `done` counts this node.
+    ProbeAllResult {
+        host: String,
+        result: Result<(Ipv4Addr, Duration), ProbeFailure>,
+        done: usize,
+        total: usize,
+    },
+    /// Probe-all sweep finished: `stopped` means the user pressed
+    /// 停止 (or the front proxy went down, see `proxy_down`)
+    /// before the queue ran out; `ok`/`failed` count the nodes
+    /// actually probed.
+    ProbeAllDone {
+        total: usize,
+        ok: usize,
+        failed: usize,
+        stopped: bool,
+        proxy_down: bool,
     },
     Connected(Box<ActiveConnection>),
     ConnectFailed(String),
@@ -178,6 +283,74 @@ fn classify_probe_failure(last_err: String, proxy_tcp: Option<bool>) -> ProbeFai
         Some(false) => ProbeFailure::ProxyDown(last_err),
         _ => ProbeFailure::NodeDown(last_err),
     }
+}
+
+/// Probe every node in `targets` in order, one at a time (never in
+/// parallel — a dead node costs about one timeout, and 95 parallel
+/// handshakes would flood the front proxy). `targets` is the
+/// (raw host, dialled target) snapshot `probe_all_targets` took at
+/// click time. Sends a progress event before each probe and a
+/// result event after it, then a done event with the counts. Stops
+/// early when `stop` is set — checked before each probe and after
+/// each result, so a 停止 click lands after the node in flight —
+/// or when a probe fails because the front proxy is down (the rest
+/// would fail identically, one timeout each).
+async fn probe_all_flow(
+    connector: &Connector,
+    targets: Vec<(String, String)>,
+    timeout: Duration,
+    stop: Arc<AtomicBool>,
+    tx: mpsc::Sender<GuiEvent>,
+    ctx: egui::Context,
+) {
+    let total = targets.len();
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    let mut stopped = false;
+    let mut proxy_down = false;
+    for (i, (host, target)) in targets.into_iter().enumerate() {
+        if stop.load(Ordering::Relaxed) {
+            stopped = true;
+            break;
+        }
+        let _ = tx.send(GuiEvent::ProbeAllProgress {
+            current: host.clone(),
+            done: i,
+            total,
+        });
+        ctx.request_repaint();
+        let res = probe_flow(connector, &target, timeout).await;
+        match &res {
+            Ok(_) => ok += 1,
+            Err(ProbeFailure::ProxyDown(_)) => {
+                failed += 1;
+                proxy_down = true;
+            }
+            Err(ProbeFailure::NodeDown(_)) => failed += 1,
+        }
+        let _ = tx.send(GuiEvent::ProbeAllResult {
+            host,
+            result: res,
+            done: i + 1,
+            total,
+        });
+        ctx.request_repaint();
+        if proxy_down {
+            break;
+        }
+        if stop.load(Ordering::Relaxed) {
+            stopped = true;
+            break;
+        }
+    }
+    let _ = tx.send(GuiEvent::ProbeAllDone {
+        total,
+        ok,
+        failed,
+        stopped,
+        proxy_down,
+    });
+    ctx.request_repaint();
 }
 
 /// Test the front proxy itself: HTTPS GET to Google and to vpngate.net
@@ -471,7 +644,23 @@ struct GuiApp {
     nodes_source: String,
     selected: Option<usize>,
     probes: HashMap<String, String>,
+    /// Last successful probe latency per host (ms), parallel to
+    /// `probes`: the 延迟/状态 sort reads this number, never
+    /// re-parses the "N ms" display string. Set when a probe
+    /// succeeds, cleared when a probe starts (the row shows
+    /// "探测中…" then) or fails, so it never goes stale.
+    probe_ms: HashMap<String, u64>,
     busy: Option<Busy>,
+    /// Probe-all sweep state: the shared stop flag the 停止 button
+    /// sets (the background task checks it before/after each probe),
+    /// and the running counts shown in the progress line. `busy ==
+    /// ProbingAll` is the sweep-active flag; the counters are only
+    /// meaningful while it is set.
+    probe_all_stop: Arc<AtomicBool>,
+    probe_all_total: usize,
+    probe_all_done: usize,
+    probe_all_ok: usize,
+    probe_all_failed: usize,
     status: String,
     error: String,
     log: Vec<String>,
@@ -492,11 +681,13 @@ struct GuiApp {
     /// and is NOT in this array — it has no separator and is not
     /// resizable, so old config files keep loading as-is.
     col_widths: [u16; 4],
-    /// Country-column sort: `None` = fetch order (startup default),
-    /// `Some` = the direction the user picked by clicking the
-    /// 国家/地区 header. Kept across refreshes; session-only, not
-    /// persisted to config.toml.
-    country_sort: Option<SortDir>,
+    /// List sort: `None` = fetch order (startup default), `Some`
+    /// = (column, direction) the user picked by clicking a
+    /// sortable header （国家/地区 / 当前人数 / 线路质量 / 延迟/状态）.
+    /// Clicking a different column restarts at that column's
+    /// first-click direction (see `SortCol::default_dir`). Kept
+    /// across refreshes; session-only, not persisted to config.toml.
+    sort: Option<(SortCol, SortDir)>,
     /// Where the mouse was pressed while selecting a row (`None` when
     /// no press is in flight). egui only counts a click when the
     /// pointer moves under `max_click_dist` (6 px); a real mouse
@@ -553,7 +744,13 @@ impl Default for GuiApp {
             nodes_source: "内嵌列表（28 个已知节点）".to_string(),
             selected: None,
             probes: HashMap::new(),
+            probe_ms: HashMap::new(),
             busy: None,
+            probe_all_stop: Arc::new(AtomicBool::new(false)),
+            probe_all_total: 0,
+            probe_all_done: 0,
+            probe_all_ok: 0,
+            probe_all_failed: 0,
             status: "未连接".to_string(),
             error: String::new(),
             log: vec!["就绪。".to_string()],
@@ -567,7 +764,7 @@ impl Default for GuiApp {
             allow_lan: false,
             system_proxy: false,
             col_widths: vpngate_client::config::UiSettings::default().node_col_widths,
-            country_sort: None,
+            sort: None,
             row_press_pos: None,
             scroll_to_selected: false,
             node_list_scroll_y: 0.0,
@@ -1031,6 +1228,9 @@ impl GuiApp {
             self.status = format!("正在探测 {}…", target_str);
         }
         self.probes.insert(target.clone(), "探测中…".to_string());
+        // A re-probe must not keep the old latency: until this probe
+        // finishes, the node sorts with the unprobed group.
+        self.probe_ms.remove(&target);
         let tx = self.event_tx.clone();
         let connector = self.connector();
         let timeout = self.timeout();
@@ -1042,6 +1242,80 @@ impl GuiApp {
             });
             ctx.request_repaint();
         });
+    }
+
+    /// Snapshot of the nodes to probe, in display order (see
+    /// `display_indices`, so a sorted list sweeps in the shown
+    /// order): (raw host — the probes-map key — and the dialled
+    /// target string, host:port with the DDNS suffix completed, like
+    /// `start_probe` builds it). A snapshot, not indices: the list
+    /// can gain a manually-added node mid-sweep, which would shift
+    /// indices under a stored queue.
+    fn probe_all_targets(&self) -> Vec<(String, String)> {
+        self.display_indices()
+            .into_iter()
+            .filter_map(|i| {
+                let n = self.nodes.get(i)?;
+                let target = match n.port {
+                    Some(p) => format!("{}:{}", vpngate::complete_ddns_host(&n.host), p),
+                    None => vpngate::complete_ddns_host(&n.host),
+                };
+                Some((n.host.clone(), target))
+            })
+            .collect()
+    }
+
+    /// Start a probe-all sweep: every node in the list, in display
+    /// order, one at a time. Blocked when another job is running or
+    /// the list is empty (the button is disabled then too).
+    fn start_probe_all(&mut self, ctx: egui::Context) {
+        if self.busy.is_some() || self.nodes.is_empty() {
+            return;
+        }
+        let targets = self.probe_all_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let total = targets.len();
+        self.probe_all_stop.store(false, Ordering::Relaxed);
+        self.probe_all_total = total;
+        self.probe_all_done = 0;
+        self.probe_all_ok = 0;
+        self.probe_all_failed = 0;
+        self.busy = Some(Busy::ProbingAll);
+        self.status = format!("正在探测全部：0/{}…", total);
+        self.log_line(format!(
+            "开始探测全部：{} 个节点（按当前显示顺序，一个一个探测）。",
+            total
+        ));
+        // The first row shows "探测中…" right away; later rows get
+        // it from the ProbeAllProgress event before their probe.
+        if let Some((first, _)) = targets.first() {
+            self.probes.insert(first.clone(), "探测中…".to_string());
+            self.probe_ms.remove(first);
+        }
+        let tx = self.event_tx.clone();
+        let connector = self.connector();
+        let timeout = self.timeout();
+        let stop = self.probe_all_stop.clone();
+        Self::spawn_task(async move {
+            probe_all_flow(&connector, targets, timeout, stop, tx, ctx).await;
+        });
+    }
+
+    /// Ask the running sweep to stop after the node in flight
+    /// finishes. The busy flag stays set until the ProbeAllDone
+    /// event arrives; results already out are kept.
+    fn stop_probe_all(&mut self) {
+        if self.busy != Some(Busy::ProbingAll) {
+            return;
+        }
+        self.probe_all_stop.store(true, Ordering::Relaxed);
+        self.status = format!(
+            "正在停止探测全部（等当前节点测完，已测 {}/{}）…",
+            self.probe_all_done, self.probe_all_total
+        );
+        self.log_line("已请求停止探测全部，当前节点测完后停下。".to_string());
     }
 
     /// Listen addresses for the next connection, from the live UI
@@ -1244,6 +1518,8 @@ impl GuiApp {
                     Ok((vip, ms)) => {
                         self.probes
                             .insert(host.clone(), format!("{} ms", ms.as_millis()));
+                        self.probe_ms
+                            .insert(host.clone(), ms.as_millis() as u64);
                         self.status =
                             format!("{} 可用：虚拟 IP {}，{} ms。", host, vip, ms.as_millis());
                         self.log_line(format!(
@@ -1255,6 +1531,7 @@ impl GuiApp {
                     }
                     Err(ProbeFailure::ProxyDown(e)) => {
                         self.probes.insert(host.clone(), "代理不通".to_string());
+                        self.probe_ms.remove(&host);
                         self.status = "探测失败：前置代理连不上。".to_string();
                         self.set_error(format!(
                             "探测 {} 失败：前置代理 {} 连不上（{}）。节点还没连上——问题在代理不在节点：刷新、探测、连接都走这条代理，代理不通时会一起失败，换节点没用。先点高级设置里的“测试前置代理”确认。",
@@ -1267,6 +1544,7 @@ impl GuiApp {
                     }
                     Err(ProbeFailure::NodeDown(e)) => {
                         self.probes.insert(host.clone(), "失败".to_string());
+                        self.probe_ms.remove(&host);
                         self.status = format!("{} 探测失败。", host);
                         if self.front_enabled {
                             self.set_error(format!(
@@ -1281,6 +1559,131 @@ impl GuiApp {
                             self.set_error(format!("探测 {} 失败：{}。换一个节点再试。", host, e));
                         }
                     }
+                }
+            }
+            GuiEvent::ProbeAllProgress {
+                current,
+                done,
+                total,
+            } => {
+                // A sweep in flight: the row being probed shows
+                // "探测中…" (same cell text as a single probe) and
+                // the status line names it. A stray progress event
+                // with no sweep running is ignored.
+                if self.busy != Some(Busy::ProbingAll) {
+                    return;
+                }
+                self.probe_all_done = done;
+                self.probe_all_total = total;
+                self.probes.insert(current.clone(), "探测中…".to_string());
+                self.probe_ms.remove(&current);
+                self.status = format!("正在探测全部：{}/{}（{}）…", done, total, current);
+            }
+            GuiEvent::ProbeAllResult {
+                host,
+                result,
+                done,
+                total,
+            } => {
+                // Same cell updates as a single probe, but no
+                // per-node error banner: 83 failures would spam the
+                // banner and the file log with the long advisory
+                // text, and the summary at the end is the right
+                // place for the outcome. One concise log line per
+                // node keeps the trace without the noise.
+                if self.busy != Some(Busy::ProbingAll) {
+                    return;
+                }
+                self.probe_all_done = done;
+                self.probe_all_total = total;
+                match result {
+                    Ok((vip, ms)) => {
+                        self.probe_all_ok += 1;
+                        self.probes
+                            .insert(host.clone(), format!("{} ms", ms.as_millis()));
+                        self.probe_ms
+                            .insert(host.clone(), ms.as_millis() as u64);
+                        self.status = format!(
+                            "正在探测全部：{}/{}（{} 可用，{} ms）…",
+                            done, total, host, ms.as_millis()
+                        );
+                        self.log_line(format!(
+                            "探测全部 {}/{}：{} 可用，虚拟 IP {}，{} ms。",
+                            done, total, host, vip, ms.as_millis()
+                        ));
+                    }
+                    Err(ProbeFailure::ProxyDown(e)) => {
+                        self.probe_all_failed += 1;
+                        self.probes.insert(host.clone(), "代理不通".to_string());
+                        self.probe_ms.remove(&host);
+                        self.status = format!(
+                            "正在探测全部：{}/{}（{} 代理不通）…",
+                            done, total, host
+                        );
+                        self.log_line(format!(
+                            "探测全部 {}/{}：{} 失败：前置代理不通（{}）。",
+                            done, total, host, e
+                        ));
+                    }
+                    Err(ProbeFailure::NodeDown(e)) => {
+                        self.probe_all_failed += 1;
+                        self.probes.insert(host.clone(), "失败".to_string());
+                        self.probe_ms.remove(&host);
+                        self.status = format!(
+                            "正在探测全部：{}/{}（{} 失败）…",
+                            done, total, host
+                        );
+                        self.log_line(format!(
+                            "探测全部 {}/{}：{} 失败（{}）。",
+                            done, total, host, e
+                        ));
+                    }
+                }
+            }
+            GuiEvent::ProbeAllDone {
+                total,
+                ok,
+                failed,
+                stopped,
+                proxy_down,
+            } => {
+                self.busy = None;
+                self.probe_all_ok = ok;
+                self.probe_all_failed = failed;
+                self.probe_all_done = ok + failed;
+                self.probe_all_total = total;
+                let skipped = total.saturating_sub(ok + failed);
+                if proxy_down {
+                    self.status = format!(
+                        "探测全部已停止：前置代理不通，已测 {}/{}，{} 个可用，{} 个失败。",
+                        ok + failed, total, ok, failed
+                    );
+                    self.set_error(format!(
+                        "探测全部已停止：前置代理 {} 不通，剩下的 {} 个节点没测（已测 {}/{}，{} 个可用）。先点高级设置里的“测试前置代理”确认。",
+                        self.front_addr, skipped, ok + failed, total, ok
+                    ));
+                    self.log_line(format!(
+                        "探测全部已停止：前置代理不通。已测 {}/{}，{} 个可用，{} 个失败，{} 个未测。",
+                        ok + failed, total, ok, failed, skipped
+                    ));
+                } else if stopped {
+                    self.status = format!(
+                        "探测全部已停止：已测 {}/{}，{} 个可用，{} 个失败。",
+                        ok + failed, total, ok, failed
+                    );
+                    self.log_line(format!(
+                        "探测全部已停止：已测 {}/{}，{} 个可用，{} 个失败，{} 个未测。",
+                        ok + failed, total, ok, failed, skipped
+                    ));
+                } else {
+                    self.status = format!(
+                        "探测全部完成：{} 个节点，{} 个可用，{} 个失败。",
+                        total, ok, failed
+                    );
+                    self.log_line(format!(
+                        "探测全部完成：{} 个节点，{} 个可用，{} 个失败。",
+                        total, ok, failed
+                    ));
                 }
             }
             GuiEvent::Connected(c) => {
@@ -1396,19 +1799,33 @@ impl GuiApp {
     }
 
     /// Node indices in display order: fetch order by default, or
-    /// sorted by country name (hostname breaks ties) once the user
-    /// has clicked the 国家/地区 header. A refresh replaces
-    /// `self.nodes` and the sort re-applies automatically, since the
-    /// order is computed here, not stored.
+    /// sorted by the column the user picked (see `sort`) — the
+    /// whole row follows the sort key, and `selected` still stores
+    /// a node index, so sorting never misaligns the selection. A
+    /// refresh replaces `self.nodes` and the sort re-applies
+    /// automatically, since the order is computed here, not stored.
     fn display_indices(&self) -> Vec<usize> {
         let mut idx: Vec<usize> = (0..self.nodes.len()).collect();
-        if let Some(dir) = self.country_sort {
+        if let Some((col, dir)) = self.sort {
             idx.sort_by(|&a, &b| {
                 let (na, nb) = (&self.nodes[a], &self.nodes[b]);
-                let ord = na
-                    .country
-                    .cmp(&nb.country)
-                    .then_with(|| na.host.cmp(&nb.host));
+                let ord = match col {
+                    SortCol::Country => na
+                        .country
+                        .cmp(&nb.country)
+                        .then_with(|| na.host.cmp(&nb.host)),
+                    SortCol::Sessions => na
+                        .sessions
+                        .cmp(&nb.sessions)
+                        .then_with(|| na.host.cmp(&nb.host)),
+                    SortCol::Quality => quality_key(na)
+                        .cmp(&quality_key(nb))
+                        .then_with(|| na.host.cmp(&nb.host)),
+                    SortCol::Latency => self
+                        .latency_key(na)
+                        .cmp(&self.latency_key(nb))
+                        .then_with(|| na.host.cmp(&nb.host)),
+                };
                 match dir {
                     SortDir::Asc => ord,
                     SortDir::Desc => ord.reverse(),
@@ -1416,6 +1833,46 @@ impl GuiApp {
             });
         }
         idx
+    }
+
+    /// Click a sortable column header: the same column again
+    /// reverses the direction; a different column starts at that
+    /// column's first-click direction (see `SortCol::default_dir`).
+    fn toggle_sort(&mut self, col: SortCol) {
+        self.sort = Some(match self.sort {
+            Some((c, dir)) if c == col => (
+                col,
+                match dir {
+                    SortDir::Asc => SortDir::Desc,
+                    SortDir::Desc => SortDir::Asc,
+                },
+            ),
+            _ => (col, col.default_dir()),
+        });
+    }
+
+    /// Sort key for the 延迟/状态 column: (group, ms). Group 0 =
+    /// probed and available, ordered by latency ms ascending;
+    /// group 1 = unprobed ("未探测" — no entry — or "探测中…");
+    /// group 2 = failed ("失败" / "代理不通"). Reversing the whole
+    /// key (second click) puts failures first, unprobed in the
+    /// middle, available by ms descending last. The ms comes from
+    /// `probe_ms`, stored when a probe succeeds — never re-parsed
+    /// from the display string.
+    fn latency_key(&self, n: &vpngate::Node) -> (u8, u64) {
+        // A node being probed right now sorts with the unprobed
+        // group even if an earlier probe left a ms behind (the
+        // start path clears `probe_ms`, so this is belt-and-braces).
+        if self.probes.get(&n.host).map(|s| s.as_str()) == Some("探测中…") {
+            return (1, 0);
+        }
+        match self.probe_ms.get(&n.host) {
+            Some(&ms) => (0, ms),
+            None => match self.probes.get(&n.host) {
+                None => (1, 0),
+                Some(_) => (2, 0),
+            },
+        }
     }
 
     /// Host of the currently connected node, if any (the `node_label`
@@ -1641,24 +2098,42 @@ impl eframe::App for GuiApp {
                     }
                     if let Some(b) = self.busy {
                         ui.spinner();
-                        ui.label(b.label());
+                        if b == Busy::ProbingAll {
+                            ui.label(format!(
+                                "正在探测全部：{}/{}…",
+                                self.probe_all_done, self.probe_all_total
+                            ));
+                        } else {
+                            ui.label(b.label());
+                        }
                     }
                 });
             });
             ui.separator();
 
-            // Node list (5 columns: a fixed 28 px status column with ∞
-            // for the connected node, then country / ISP / host:port /
-            // latency-status; host:port merged so the grid fits a 560 px
-            // window — hostnames alone are ~200 px wide).
+            // Node list (7 columns: a fixed 28 px status column with ∞
+            // for the connected node, then country / ISP / 当前人数 /
+            // 线路质量 / host:port / latency-status; host:port merged
+            // so the grid fits a 560 px window — hostnames alone are
+            // ~200 px wide).
             // Each row: (node index, status icon, country, isp,
-            // host:port shown, status, host:port full). Rows are built
-            // in display order (see display_indices): fetch order by
-            // default, or sorted by country once the user clicks the
-            // 国家/地区 header. `selected` still stores a node index.
+            // sessions cell, quality cell, host:port shown, status,
+            // host:port full). Rows are built in display order (see
+            // display_indices): fetch order by default, or sorted by
+            // the column the user clicked. `selected` still stores a
+            // node index.
             let connected_host = self.connected_node_host();
-            let rows: Vec<(usize, String, String, String, String, String, String)> =
-                self.display_indices()
+            let rows: Vec<(
+                usize,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+            )> = self.display_indices()
                     .into_iter()
                     .map(|idx| {
                         let n = &self.nodes[idx];
@@ -1688,6 +2163,8 @@ impl eframe::App for GuiApp {
                             // fixed 12/14-character cut.
                             n.country.clone(),
                             if n.isp.is_empty() { n.name.clone() } else { n.isp.clone() },
+                            sessions_cell(n),
+                            quality_cell(n),
                             // All curated hosts end in .opengw.net; drop
                             // the suffix for display (full host is in
                             // the tooltip).
@@ -1730,12 +2207,19 @@ impl eframe::App for GuiApp {
                         // window at the default widths.
                         ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
                         // Status column (∞) is fixed 28 px and never
-                        // resizable; the other four come from config.
+                        // resizable, and the two new columns （当前人数 /
+                        // 线路质量） are fixed too, so the old 4-element
+                        // node_col_widths in config.toml keeps loading
+                        // as-is; the other four come from config.
                         const STATUS_COL_W: f32 = 28.0;
-                        let widths: [f32; 5] = [
+                        const SESSIONS_COL_W: f32 = 64.0;
+                        const QUALITY_COL_W: f32 = 88.0;
+                        let widths: [f32; 7] = [
                             STATUS_COL_W,
                             self.col_widths[0] as f32,
                             self.col_widths[1] as f32,
+                            SESSIONS_COL_W,
+                            QUALITY_COL_W,
                             self.col_widths[2] as f32,
                             self.col_widths[3] as f32,
                         ];
@@ -1744,14 +2228,14 @@ impl eframe::App for GuiApp {
                         // scroll drag (see the tolerant-click note in
                         // the row loop below).
                         let row_h = 30.0;
-                        // One row is 5 cells + 4 six-pixel separators +
-                        // the 8 gaps between the 9 items. The status
+                        // One row is 7 cells + 6 six-pixel separators +
+                        // the 12 gaps between the 13 items. The status
                         // column has no separator (its gap is the same
                         // width, so the columns stay aligned).
                         let handle_w = 6.0f32;
                         let gap = ui.spacing().item_spacing.x;
                         let total_w =
-                            widths.iter().sum::<f32>() + 4.0 * handle_w + 8.0 * gap;
+                            widths.iter().sum::<f32>() + 6.0 * handle_w + 12.0 * gap;
                         // Rows span the full available width, not just
                         // the columns: at 800 px the old 554 px rows
                         // left ~200 px of dead space on the right of
@@ -1779,8 +2263,9 @@ impl eframe::App for GuiApp {
                         // width is remembered in the settings and
                         // auto-saved to config.toml. The status column
                         // (index 0) has an empty header and no
-                        // separator; the country column (index 1) is
-                        // clickable to sort A-Z / Z-A (see below).
+                        // separator; the country （当前人数 / 线路质量 /
+                        // 延迟/状态） columns (indices 1, 3, 4, 6) are
+                        // clickable to sort (see below).
                         // NOTE: the cells are placed at exact rects (like
                         // the data rows below), not via
                         // allocate_ui_with_layout: that advances the parent
@@ -1793,12 +2278,29 @@ impl eframe::App for GuiApp {
                             egui::vec2(row_w, row_h),
                             egui::Sense::hover(),
                         );
-                        let country_label = match self.country_sort {
-                            None => "国家/地区".to_string(),
-                            Some(dir) => format!("国家/地区 {}", dir.arrow()),
+                        // The arrow sits on the one column currently
+                        // sorted (see `sort`); the other sortable
+                        // headers show their bare label.
+                        let sort_arrow = |col: SortCol| match self.sort {
+                            Some((c, dir)) if c == col => format!(" {}", dir.arrow()),
+                            _ => String::new(),
                         };
-                        let header_labels =
-                            ["", country_label.as_str(), "运营商", "主机:端口", "延迟/状态"];
+                        let country_label = format!("国家/地区{}", sort_arrow(SortCol::Country));
+                        let sessions_label =
+                            format!("当前人数{}", sort_arrow(SortCol::Sessions));
+                        let quality_label =
+                            format!("线路质量{}", sort_arrow(SortCol::Quality));
+                        let latency_label =
+                            format!("延迟/状态{}", sort_arrow(SortCol::Latency));
+                        let header_labels = [
+                            "",
+                            country_label.as_str(),
+                            "运营商",
+                            sessions_label.as_str(),
+                            quality_label.as_str(),
+                            "主机:端口",
+                            latency_label.as_str(),
+                        ];
                         let mut x = header_rect.left();
                         for (i, label) in header_labels.iter().enumerate() {
                             let cell_rect = egui::Rect::from_min_size(
@@ -1810,42 +2312,71 @@ impl eframe::App for GuiApp {
                                 cell_rect,
                                 egui::RichText::new(*label).strong(),
                             );
-                            // Country header: click toggles A-Z / Z-A.
-                            // The label is drawn first and the interact
+                            // Sortable headers: country (1), 当前人数
+                            // (3), 线路质量 (4), 延迟/状态 (6). The
+                            // label is drawn first and the interact
                             // sits on top of it (a Label has no sense,
-                            // so it cannot eat the click).
-                            if i == 1 {
+                            // so it cannot eat the click). Clicking a
+                            // header sorts by that column (first click
+                            // = that column's most useful order);
+                            // clicking it again reverses.
+                            let sort_col = match i {
+                                1 => Some(SortCol::Country),
+                                3 => Some(SortCol::Sessions),
+                                4 => Some(SortCol::Quality),
+                                6 => Some(SortCol::Latency),
+                                _ => None,
+                            };
+                            if let Some(col) = sort_col {
+                                let tip = match col {
+                                    SortCol::Country => {
+                                        "点击按国家排序（A-Z / Z-A 切换）"
+                                    }
+                                    SortCol::Sessions => "点击按连接人数排序",
+                                    SortCol::Quality => {
+                                        "点击按线路质量排序（速度优先）"
+                                    }
+                                    SortCol::Latency => {
+                                        "点击按延迟排序：已测的按毫秒从小到大，未测的居中，失败的最后"
+                                    }
+                                };
                                 let resp = ui
                                     .interact(
                                         cell_rect,
-                                        egui::Id::new("sort_country"),
+                                        egui::Id::new(("sort_col", i)),
                                         egui::Sense::click(),
                                     )
                                     .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                    .on_hover_text("点击按国家排序（A-Z / Z-A 切换）");
+                                    .on_hover_text(tip);
                                 if resp.clicked() {
-                                    self.country_sort = Some(match self.country_sort {
-                                        None | Some(SortDir::Desc) => SortDir::Asc,
-                                        Some(SortDir::Asc) => SortDir::Desc,
-                                    });
+                                    self.toggle_sort(col);
                                 }
                             }
                             x += widths[i];
-                            if i < 4 {
+                            if i < 6 {
                                 x += gap;
-                                // Separator after the country, ISP and
-                                // host columns only (indices 1..=3 in
-                                // the 5-column layout); the status
+                                // Separator after a resizable column
+                                // only: country (1) -> col_widths[0],
+                                // ISP (2) -> col_widths[1], host:port
+                                // (5) -> col_widths[2]. The status
                                 // column keeps the same gap but no
-                                // handle, and the last column has none.
-                                if (1..=3).contains(&i) {
+                                // handle, the two fixed columns （当前人
+                                // 数 / 线路质量） have none, and the
+                                // last column has none.
+                                let sep_col = match i {
+                                    1 => Some(0usize),
+                                    2 => Some(1usize),
+                                    5 => Some(2usize),
+                                    _ => None,
+                                };
+                                if let Some(wi) = sep_col {
                                     let handle_rect = egui::Rect::from_min_size(
                                         egui::pos2(x, header_rect.top()),
                                         egui::vec2(handle_w, row_h),
                                     );
                                     let resp = ui.interact(
                                         handle_rect,
-                                        egui::Id::new(("node_col_sep", i - 1)),
+                                        egui::Id::new(("node_col_sep", wi)),
                                         egui::Sense::drag(),
                                     );
                                     let active = resp.hovered() || resp.dragged();
@@ -1855,8 +2386,8 @@ impl eframe::App for GuiApp {
                                     // release event still carries its delta
                                     // then (kittest teleports this way).
                                     if resp.dragged() || resp.drag_stopped() {
-                                        self.col_widths[i - 1] =
-                                            (self.col_widths[i - 1] as f32
+                                        self.col_widths[wi] =
+                                            (self.col_widths[wi] as f32
                                                 + resp.drag_delta().x)
                                                 .clamp(40.0, 400.0)
                                                 as u16;
@@ -1883,8 +2414,10 @@ impl eframe::App for GuiApp {
                         // The row rect spans the full available width
                         // (row_w, not just total_w) so clicks on the
                         // empty right part of a row still select it.
-                        for (display_i, (node_idx, status_icon, country, isp, hostport, status, full)) in
-                            rows.iter().enumerate()
+                        for (
+                            display_i,
+                            (node_idx, status_icon, country, isp, sessions, quality, hostport, status, full),
+                        ) in rows.iter().enumerate()
                         {
                             let (row_rect, row_resp) = ui.allocate_exact_size(
                                 egui::vec2(row_w, row_h),
@@ -1938,7 +2471,8 @@ impl eframe::App for GuiApp {
                             };
                             // Place each cell label at its exact rect
                             // (egui 0.36 has no allocate_ui_at_rect).
-                            let cells = [status_icon, country, isp, hostport, status];
+                            let cells =
+                                [status_icon, country, isp, sessions, quality, hostport, status];
                             let mut x = row_rect.left();
                             for (j, text) in cells.iter().enumerate() {
                                 let cell_rect = egui::Rect::from_min_size(
@@ -1970,7 +2504,7 @@ impl eframe::App for GuiApp {
                                     put_cell_label(ui, cell_rect, cell_text(text));
                                 }
                                 x += widths[j];
-                                if j < 4 {
+                                if j < 6 {
                                     // Gap, separator, gap — the same
                                     // symmetric spacing as the header row.
                                     x += gap + handle_w + gap;
@@ -2056,6 +2590,42 @@ impl eframe::App for GuiApp {
                     .clicked()
                 {
                     self.start_probe(ui.ctx().clone());
+                }
+                // Probe-all: sweeps the whole list in display order,
+                // one node at a time. While a sweep runs the same
+                // button becomes 停止 (the sweep stops after the
+                // node in flight; results already out are kept).
+                // No selection needed — it probes everything.
+                if self.busy == Some(Busy::ProbingAll) {
+                    let stop_requested = self.probe_all_stop.load(Ordering::Relaxed);
+                    if ui
+                        .add_enabled(
+                            !stop_requested,
+                            egui::Button::new("停止").min_size(btn_size),
+                        )
+                        .on_hover_text("在当前节点探测结束后停下，已出的结果保留")
+                        .on_disabled_hover_text("正在停止，等当前节点测完…")
+                        .clicked()
+                    {
+                        self.stop_probe_all();
+                    }
+                } else {
+                    let can_probe_all = self.busy.is_none() && !self.nodes.is_empty();
+                    if ui
+                        .add_enabled(
+                            can_probe_all,
+                            egui::Button::new("探测全部").min_size(btn_size),
+                        )
+                        .on_hover_text("按当前显示顺序，一个一个探测全部节点")
+                        .on_disabled_hover_text(if self.nodes.is_empty() {
+                            "列表里还没有节点"
+                        } else {
+                            "正在忙，请稍候"
+                        })
+                        .clicked()
+                    {
+                        self.start_probe_all(ui.ctx().clone());
+                    }
                 }
                 if ui
                     .add_enabled(
@@ -2359,6 +2929,17 @@ mod tests {
         n
     }
 
+    /// Node with explicit listed stats (sessions / speed / ping).
+    /// All three zero = no data (the curated 28); any nonzero =
+    /// has data.
+    fn node_stats(host: &str, country: &str, sessions: u64, speed_mbps: u64, ping_ms: u64) -> Node {
+        let mut n = node_in(host, country);
+        n.sessions = sessions;
+        n.speed_mbps = speed_mbps;
+        n.ping_ms = ping_ms;
+        n
+    }
+
     #[test]
     fn country_sort_orders_by_country_then_host() {
         let mut app = GuiApp::for_tests();
@@ -2370,12 +2951,12 @@ mod tests {
         ];
         // Default: fetch order, no sorting.
         assert_eq!(app.display_indices(), vec![0, 1, 2, 3]);
-        app.country_sort = Some(SortDir::Asc);
+        app.sort = Some((SortCol::Country, SortDir::Asc));
         // Chinese names sort by string (Unicode code-point) order:
         // 德国 U+5FB7 < 日本 U+65E5 < 美国 U+7F8E; same-country rows
         // break ties by hostname (a before c).
         assert_eq!(app.display_indices(), vec![3, 1, 2, 0]);
-        app.country_sort = Some(SortDir::Desc);
+        app.sort = Some((SortCol::Country, SortDir::Desc));
         assert_eq!(app.display_indices(), vec![0, 2, 1, 3]);
     }
 
@@ -2386,7 +2967,7 @@ mod tests {
             node_in("b.opengw.net", "美国"),
             node_in("a.opengw.net", "日本"),
         ];
-        app.country_sort = Some(SortDir::Asc);
+        app.sort = Some((SortCol::Country, SortDir::Asc));
         assert_eq!(app.display_indices(), vec![1, 0]);
         app.apply_event(GuiEvent::Nodes(vpngate::NodeListUpdate {
             nodes: vec![
@@ -2399,8 +2980,188 @@ mod tests {
             web_error: None,
         }));
         // New list, same chosen direction (德国 < 美国).
-        assert_eq!(app.country_sort, Some(SortDir::Asc));
+        assert_eq!(app.sort, Some((SortCol::Country, SortDir::Asc)));
         assert_eq!(app.display_indices(), vec![1, 0]);
+    }
+
+    #[test]
+    fn sessions_sort_orders_few_first_then_many() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_stats("b.opengw.net", "日本", 47, 500, 10),
+            node_stats("a.opengw.net", "日本", 0, 0, 0),
+            node_stats("c.opengw.net", "日本", 301, 100, 5),
+            node_stats("d.opengw.net", "日本", 5, 200, 20),
+        ];
+        assert_eq!(app.display_indices(), vec![0, 1, 2, 3]);
+        app.sort = Some((SortCol::Sessions, SortDir::Asc));
+        // Fewest first: 0, 5, 47, 301 (a no-data node has 0 sessions).
+        assert_eq!(app.display_indices(), vec![1, 3, 0, 2]);
+        app.sort = Some((SortCol::Sessions, SortDir::Desc));
+        assert_eq!(app.display_indices(), vec![2, 0, 3, 1]);
+    }
+
+    #[test]
+    fn quality_sort_orders_by_speed_then_ping_with_no_data_at_the_ends() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_stats("a.opengw.net", "日本", 10, 500, 30),
+            node_stats("b.opengw.net", "日本", 10, 500, 10),
+            node_stats("c.opengw.net", "日本", 10, 100, 5),
+            node_stats("d.opengw.net", "日本", 0, 0, 0),
+        ];
+        app.sort = Some((SortCol::Quality, SortDir::Desc));
+        // First click: fastest first; same speed -> smaller ping
+        // first; the no-data node last.
+        assert_eq!(app.display_indices(), vec![1, 0, 2, 3]);
+        app.sort = Some((SortCol::Quality, SortDir::Asc));
+        // Reversed: no-data first, slowest first; same speed ->
+        // larger ping first.
+        assert_eq!(app.display_indices(), vec![3, 2, 0, 1]);
+    }
+
+    #[test]
+    fn toggle_sort_resets_direction_when_switching_columns() {
+        let mut app = GuiApp::for_tests();
+        app.sort = Some((SortCol::Country, SortDir::Desc));
+        app.toggle_sort(SortCol::Sessions);
+        assert_eq!(
+            app.sort,
+            Some((SortCol::Sessions, SortDir::Asc)),
+            "switching to sessions starts few-first"
+        );
+        app.toggle_sort(SortCol::Sessions);
+        assert_eq!(
+            app.sort,
+            Some((SortCol::Sessions, SortDir::Desc)),
+            "same column again reverses"
+        );
+        app.toggle_sort(SortCol::Quality);
+        assert_eq!(
+            app.sort,
+            Some((SortCol::Quality, SortDir::Desc)),
+            "switching to quality starts fastest-first"
+        );
+        app.toggle_sort(SortCol::Latency);
+        assert_eq!(
+            app.sort,
+            Some((SortCol::Latency, SortDir::Asc)),
+            "switching to latency starts available-first by ms"
+        );
+        app.toggle_sort(SortCol::Country);
+        assert_eq!(
+            app.sort,
+            Some((SortCol::Country, SortDir::Asc)),
+            "switching back to country starts A-Z"
+        );
+    }
+
+    #[test]
+    fn sessions_and_quality_cells_format() {
+        // API node with data: "47人" / "572M@3ms".
+        let n = node_stats("a.opengw.net", "日本", 47, 572, 3);
+        assert_eq!(sessions_cell(&n), "47人");
+        assert_eq!(quality_cell(&n), "572M@3ms");
+        // Curated node: all three zero -> "—" in both cells.
+        let n = node_stats("b.opengw.net", "日本", 0, 0, 0);
+        assert_eq!(sessions_cell(&n), "—");
+        assert_eq!(quality_cell(&n), "—");
+        // Data but zero sessions: "0人", not "—".
+        let n = node_stats("c.opengw.net", "日本", 0, 100, 5);
+        assert_eq!(sessions_cell(&n), "0人");
+        assert_eq!(quality_cell(&n), "100M@5ms");
+    }
+
+    #[test]
+    fn latency_sort_orders_available_then_unprobed_then_failed() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "日本"),
+            node_in("c.opengw.net", "日本"),
+            node_in("d.opengw.net", "日本"),
+            node_in("e.opengw.net", "日本"),
+            node_in("f.opengw.net", "日本"),
+        ];
+        // a: 120 ms, b/f: 30 ms (tie), c: unprobed, d: failed,
+        // e: probing (counts as unprobed).
+        app.probe_ms.insert("a.opengw.net".to_string(), 120);
+        app.probes
+            .insert("a.opengw.net".to_string(), "120 ms".to_string());
+        app.probe_ms.insert("b.opengw.net".to_string(), 30);
+        app.probes
+            .insert("b.opengw.net".to_string(), "30 ms".to_string());
+        app.probe_ms.insert("f.opengw.net".to_string(), 30);
+        app.probes
+            .insert("f.opengw.net".to_string(), "30 ms".to_string());
+        app.probes
+            .insert("d.opengw.net".to_string(), "失败".to_string());
+        app.probes
+            .insert("e.opengw.net".to_string(), "探测中…".to_string());
+        app.sort = Some((SortCol::Latency, SortDir::Asc));
+        // Available by ms ascending (b/f tie -> host a-z), then
+        // unprobed (c, e), then failed.
+        assert_eq!(app.display_indices(), vec![1, 5, 0, 2, 4, 3]);
+        app.sort = Some((SortCol::Latency, SortDir::Desc));
+        // Whole order reversed: failed first, unprobed middle,
+        // available by ms descending last.
+        assert_eq!(app.display_indices(), vec![3, 4, 2, 0, 5, 1]);
+    }
+
+    #[test]
+    fn probe_ms_tracks_probe_events() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![node_in("a.opengw.net", "日本")];
+        // A successful probe stores the ms alongside the display
+        // string — the latency sort reads this number, never the
+        // string.
+        app.apply_event(GuiEvent::Probe {
+            host: "a.opengw.net".to_string(),
+            result: Ok((
+                std::net::Ipv4Addr::new(10, 0, 0, 1),
+                std::time::Duration::from_millis(42),
+            )),
+        });
+        assert_eq!(app.probe_ms.get("a.opengw.net"), Some(&42));
+        assert_eq!(
+            app.probes.get("a.opengw.net").map(|s| s.as_str()),
+            Some("42 ms")
+        );
+        // A sweep progress event clears it (the row shows 探测中…).
+        app.busy = Some(Busy::ProbingAll);
+        app.apply_event(GuiEvent::ProbeAllProgress {
+            current: "a.opengw.net".to_string(),
+            done: 0,
+            total: 1,
+        });
+        assert_eq!(app.probe_ms.get("a.opengw.net"), None);
+        assert_eq!(
+            app.probes.get("a.opengw.net").map(|s| s.as_str()),
+            Some("探测中…")
+        );
+        // A sweep failure leaves no ms behind.
+        app.apply_event(GuiEvent::ProbeAllResult {
+            host: "a.opengw.net".to_string(),
+            result: Err(ProbeFailure::NodeDown("no route".to_string())),
+            done: 1,
+            total: 1,
+        });
+        assert_eq!(app.probe_ms.get("a.opengw.net"), None);
+        assert_eq!(
+            app.probes.get("a.opengw.net").map(|s| s.as_str()),
+            Some("失败")
+        );
+        // A sweep success stores it again.
+        app.apply_event(GuiEvent::ProbeAllResult {
+            host: "a.opengw.net".to_string(),
+            result: Ok((
+                std::net::Ipv4Addr::new(10, 0, 0, 2),
+                std::time::Duration::from_millis(7),
+            )),
+            done: 1,
+            total: 1,
+        });
+        assert_eq!(app.probe_ms.get("a.opengw.net"), Some(&7));
     }
 
     #[test]
@@ -2477,7 +3238,7 @@ mod tests {
         assert!(!app.scroll_to_selected);
         // Sorted list: movement follows the shown order (德国 <
         // 日本 < 美国 in A-Z, i.e. display [2, 1, 0]).
-        app.country_sort = Some(SortDir::Asc);
+        app.sort = Some((SortCol::Country, SortDir::Asc));
         app.selected = None;
         app.move_selection(1);
         assert_eq!(app.selected, Some(2), "first in A-Z order is 德国");
@@ -2492,6 +3253,209 @@ mod tests {
         assert_eq!(app.selected, None);
         app.move_selection(-1);
         assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn probe_all_targets_follow_display_order() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_in("b.opengw.net", "美国"),
+            node_in("a.opengw.net", "日本"),
+            node_in("c.opengw.net", "日本"),
+            node_in("d.opengw.net", "德国"),
+        ];
+        // Fetch order by default.
+        let targets = app.probe_all_targets();
+        let hosts: Vec<&str> = targets.iter().map(|(h, _)| h.as_str()).collect();
+        assert_eq!(
+            hosts,
+            ["b.opengw.net", "a.opengw.net", "c.opengw.net", "d.opengw.net"]
+        );
+        // Sorted A-Z: 德国 < 日本 < 美国, hostname breaks ties.
+        app.sort = Some((SortCol::Country, SortDir::Asc));
+        let targets = app.probe_all_targets();
+        let hosts: Vec<&str> = targets.iter().map(|(h, _)| h.as_str()).collect();
+        assert_eq!(
+            hosts,
+            ["d.opengw.net", "a.opengw.net", "c.opengw.net", "b.opengw.net"]
+        );
+        // Targets are dialled with the completed host:port.
+        assert_eq!(targets[0].1, "d.opengw.net:992");
+        // Empty list: nothing to probe.
+        app.nodes = vec![];
+        assert!(app.probe_all_targets().is_empty());
+    }
+
+    #[test]
+    fn probe_all_events_drive_progress_and_stop() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "美国"),
+            node_in("c.opengw.net", "德国"),
+        ];
+        // Empty list: starting is a no-op (the button is disabled
+        // then too).
+        let mut empty = GuiApp::for_tests();
+        empty.nodes = vec![];
+        empty.start_probe_all(egui::Context::default());
+        assert!(empty.busy.is_none());
+        // Starting is blocked while another job runs.
+        app.busy = Some(Busy::Fetching);
+        app.start_probe_all(egui::Context::default());
+        assert_eq!(app.busy, Some(Busy::Fetching));
+        app.busy = None;
+        app.start_probe_all(egui::Context::default());
+        assert_eq!(app.busy, Some(Busy::ProbingAll));
+        assert_eq!((app.probe_all_total, app.probe_all_done), (3, 0));
+        assert_eq!(
+            app.probes.get("a.opengw.net").map(|s| s.as_str()),
+            Some("探测中…"),
+            "the first row shows 探测中… right away"
+        );
+        assert!(app.status.contains("0/3"), "status: {}", app.status);
+        // Starting again while sweeping is a no-op.
+        app.start_probe_all(egui::Context::default());
+        assert_eq!(app.probe_all_total, 3);
+        // Progress on the first node, then its good result: the row
+        // takes the latency and the progress advances.
+        app.apply_event(GuiEvent::ProbeAllProgress {
+            current: "a.opengw.net".to_string(),
+            done: 0,
+            total: 3,
+        });
+        assert!(app.status.contains("0/3"), "status: {}", app.status);
+        assert!(app.status.contains("a.opengw.net"), "status: {}", app.status);
+        app.apply_event(GuiEvent::ProbeAllResult {
+            host: "a.opengw.net".to_string(),
+            result: Ok((Ipv4Addr::new(10, 0, 0, 2), Duration::from_millis(95))),
+            done: 1,
+            total: 3,
+        });
+        assert_eq!(
+            app.probes.get("a.opengw.net").map(|s| s.as_str()),
+            Some("95 ms")
+        );
+        assert_eq!((app.probe_all_ok, app.probe_all_failed), (1, 0));
+        // A failed node writes 失败 — and neither outcome sets the
+        // error banner mid-sweep (the summary at the end is the
+        // place for the outcome).
+        app.apply_event(GuiEvent::ProbeAllProgress {
+            current: "b.opengw.net".to_string(),
+            done: 1,
+            total: 3,
+        });
+        assert_eq!(
+            app.probes.get("b.opengw.net").map(|s| s.as_str()),
+            Some("探测中…")
+        );
+        app.apply_event(GuiEvent::ProbeAllResult {
+            host: "b.opengw.net".to_string(),
+            result: Err(ProbeFailure::NodeDown("timeout".to_string())),
+            done: 2,
+            total: 3,
+        });
+        assert_eq!(
+            app.probes.get("b.opengw.net").map(|s| s.as_str()),
+            Some("失败")
+        );
+        assert_eq!((app.probe_all_ok, app.probe_all_failed), (1, 1));
+        assert!(
+            app.error.is_empty(),
+            "no per-node error banner mid-sweep: {}",
+            app.error
+        );
+        assert_eq!(app.busy, Some(Busy::ProbingAll));
+        // 停止: the flag is set (the task stops after the node in
+        // flight) and the status says so; the Done event clears the
+        // busy flag and writes the summary.
+        app.stop_probe_all();
+        assert!(app.probe_all_stop.load(Ordering::Relaxed));
+        assert!(app.status.contains("正在停止"), "status: {}", app.status);
+        app.apply_event(GuiEvent::ProbeAllDone {
+            total: 3,
+            ok: 1,
+            failed: 1,
+            stopped: true,
+            proxy_down: false,
+        });
+        assert!(app.busy.is_none());
+        assert!(app.status.contains("已停止"), "status: {}", app.status);
+        assert!(app.status.contains("已测 2/3"), "status: {}", app.status);
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.contains("探测全部已停止：已测 2/3，1 个可用，1 个失败，1 个未测")),
+            "log must carry the stopped summary: {:?}",
+            app.log
+        );
+        // A completed sweep (not stopped) writes the finished summary.
+        let mut done_app = GuiApp::for_tests();
+        done_app.nodes = vec![node_in("a.opengw.net", "日本")];
+        done_app.start_probe_all(egui::Context::default());
+        done_app.apply_event(GuiEvent::ProbeAllResult {
+            host: "a.opengw.net".to_string(),
+            result: Ok((Ipv4Addr::new(10, 0, 0, 2), Duration::from_millis(64))),
+            done: 1,
+            total: 1,
+        });
+        done_app.apply_event(GuiEvent::ProbeAllDone {
+            total: 1,
+            ok: 1,
+            failed: 0,
+            stopped: false,
+            proxy_down: false,
+        });
+        assert!(done_app.busy.is_none());
+        assert_eq!(
+            done_app.status,
+            "探测全部完成：1 个节点，1 个可用，0 个失败。"
+        );
+        // A proxy-down result aborts the sweep with the proxy named.
+        let mut proxy_app = GuiApp::for_tests();
+        proxy_app.front_enabled = true;
+        proxy_app.front_addr = "127.0.0.1:2080".to_string();
+        proxy_app.nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "美国"),
+        ];
+        proxy_app.start_probe_all(egui::Context::default());
+        proxy_app.apply_event(GuiEvent::ProbeAllResult {
+            host: "a.opengw.net".to_string(),
+            result: Err(ProbeFailure::ProxyDown("connection refused".to_string())),
+            done: 1,
+            total: 2,
+        });
+        assert_eq!(
+            proxy_app.probes.get("a.opengw.net").map(|s| s.as_str()),
+            Some("代理不通")
+        );
+        proxy_app.apply_event(GuiEvent::ProbeAllDone {
+            total: 2,
+            ok: 0,
+            failed: 1,
+            stopped: false,
+            proxy_down: true,
+        });
+        assert!(proxy_app.busy.is_none());
+        assert!(
+            proxy_app.status.contains("前置代理不通"),
+            "status: {}",
+            proxy_app.status
+        );
+        assert!(
+            proxy_app.error.contains("127.0.0.1:2080"),
+            "error must name the proxy: {}",
+            proxy_app.error
+        );
+        assert!(
+            proxy_app
+                .log
+                .iter()
+                .any(|l| l.contains("探测全部已停止：前置代理不通。已测 1/2，0 个可用，1 个失败，1 个未测")),
+            "log must carry the proxy-down summary: {:?}",
+            proxy_app.log
+        );
     }
 
     #[test]
@@ -3000,6 +3964,108 @@ mod tests {
         );
     }
 
+    /// A TCP listener that accepts and holds connections forever,
+    /// never sending a byte — a hanging target (a dead node whose
+    /// TLS handshake never answers). Same idea as the integration
+    /// test's `black_hole_port`, for the bin's own async tests.
+    fn black_hole_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || loop {
+            let Ok((s, _)) = listener.accept() else {
+                break;
+            };
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(3600));
+                drop(s);
+            });
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn probe_all_flow_stops_after_stop_request() {
+        // Four black-hole targets, 2 s timeout each: a full sweep
+        // would take ~8 s. The stop flag is set as soon as the
+        // first result arrives, so the sweep must halt after one
+        // or two results — the flag may land just after the loop
+        // already started the next probe, and that probe still
+        // finishes first.
+        let targets: Vec<(String, String)> = (0..4)
+            .map(|_| {
+                let p = black_hole_port();
+                (format!("127.0.0.1:{}", p), format!("127.0.0.1:{}", p))
+            })
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flow = stop.clone();
+        let stop_collector = stop.clone();
+        let connector = Connector::new(None);
+        let timeout = Duration::from_secs(2);
+        let start = std::time::Instant::now();
+        tokio::spawn(async move {
+            probe_all_flow(
+                &connector,
+                targets,
+                timeout,
+                stop_flow,
+                tx,
+                egui::Context::default(),
+            )
+            .await;
+        });
+        // The std mpsc receiver blocks, so it runs on a blocking
+        // thread; it sets the stop flag the moment the first
+        // result arrives, then reports how many results came and
+        // the Done event's verdict.
+        let (results, done_ev) = tokio::task::spawn_blocking(move || {
+            let mut results = 0usize;
+            let mut done_ev = None;
+            loop {
+                match rx.recv_timeout(Duration::from_secs(20)) {
+                    Ok(GuiEvent::ProbeAllResult { .. }) => {
+                        results += 1;
+                        stop_collector.store(true, Ordering::Relaxed);
+                    }
+                    Ok(GuiEvent::ProbeAllDone {
+                        total,
+                        ok,
+                        failed,
+                        stopped,
+                        proxy_down,
+                    }) => {
+                        done_ev = Some((total, ok, failed, stopped, proxy_down));
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            (results, done_ev)
+        })
+        .await
+        .unwrap();
+        let elapsed = start.elapsed();
+        let (total, ok, failed, stopped, proxy_down) =
+            done_ev.expect("a Done event must arrive");
+        assert_eq!(total, 4);
+        assert!(stopped, "the sweep must report stopped");
+        assert!(!proxy_down, "no proxy is configured, so nothing is proxy-down");
+        assert_eq!(ok, 0, "black holes never answer");
+        assert_eq!(failed, results, "every probed node failed");
+        assert!(
+            (1..=2).contains(&results),
+            "the stop must halt the sweep after one or two results, got {}",
+            results
+        );
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "a stopped sweep must not run the full queue (~8 s), took {:?}",
+            elapsed
+        );
+    }
+
     /// A port with nothing listening on it.
     fn closed_port() -> u16 {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3281,7 +4347,7 @@ mod tests {
                 app
             });
         harness.run_steps(10);
-        assert_eq!(harness.state().country_sort, None);
+        assert_eq!(harness.state().sort, None);
         let header = harness.get_by_label("国家/地区");
         let center = header.rect().center();
         harness.drag_at(center);
@@ -3289,8 +4355,8 @@ mod tests {
         harness.drop_at(center);
         harness.run();
         assert_eq!(
-            harness.state().country_sort,
-            Some(SortDir::Asc),
+            harness.state().sort,
+            Some((SortCol::Country, SortDir::Asc)),
             "first header click sorts A-Z"
         );
         assert_eq!(
@@ -3303,11 +4369,162 @@ mod tests {
         harness.drop_at(center);
         harness.run();
         assert_eq!(
-            harness.state().country_sort,
-            Some(SortDir::Desc),
+            harness.state().sort,
+            Some((SortCol::Country, SortDir::Desc)),
             "second header click sorts Z-A"
         );
         assert_eq!(harness.state().display_indices(), vec![0, 1]);
+    }
+
+    /// Clicking the 当前人数 / 线路质量 headers sorts by that column
+    /// (first click = the column's most useful order, second click =
+    /// reversed), and switching to the country header leaves the
+    /// arrow only there. Needs a graphics adapter.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn sort_headers_toggle_and_switch_clears_arrow() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 420.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_stats("a.opengw.net", "日本", 47, 500, 10),
+                    node_stats("b.opengw.net", "美国", 5, 100, 5),
+                    node_stats("c.opengw.net", "德国", 301, 200, 20),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        assert_eq!(harness.state().sort, None);
+        // 当前人数, first click: fewest first (b 5, a 47, c 301).
+        let sessions_header = harness.get_by_label("当前人数");
+        let sessions_center = sessions_header.rect().center();
+        harness.drag_at(sessions_center);
+        harness.run();
+        harness.drop_at(sessions_center);
+        harness.run();
+        assert_eq!(
+            harness.state().sort,
+            Some((SortCol::Sessions, SortDir::Asc)),
+            "first 当前人数 click sorts few-first"
+        );
+        assert_eq!(harness.state().display_indices(), vec![1, 0, 2]);
+        // Same header again: most first.
+        harness.drag_at(sessions_center);
+        harness.run();
+        harness.drop_at(sessions_center);
+        harness.run();
+        assert_eq!(
+            harness.state().sort,
+            Some((SortCol::Sessions, SortDir::Desc)),
+            "second 当前人数 click sorts most-first"
+        );
+        assert_eq!(harness.state().display_indices(), vec![2, 0, 1]);
+        // 线路质量, first click: fastest first (a 500, c 200, b 100).
+        let quality_header = harness.get_by_label("线路质量");
+        let quality_center = quality_header.rect().center();
+        harness.drag_at(quality_center);
+        harness.run();
+        harness.drop_at(quality_center);
+        harness.run();
+        assert_eq!(
+            harness.state().sort,
+            Some((SortCol::Quality, SortDir::Desc)),
+            "first 线路质量 click sorts fastest-first"
+        );
+        assert_eq!(harness.state().display_indices(), vec![0, 2, 1]);
+        // 国家/地区: the arrow moves there alone (德国 < 日本 < 美国）.
+        let country_header = harness.get_by_label("国家/地区");
+        let country_center = country_header.rect().center();
+        harness.drag_at(country_center);
+        harness.run();
+        harness.drop_at(country_center);
+        harness.run();
+        assert_eq!(
+            harness.state().sort,
+            Some((SortCol::Country, SortDir::Asc)),
+            "switching to the country header starts A-Z"
+        );
+        assert_eq!(harness.state().display_indices(), vec![2, 0, 1]);
+        harness.get_by_label("国家/地区 ▲");
+        assert!(
+            harness.query_by_label("当前人数 ▲").is_none(),
+            "the sessions arrow must clear when another column sorts"
+        );
+        assert!(
+            harness.query_by_label("当前人数 ▼").is_none(),
+            "the sessions arrow must clear when another column sorts"
+        );
+        assert!(
+            harness.query_by_label("线路质量 ▲").is_none(),
+            "the quality arrow must clear when another column sorts"
+        );
+        assert!(
+            harness.query_by_label("线路质量 ▼").is_none(),
+            "the quality arrow must clear when another column sorts"
+        );
+    }
+
+    /// Clicking the 延迟/状态 header sorts available nodes by ms
+    /// ascending (unprobed middle, failed last) on the first click
+    /// and reverses on the second. The header sits past the right
+    /// edge at 560 px with the default column widths, so the test
+    /// narrows the resizable columns to bring it into view. Needs
+    /// a graphics adapter.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn latency_header_click_toggles_sort() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 420.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_stats("a.opengw.net", "日本", 10, 500, 10),
+                    node_stats("b.opengw.net", "日本", 10, 100, 5),
+                    node_stats("c.opengw.net", "日本", 10, 200, 20),
+                ];
+                app.col_widths = [50, 60, 80, 50];
+                app
+            });
+        harness.run_steps(10);
+        assert_eq!(harness.state().sort, None);
+        // a: 120 ms, b: unprobed, c: failed.
+        harness
+            .state_mut()
+            .probe_ms
+            .insert("a.opengw.net".to_string(), 120);
+        harness
+            .state_mut()
+            .probes
+            .insert("a.opengw.net".to_string(), "120 ms".to_string());
+        harness
+            .state_mut()
+            .probes
+            .insert("c.opengw.net".to_string(), "失败".to_string());
+        let header = harness.get_by_label("延迟/状态");
+        let center = header.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(
+            harness.state().sort,
+            Some((SortCol::Latency, SortDir::Asc)),
+            "first latency click: available by ms, unprobed middle, failed last"
+        );
+        assert_eq!(harness.state().display_indices(), vec![0, 1, 2]);
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(
+            harness.state().sort,
+            Some((SortCol::Latency, SortDir::Desc)),
+            "second latency click reverses the whole order"
+        );
+        assert_eq!(harness.state().display_indices(), vec![2, 1, 0]);
     }
 
     /// Enter connects the selected node and Ctrl+R probes it (the
@@ -3450,6 +4667,128 @@ mod tests {
             matches!(harness.state().busy, Some(Busy::Probing)),
             "Ctrl+R must start a probe on the arrow-selected row, busy={:?}",
             harness.state().busy
+        );
+    }
+
+    /// Clicking 探测全部 starts a sweep (busy = ProbingAll, first
+    /// row 探测中…), one driven result advances the progress, Enter
+    /// is blocked while sweeping but ↑/↓ still move the selection,
+    /// and 停止 sets the stop flag so the Done event ends it with
+    /// the stopped summary. The harness has no tokio runtime, so
+    /// the sweep's events are driven by hand through apply_event
+    /// (same approach as the shortcut test's busy-flag proof).
+    /// Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn probe_all_button_starts_sweep_and_stop_halts_it() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 420.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        assert!(harness.state().busy.is_none());
+        let btn = harness.get_by_label("探测全部");
+        let center = btn.rect().center();
+        harness.drag_at(center);
+        harness.run_steps(3);
+        harness.drop_at(center);
+        // run_steps, not run(): the spinner shown while busy
+        // requests a repaint every frame, so run() never settles.
+        harness.run_steps(3);
+        assert!(
+            matches!(harness.state().busy, Some(Busy::ProbingAll)),
+            "clicking 探测全部 must start a sweep, busy={:?}",
+            harness.state().busy
+        );
+        assert!(
+            harness.state().status.contains("0/3"),
+            "status must show the sweep progress: {}",
+            harness.state().status
+        );
+        assert_eq!(
+            harness.state().probes.get("a.opengw.net").map(|s| s.as_str()),
+            Some("探测中…"),
+            "the first row shows 探测中…"
+        );
+        // The same button is now 停止.
+        let stop_btn = harness.get_by_label("停止");
+        assert!(
+            stop_btn.rect().width() > 0.0,
+            "the button must read 停止 while sweeping"
+        );
+        // Drive one result through by hand: the row takes the
+        // latency and the progress advances.
+        harness.state_mut().apply_event(GuiEvent::ProbeAllResult {
+            host: "a.opengw.net".to_string(),
+            result: Ok((Ipv4Addr::new(10, 0, 0, 2), Duration::from_millis(95))),
+            done: 1,
+            total: 3,
+        });
+        harness.run_steps(3);
+        assert_eq!(
+            harness.state().probes.get("a.opengw.net").map(|s| s.as_str()),
+            Some("95 ms")
+        );
+        assert!(
+            harness.state().status.contains("1/3"),
+            "status must advance: {}",
+            harness.state().status
+        );
+        // Enter is blocked while sweeping (it would start a
+        // connect); arrow keys still move the selection (they
+        // start nothing).
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(3);
+        assert!(
+            matches!(harness.state().busy, Some(Busy::ProbingAll)),
+            "Enter must not start a connect mid-sweep"
+        );
+        harness.key_press(egui::Key::ArrowDown);
+        harness.run_steps(3);
+        assert_eq!(
+            harness.state().selected,
+            Some(0),
+            "↓ must still move the selection while sweeping"
+        );
+        // Click 停止: the flag is set (the sweep stops after the
+        // node in flight); the Done event clears the busy flag
+        // and writes the stopped summary.
+        let stop = harness.get_by_label("停止");
+        let center = stop.rect().center();
+        harness.drag_at(center);
+        harness.run_steps(3);
+        harness.drop_at(center);
+        harness.run_steps(3);
+        assert!(
+            harness.state().probe_all_stop.load(Ordering::Relaxed),
+            "clicking 停止 must set the stop flag"
+        );
+        harness.state_mut().apply_event(GuiEvent::ProbeAllDone {
+            total: 3,
+            ok: 1,
+            failed: 0,
+            stopped: true,
+            proxy_down: false,
+        });
+        harness.run_steps(3);
+        assert!(harness.state().busy.is_none());
+        assert!(
+            harness.state().status.contains("已停止"),
+            "status must carry the stopped summary: {}",
+            harness.state().status
+        );
+        assert!(
+            harness.state().status.contains("已测 1/3"),
+            "status: {}",
+            harness.state().status
         );
     }
 
