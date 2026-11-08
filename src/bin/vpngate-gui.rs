@@ -709,22 +709,27 @@ fn manual_node(host: String, port: Option<u16>) -> Node {
 }
 
 /// One line per node, in the given (display) order: `host:port`
-/// first, then the four metadata columns tab-separated — country,
-/// operator, user count, line quality in Mbps:
-/// `vpn547433109.opengw.net:995\t日本\tIIJ\t47\t572`.
+/// first, then the five metadata columns tab-separated — country,
+/// operator, user count, line quality in Mbps, and (v3.16) the
+/// last probed latency in ms:
+/// `vpn547433109.opengw.net:995\t日本\tIIJ\t47\t572\t42`.
+/// The sixth column is the probe latency from `probe_ms` (the
+/// 延迟/状态 column's number, up to thousands of ms) — empty when
+/// the node was never probed. It is NOT the API ping (`Node.ping_ms`,
+/// the @xxms inside the line-quality column, tens of ms): that one
+/// comes back from the API on refresh and is never exported.
 /// The host is the completed DDNS hostname — the same target a
 /// connect dials (a bare API label like "public-vpn-192" becomes
 /// "public-vpn-192.opengw.net"). A node with no known port exports
 /// as a bare host: the app never invents a port (API nodes arrive
 /// port-less and connect tries 443/992/995 in parallel, so no
-/// single port is "the" port for them). Latency is NOT exported —
-/// it is measured live and re-probed after an import. Empty fields
+/// single port is "the" port for them). Empty fields
 /// mean unknown (sessions/speed are 0 when the node carries no
 /// stats); country/operator are sanitized so a stray tab or newline
 /// in the data can never break the line format. The first field
 /// stays a plain `host:port`, so the text is still usable as a bare
 /// host list by anything that only reads the first field.
-fn export_nodes_text(nodes: &[Node]) -> String {
+fn export_nodes_text(nodes: &[Node], probe_ms: &HashMap<String, u64>) -> String {
     nodes
         .iter()
         .map(|n| {
@@ -743,13 +748,19 @@ fn export_nodes_text(nodes: &[Node]) -> String {
             } else {
                 n.speed_mbps.to_string()
             };
+            let latency = probe_ms
+                .get(&vpngate::complete_ddns_host(&n.host))
+                .or_else(|| probe_ms.get(&n.host))
+                .map(|ms| ms.to_string())
+                .unwrap_or_default();
             format!(
-                "{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}",
                 hostport,
                 field(&n.country),
                 field(&n.isp),
                 sessions,
-                speed
+                speed,
+                latency
             )
         })
         .collect::<Vec<_>>()
@@ -769,6 +780,10 @@ enum ImportLine {
     /// (old plain `host:port` lines); `sessions` and `speed_mbps`
     /// are 0 then — unknown, shown as "—". Never a literal
     /// placeholder value: v3.11 stamped "导入" here, v3.12 removes it.
+    /// `probe_ms` (v3.16) is the last probed latency in ms from the
+    /// sixth column — `None` when the line carries no sixth column
+    /// or it is empty (never probed); the import restores it into
+    /// the app's in-memory `probe_ms` plus its display string.
     Node {
         host: String,
         port: Option<u16>,
@@ -776,18 +791,22 @@ enum ImportLine {
         isp: String,
         sessions: u64,
         speed_mbps: u64,
+        probe_ms: Option<u64>,
     },
 }
 
-/// Parse one import line. Two formats, both accepted:
-/// * new (v3.12 export): `host:port\tcountry\tisp\tsessions\tspeed`
-///   — the four metadata columns are restored; empty fields mean
-///   unknown;
+/// Parse one import line. Three formats, all accepted:
+/// * new (v3.16 export): `host:port\tcountry\tisp\tsessions\tspeed\tprobe_ms`
+///   — the five metadata columns are restored; empty fields mean
+///   unknown; the sixth column is the last probed latency in ms
+///   (empty = never probed, non-numeric = Malformed);
+/// * v3.12–v3.15 export: `host:port\tcountry\tisp\tsessions\tspeed`
+///   — the four metadata columns are restored, no latency;
 /// * old (v3.11 and earlier): a plain `host:port` or bare hostname
 ///   — metadata stays empty.
 /// A hostname is ASCII letters/digits, `.` and `-` (the same
 /// alphabet `parse_manual_target` accepts for a bare host); a port,
-/// when present, must be 1–65535; sessions/speed, when present,
+/// when present, must be 1–65535; sessions/speed/probe_ms, when present,
 /// must be numbers. A bare VPNGate label without a dot
 /// ("public-vpn-192") is accepted and completed to `.opengw.net`
 /// here, so the stored host is always the full FQDN.
@@ -797,7 +816,7 @@ fn parse_import_line(line: &str) -> ImportLine {
         return ImportLine::Skip;
     }
     let parts: Vec<&str> = t.split('\t').collect();
-    if parts.len() > 5 {
+    if parts.len() > 6 {
         return ImportLine::Malformed;
     }
     let valid_host = |h: &str| {
@@ -839,6 +858,15 @@ fn parse_import_line(line: &str) -> ImportLine {
     let Some(speed_mbps) = number(4) else {
         return ImportLine::Malformed;
     };
+    // Sixth column (v3.16): empty = never probed, a number =
+    // the last probed latency in ms, anything else = Malformed.
+    let probe_ms = match field(5) {
+        "" => None,
+        s => match s.parse::<u64>() {
+            Ok(ms) => Some(ms),
+            Err(_) => return ImportLine::Malformed,
+        },
+    };
     ImportLine::Node {
         host: vpngate::complete_ddns_host(&host),
         port,
@@ -846,6 +874,7 @@ fn parse_import_line(line: &str) -> ImportLine {
         isp: field(2).to_string(),
         sessions,
         speed_mbps,
+        probe_ms,
     }
 }
 
@@ -3489,7 +3518,7 @@ impl GuiApp {
             return;
         }
         let nodes = self.selected_nodes_in_display_order();
-        let text = export_nodes_text(&nodes);
+        let text = export_nodes_text(&nodes, &self.probe_ms);
         if text.is_empty() {
             self.status = "没有选中的节点可导出。".to_string();
             self.log_line("导出选中：没有选中的节点，未写入剪贴板。".to_string());
@@ -3511,7 +3540,7 @@ impl GuiApp {
             return;
         }
         let nodes = self.selected_nodes_in_display_order();
-        let text = export_nodes_text(&nodes);
+        let text = export_nodes_text(&nodes, &self.probe_ms);
         if text.is_empty() {
             self.status = "没有选中的节点可导出。".to_string();
             self.log_line("导出到文件：没有选中的节点，未写文件。".to_string());
@@ -3587,9 +3616,17 @@ impl GuiApp {
     /// side effects (and without touching the cache or the config).
     /// Nodes are appended at the end, in the file's order; the
     /// selection is left untouched. A host already in the list (by
-    /// completed hostname) is a duplicate; a host on the blocklist
-    /// is unblocked — importing it is an explicit request to have it
-    /// back — and reported in `unblocked`.
+    /// completed hostname) is a duplicate — the whole line is
+    /// skipped, including any probe latency it carries (v3.16:
+    /// the existing row's live probe_ms is authoritative); a host
+    /// on the blocklist is unblocked — importing it is an explicit
+    /// request to have it back — and reported in `unblocked`.
+    /// A sixth column (v3.16) restores the last probed latency
+    /// into `probe_ms` plus its "N ms" display string. The export
+    /// text is the latency's only persistence: the node cache
+    /// stores `Node` only, so an imported latency survives only
+    /// until the program exits (a refresh/re-probe overwrites or
+    /// clears it by the existing probe rules).
     fn import_nodes_text(&mut self, text: &str) -> ImportReport {
         let mut report = ImportReport::default();
         for line in text.lines() {
@@ -3603,6 +3640,7 @@ impl GuiApp {
                     isp,
                     sessions,
                     speed_mbps,
+                    probe_ms,
                 } => {
                     let key = Self::blocked_key(&host);
                     if self
@@ -3610,6 +3648,10 @@ impl GuiApp {
                         .iter()
                         .any(|n| Self::blocked_key(&n.host) == key)
                     {
+                        // Duplicate host: the whole line is skipped
+                        // — including its probe latency. The existing
+                        // row's probe_ms is live state; an imported
+                        // stale value must not overwrite it.
                         report.duplicates += 1;
                         continue;
                     }
@@ -3624,7 +3666,7 @@ impl GuiApp {
                     // "导入" into both fields here — that is the
                     // bug Leo's screenshot shows.
                     self.nodes.push(Node {
-                        host,
+                        host: host.clone(),
                         port,
                         country,
                         country_code: String::new(),
@@ -3639,6 +3681,17 @@ impl GuiApp {
                         port_source: "import".to_string(),
                         source: "import".to_string(),
                     });
+                    // v3.16: restore the last probed latency (the
+                    // export text is its only persistence — the
+                    // node cache stores Node only, never probe_ms).
+                    // The restored value is "last measured", not a
+                    // fresh probe: it shows as "N ms" and sorts
+                    // like a real probe result, until a re-probe
+                    // overwrites/clears it by the existing rules.
+                    if let Some(ms) = probe_ms {
+                        self.probes.insert(host.clone(), format!("{} ms", ms));
+                        self.probe_ms.insert(host, ms);
+                    }
                     report.added += 1;
                 }
             }
@@ -6029,8 +6082,8 @@ mod tests {
         let mut c = node_in("c.opengw.net", "德国");
         c.port = Some(995);
         assert_eq!(
-            export_nodes_text(&[a, b, c]),
-            "b.opengw.net:443\t美国\tNTT\t1\t50\na.opengw.net:992\t日本\tNTT\t1\t50\nc.opengw.net:995\t德国\tNTT\t1\t50"
+            export_nodes_text(&[a, b, c], &HashMap::new()),
+            "b.opengw.net:443\t美国\tNTT\t1\t50\t\na.opengw.net:992\t日本\tNTT\t1\t50\t\nc.opengw.net:995\t德国\tNTT\t1\t50\t"
         );
     }
 
@@ -6047,10 +6100,10 @@ mod tests {
         let mut b = node_in("x.opengw.net", "美国");
         b.port = None;
         assert_eq!(
-            export_nodes_text(&[a, b]),
-            "public-vpn-192.opengw.net\t日本\tNTT\t\t\nx.opengw.net\t美国\tNTT\t1\t50"
+            export_nodes_text(&[a, b], &HashMap::new()),
+            "public-vpn-192.opengw.net\t日本\tNTT\t\t\t\nx.opengw.net\t美国\tNTT\t1\t50\t"
         );
-        assert_eq!(export_nodes_text(&[]), "");
+        assert_eq!(export_nodes_text(&[], &HashMap::new()), "");
     }
 
     #[test]
@@ -6077,7 +6130,8 @@ mod tests {
                     isp,
                     sessions,
                     speed_mbps,
-                } => (host, port, country, isp, sessions, speed_mbps),
+                    probe_ms,
+                } => (host, port, country, isp, sessions, speed_mbps, probe_ms),
                 _ => panic!("expected a node"),
             },
             (
@@ -6086,7 +6140,8 @@ mod tests {
                 String::new(),
                 String::new(),
                 0,
-                0
+                0,
+                None
             )
         );
         // A bare label is completed to the full FQDN on import.
@@ -6107,7 +6162,8 @@ mod tests {
                     isp,
                     sessions,
                     speed_mbps,
-                } => (host, port, country, isp, sessions, speed_mbps),
+                    probe_ms,
+                } => (host, port, country, isp, sessions, speed_mbps, probe_ms),
                 _ => panic!("expected a node"),
             },
             (
@@ -6116,7 +6172,8 @@ mod tests {
                 "日本".to_string(),
                 "IIJ".to_string(),
                 47,
-                572
+                572,
+                None
             )
         );
         // Trailing empty metadata fields are fine (unknown).
@@ -6129,7 +6186,8 @@ mod tests {
                     isp,
                     sessions,
                     speed_mbps,
-                } => (host, port, country, isp, sessions, speed_mbps),
+                    probe_ms,
+                } => (host, port, country, isp, sessions, speed_mbps, probe_ms),
                 _ => panic!("expected a node"),
             },
             (
@@ -6138,7 +6196,8 @@ mod tests {
                 String::new(),
                 String::new(),
                 0,
-                0
+                0,
+                None
             )
         );
         assert!(matches!(parse_import_line(""), ImportLine::Skip));
@@ -6151,7 +6210,7 @@ mod tests {
             parse_import_line("  # indented comment"),
             ImportLine::Skip
         ));
-        for bad in [":443", "a.opengw.net:", "a.opengw.net:0", "a.opengw.net:70000", "a.opengw.net:notaport", "ho st:443", "a:b:443", "a_b.opengw.net:443", "a.opengw.net:443\t日本\tIIJ\tx\t572", "a.opengw.net:443\t日本\tIIJ\t47\tfast", "a.opengw.net:443\t日本\tIIJ\t47\t572\textra"] {
+        for bad in [":443", "a.opengw.net:", "a.opengw.net:0", "a.opengw.net:70000", "a.opengw.net:notaport", "ho st:443", "a:b:443", "a_b.opengw.net:443", "a.opengw.net:443\t日本\tIIJ\tx\t572", "a.opengw.net:443\t日本\tIIJ\t47\tfast", "a.opengw.net:443\t日本\tIIJ\t47\t572\t42\textra"] {
             assert!(
                 matches!(parse_import_line(bad), ImportLine::Malformed),
                 "{bad} must be malformed"
@@ -6225,7 +6284,7 @@ mod tests {
         b.isp = "NTT".to_string();
         b.sessions = 3;
         b.speed_mbps = 120;
-        let text = export_nodes_text(&[a.clone(), b.clone()]);
+        let text = export_nodes_text(&[a.clone(), b.clone()], &HashMap::new());
         let mut app = GuiApp::for_tests();
         // Start from an empty list: for_tests() carries the 28
         // curated nodes, and one of the fixture hosts is among them.
@@ -6243,6 +6302,189 @@ mod tests {
         assert_eq!(app.nodes[1].country, "美国");
         assert_eq!(app.nodes[1].sessions, 3);
         assert_eq!(app.nodes[1].speed_mbps, 120);
+    }
+
+    /// v3.16: export then import restores the probed latency
+    /// (probe_ms) too, with the latency column's display string
+    /// filled in — the imported value is the *last measured* one,
+    /// not a fresh probe, and it sorts like a real probe result.
+    #[test]
+    fn import_restores_probe_ms_from_sixth_column() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![];
+        let report = app.import_nodes_text(
+            "a.opengw.net:443\t日本\tNTT\t3\t120\t42\n\
+             b.opengw.net:992\t美国\tNTT\t1\t50\t\n\
+             c.opengw.net:995\t德国\tNTT\t0\t0\t1234",
+        );
+        assert_eq!(report.added, 3);
+        assert_eq!(report.malformed, 0);
+        assert_eq!(app.probe_ms.get("a.opengw.net"), Some(&42));
+        assert_eq!(
+            app.probes.get("a.opengw.net").map(|s| s.as_str()),
+            Some("42 ms")
+        );
+        // Empty sixth column = never probed: no ms, no display.
+        assert_eq!(app.probe_ms.get("b.opengw.net"), None);
+        assert_eq!(app.probes.get("b.opengw.net"), None);
+        assert_eq!(app.probe_ms.get("c.opengw.net"), Some(&1234));
+        assert_eq!(
+            app.probes.get("c.opengw.net").map(|s| s.as_str()),
+            Some("1234 ms")
+        );
+    }
+
+    /// v3.16: the core round trip — export with a probe map, then
+    /// import the text back: the latency comes back with the node.
+    #[test]
+    fn export_import_round_trip_restores_probe_ms() {
+        let mut a = node_in("a.opengw.net", "日本");
+        a.port = Some(443);
+        a.sessions = 3;
+        a.speed_mbps = 120;
+        let mut b = node_in("b.opengw.net", "美国");
+        b.port = Some(992);
+        let mut probe_ms = HashMap::new();
+        probe_ms.insert("a.opengw.net".to_string(), 42);
+        probe_ms.insert("b.opengw.net".to_string(), 1234);
+        let text = export_nodes_text(&[a, b], &probe_ms);
+        assert_eq!(
+            text,
+            "a.opengw.net:443\t日本\tNTT\t3\t120\t42\nb.opengw.net:992\t美国\tNTT\t1\t50\t1234"
+        );
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![];
+        let report = app.import_nodes_text(&text);
+        assert_eq!(report.added, 2);
+        assert_eq!(report.malformed, 0);
+        assert_eq!(app.probe_ms.get("a.opengw.net"), Some(&42));
+        assert_eq!(
+            app.probes.get("a.opengw.net").map(|s| s.as_str()),
+            Some("42 ms")
+        );
+        assert_eq!(app.probe_ms.get("b.opengw.net"), Some(&1234));
+    }
+
+    /// v3.16: parse of the sixth column itself — a number is
+    /// kept, empty is None, non-numeric is Malformed.
+    #[test]
+    fn parse_import_line_sixth_column() {
+        assert_eq!(
+            match parse_import_line("a.opengw.net:443\t日本\tNTT\t3\t120\t42") {
+                ImportLine::Node { probe_ms, .. } => probe_ms,
+                _ => panic!("expected a node"),
+            },
+            Some(42)
+        );
+        assert_eq!(
+            match parse_import_line("a.opengw.net:443\t日本\tNTT\t3\t120\t") {
+                ImportLine::Node { probe_ms, .. } => probe_ms,
+                _ => panic!("expected a node"),
+            },
+            None
+        );
+        assert!(matches!(
+            parse_import_line("a.opengw.net:443\t日本\tNTT\t3\t120\tfast"),
+            ImportLine::Malformed
+        ));
+    }
+
+    /// v3.16: a non-numeric sixth column is Malformed (the whole
+    /// line is skipped, the import does not fail), and so is
+    /// anything past six columns.
+    #[test]
+    fn import_sixth_column_non_numeric_or_too_many_is_malformed() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![];
+        let report = app.import_nodes_text(
+            "a.opengw.net:443\t日本\tNTT\t3\t120\tfast\n\
+             b.opengw.net:992\t美国\tNTT\t1\t50\t42\textra\n\
+             c.opengw.net:995\t德国\tNTT\t0\t0\t7",
+        );
+        assert_eq!(report.added, 1);
+        assert_eq!(report.malformed, 2);
+        assert_eq!(app.nodes.len(), 1);
+        assert_eq!(app.nodes[0].host, "c.opengw.net");
+        assert_eq!(app.probe_ms.get("c.opengw.net"), Some(&7));
+    }
+
+    /// v3.16: a 5-column v3.12–v3.15 export still imports, with
+    /// no probe latency restored (the node sorts as unprobed).
+    #[test]
+    fn import_five_column_legacy_file_has_no_probe_ms() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![];
+        let report =
+            app.import_nodes_text("a.opengw.net:443\t日本\tNTT\t3\t120");
+        assert_eq!(report.added, 1);
+        assert_eq!(report.malformed, 0);
+        assert_eq!(app.probe_ms.get("a.opengw.net"), None);
+        assert_eq!(app.probes.get("a.opengw.net"), None);
+    }
+
+    /// v3.16: a duplicate host carrying a probe latency is
+    /// skipped whole — the existing row's (live) probe_ms is
+    /// NOT overwritten by the imported stale value. The import
+    /// dedup is host-based and the existing row is authoritative:
+    /// silently swapping in an old measurement would mislead
+    /// the latency sort; a user who wants the imported value
+    /// deletes the row first and re-imports.
+    #[test]
+    fn import_duplicate_with_probe_ms_keeps_existing_latency() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![node_in("a.opengw.net", "日本")];
+        app.probe_ms.insert("a.opengw.net".to_string(), 30);
+        app.probes
+            .insert("a.opengw.net".to_string(), "30 ms".to_string());
+        let report =
+            app.import_nodes_text("a.opengw.net:443\t日本\tNTT\t3\t120\t999");
+        assert_eq!(report.added, 0);
+        assert_eq!(report.duplicates, 1);
+        assert_eq!(app.probe_ms.get("a.opengw.net"), Some(&30));
+        assert_eq!(
+            app.probes.get("a.opengw.net").map(|s| s.as_str()),
+            Some("30 ms")
+        );
+    }
+
+    /// v3.16: an imported latency takes part in the latency sort
+    /// exactly like a freshly probed one (available group, ms
+    /// ascending), and a re-probe overwrites / clears it by the
+    /// existing probe rules.
+    #[test]
+    fn imported_probe_ms_sorts_and_is_covered_by_reprobe() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![];
+        let report = app.import_nodes_text(
+            "a.opengw.net:443\t日本\tNTT\t1\t50\t120\n\
+             b.opengw.net:443\t日本\tNTT\t1\t50\t30\n\
+             c.opengw.net:443\t日本\tNTT\t1\t50\t",
+        );
+        assert_eq!(report.added, 3);
+        app.sort = Some((SortCol::Latency, SortDir::Asc));
+        assert_eq!(app.display_indices(), vec![1, 0, 2]);
+        // A fresh successful probe overwrites the imported value.
+        app.apply_event(GuiEvent::Probe {
+            host: "a.opengw.net".to_string(),
+            result: Ok((
+                std::net::Ipv4Addr::new(10, 0, 0, 1),
+                std::time::Duration::from_millis(5),
+            )),
+        });
+        assert_eq!(app.probe_ms.get("a.opengw.net"), Some(&5));
+        assert_eq!(app.display_indices(), vec![0, 1, 2]);
+        // A probe starting clears it (row shows 探测中…).
+        app.busy = Some(Busy::ProbingAll);
+        app.apply_event(GuiEvent::ProbeAllProgress {
+            current: "b.opengw.net".to_string(),
+            done: 0,
+            total: 1,
+        });
+        assert_eq!(app.probe_ms.get("b.opengw.net"), None);
+        assert_eq!(
+            app.probes.get("b.opengw.net").map(|s| s.as_str()),
+            Some("探测中…")
+        );
     }
 
     /// Old plain `host:port` lines still import, with the four
@@ -10103,7 +10345,7 @@ mod tests {
             click_button_label_copied_text(&mut harness, "导出选中 (2)");
         assert_eq!(
             copied.as_deref(),
-            Some("a.opengw.net:443\t日本\tNTT\t1\t50\nc.opengw.net:995\t德国\tNTT\t1\t50"),
+            Some("a.opengw.net:443\t日本\tNTT\t1\t50\t\nc.opengw.net:995\t德国\tNTT\t1\t50\t"),
             "export must list the selection in display order, each with its own port and metadata columns"
         );
         assert_eq!(
@@ -10165,7 +10407,7 @@ mod tests {
         harness.step();
         assert_eq!(
             copied_text(&harness).as_deref(),
-            Some("a.opengw.net:992\t日本\tNTT\t1\t50\nb.opengw.net:992\t美国\tNTT\t1\t50"),
+            Some("a.opengw.net:992\t日本\tNTT\t1\t50\t\nb.opengw.net:992\t美国\tNTT\t1\t50\t"),
             "Ctrl+C must copy the selection in display order, with metadata columns"
         );
         assert_eq!(harness.state().status, "已导出 2 个节点到剪贴板。");
@@ -10333,7 +10575,7 @@ mod tests {
         harness.step();
         assert_eq!(
             copied_text(&harness).as_deref(),
-            Some("c.opengw.net:992\t德国\tNTT\t1\t50\na.opengw.net:992\t日本\tNTT\t1\t50\nb.opengw.net:992\t美国\tNTT\t1\t50"),
+            Some("c.opengw.net:992\t德国\tNTT\t1\t50\t\na.opengw.net:992\t日本\tNTT\t1\t50\t\nb.opengw.net:992\t美国\tNTT\t1\t50\t"),
             "Ctrl+A then Ctrl+C must export the whole list in display order"
         );
     }
@@ -10714,7 +10956,7 @@ mod tests {
             click_button_label_copied_text(&mut harness, "导出选中 (2)");
         assert_eq!(
             copied.as_deref(),
-            Some("vpn547433109.opengw.net:995\t日本\tIIJ\t47\t572\na.opengw.net:443\t美国\tNTT\t3\t120"),
+            Some("vpn547433109.opengw.net:995\t日本\tIIJ\t47\t572\t\na.opengw.net:443\t美国\tNTT\t3\t120\t"),
             "export must carry the four metadata columns"
         );
         click_button_label(&mut harness, "删除选中 (2)");
@@ -10742,6 +10984,80 @@ mod tests {
         );
         // The delete + the import wrote config.toml and
         // nodes_cache.json next to the test exe; clean up.
+        if let Some(path) = Config::portable_config_path() {
+            let _ = std::fs::remove_file(&path);
+        }
+        if let Some(cache) = vpngate::cache_path() {
+            let _ = std::fs::remove_file(&cache);
+        }
+    }
+
+    /// v3.16: export → delete → import restores the probed
+    /// latency too — the copied text carries a sixth column, and
+    /// after the paste the latency column shows it again.
+    /// Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn export_import_round_trip_keeps_probe_ms() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let mut a = node_in("vpn547433109.opengw.net", "日本");
+        a.port = Some(995);
+        a.isp = "IIJ".to_string();
+        a.sessions = 47;
+        a.speed_mbps = 572;
+        let mut b = node_in("a.opengw.net", "美国");
+        b.port = Some(443);
+        b.isp = "NTT".to_string();
+        b.sessions = 3;
+        b.speed_mbps = 120;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.probe_ms
+                    .insert("vpn547433109.opengw.net".to_string(), 42);
+                app.probes.insert(
+                    "vpn547433109.opengw.net".to_string(),
+                    "42 ms".to_string(),
+                );
+                app.nodes = vec![a, b];
+                app
+            });
+        harness.run_steps(10);
+        click_row_label(&mut harness, "日本");
+        shift_click_row_label(&mut harness, "美国");
+        let copied =
+            click_button_label_copied_text(&mut harness, "导出选中 (2)");
+        assert_eq!(
+            copied.as_deref(),
+            Some("vpn547433109.opengw.net:995\t日本\tIIJ\t47\t572\t42\na.opengw.net:443\t美国\tNTT\t3\t120\t"),
+            "export must carry the probed latency as a sixth column (empty when unprobed)"
+        );
+        click_button_label(&mut harness, "删除选中 (2)");
+        assert_eq!(harness.state().nodes.len(), 0);
+        harness.event(egui::Event::Paste(
+            copied.expect("export must have copied text"),
+        ));
+        harness.step();
+        assert_eq!(harness.state().nodes.len(), 2);
+        assert_eq!(
+            harness.state().probe_ms.get("vpn547433109.opengw.net"),
+            Some(&42)
+        );
+        assert_eq!(
+            harness
+                .state()
+                .probes
+                .get("vpn547433109.opengw.net")
+                .map(|s| s.as_str()),
+            Some("42 ms")
+        );
+        assert_eq!(
+            harness.state().probe_ms.get("a.opengw.net"),
+            None,
+            "the unprobed node stays unprobed after the round trip"
+        );
         if let Some(path) = Config::portable_config_path() {
             let _ = std::fs::remove_file(&path);
         }
