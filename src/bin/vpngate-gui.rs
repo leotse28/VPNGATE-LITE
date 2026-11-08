@@ -9,11 +9,12 @@
 
 use eframe::egui;
 use std::collections::{BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vpngate_client::config::Config;
 use vpngate_client::filelog::{self, FileLogger, LogLevel};
 use vpngate_client::net::{self, Connector};
@@ -44,7 +45,7 @@ enum Busy {
 /// column at a time: clicking a header sorts by that column and
 /// clears the previous column's arrow; clicking the same column
 /// again reverses the direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SortCol {
     Country,
     Sessions,
@@ -75,7 +76,7 @@ impl SortCol {
 /// header. Chinese country names sort by string (Unicode code-point)
 /// order — deterministic, and same-country rows stay grouped — with
 /// the hostname as the tie-breaker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SortDir {
     Asc,
     Desc,
@@ -91,6 +92,25 @@ impl SortDir {
         }
     }
 }
+
+/// One rendered node-list row: (node index, status icon, country,
+/// ISP, sessions cell, quality cell, per-capita cell, host:port
+/// shown, latency/status, host:port full). v3.14 caches the whole
+/// built list (`GuiApp::rows_cache`) keyed by `list_fingerprint`,
+/// so the ~1100 per-frame `String` allocations of the old build
+/// happen only when the list actually changed.
+type NodeRow = (
+    usize,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
 /// Sort key for the 线路质量 column: (has data, speed, ping
 /// reversed). No-data nodes (sessions, speed and ping all zero —
@@ -455,12 +475,32 @@ async fn connect_flow(
     let vip = tunnel.vip;
     let mut listeners = Vec::new();
     for addr in &listen_addrs {
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-            format!(
-                "本地混合代理无法监听 {}：{}（端口可能被占用，换一个端口再试）",
-                addr, e
-            )
-        })?;
+        // Bind the local mixed-proxy port. v3.14: one retry after a
+        // short wait when the address is in use — a restart starts
+        // the new instance BEFORE the old one exits, so the first
+        // bind of a restart-resume connect can still hit the old
+        // process's listener; the old process is gone within a
+        // second or two, so one 2 s retry covers it. A manual
+        // connect that hits a genuinely busy port fails after the
+        // same single retry, with the retry named in the error.
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::net::TcpListener::bind(addr).await.map_err(|e2| {
+                    format!(
+                        "本地混合代理无法监听 {}：{}（已重试一次，端口仍被占用，换一个端口再试）",
+                        addr, e2
+                    )
+                })?
+            }
+            Err(e) => {
+                return Err(format!(
+                    "本地混合代理无法监听 {}：{}（端口可能被占用，换一个端口再试）",
+                    addr, e
+                ));
+            }
+        };
         listeners.push(listener);
     }
     let mut serve = Vec::new();
@@ -1099,6 +1139,62 @@ struct GuiApp {
     /// The log file's path (shown in the UI log at startup and next to
     /// the save button). `Some` even when the file could not be opened.
     log_path: Option<std::path::PathBuf>,
+    /// RSS sampling (v3.14, diagnosis §7): when the app started
+    /// (all RSS `t=` values are relative to this), which one-shot
+    /// samples have fired, and the last periodic sample. The
+    /// one-shot tags: T0 (first frame), T+5min (quiet baseline),
+    /// C0 (connected), C+30min, D0 (disconnected) + D+10s, P0
+    /// (probe-all done); plus one sample every 30 minutes. The
+    /// three pass/fail tiers (Tier A/B/C, diagnosis §7.3) are
+    /// judged from the log lines Leo sends back — the VM cannot
+    /// produce Windows RSS numbers.
+    started_at: Instant,
+    rss_t0_done: bool,
+    rss_t5_done: bool,
+    rss_last_periodic: Instant,
+    rss_connected_since: Option<Instant>,
+    rss_conn30_done: bool,
+    rss_disconnected_at: Option<Instant>,
+    rss_disconnect_10s_done: bool,
+    /// Last read of `font_atlas_fill_ratio()` (updated once per
+    /// frame in `ui()`; the RSS log lines read this field, so
+    /// `sample_rss` needs no `egui::Context` and stays callable
+    /// from `apply_event` / `disconnect`). 0.0 before the first
+    /// frame.
+    last_atlas_fill: f32,
+    /// Cached `log.join("\n")` for the log panel (v3.14, diagnosis
+    /// §3 item 4): the old code re-joined up to 100 lines every
+    /// frame. Rebuilt only when `log_text_dirty` (set by the only
+    /// log writer, `log_line_at`).
+    log_text_cache: String,
+    log_text_dirty: bool,
+    /// Cached display order + built rows (v3.14, diagnosis §3 item
+    /// 7), both keyed by `list_fingerprint()`: (fingerprint,
+    /// order) / (fingerprint, rows). A fingerprint change rebuilds;
+    /// anything else reuses the cached values with no per-frame
+    /// `String` allocation. The fingerprint hashes every field the
+    /// rows or the order read (node display fields, `probes`,
+    /// `probe_ms`, `sort`, connected node) — a missed input would
+    /// show a stale list, so the hash inputs are the contract.
+    order_cache: Option<(u64, Vec<usize>)>,
+    rows_cache: Option<(u64, Vec<NodeRow>)>,
+    /// How many times `build_rows` ran (test-only: the cache tests
+    /// assert a second frame with an unchanged list does NOT
+    /// rebuild). Never read in production.
+    #[cfg(test)]
+    rows_built: usize,
+    /// True while this instance is exiting because the user chose
+    /// 重启客户端 (v3.14): `perform_quit` then keeps the resume
+    /// marker the restart just wrote; a manual quit
+    /// (`restarting == false`) deletes it, so a later manual open
+    /// never auto-connects.
+    restarting: bool,
+    /// A restart-resume auto-connect is in flight (v3.14): set by
+    /// `try_resume` when it starts the connect, cleared by the
+    /// `Connected` / `ConnectFailed` event — so those handlers can
+    /// log the resume outcome explicitly ("已连回…" /
+    /// "自动连接失败…，保持断开，不再重试").
+    resume_pending: bool,
     event_tx: mpsc::Sender<GuiEvent>,
     event_rx: Option<mpsc::Receiver<GuiEvent>>,
 }
@@ -1167,6 +1263,23 @@ impl Default for GuiApp {
             last_save_error: String::new(),
             file_logger: None,
             log_path: None,
+            started_at: Instant::now(),
+            rss_t0_done: false,
+            rss_t5_done: false,
+            rss_last_periodic: Instant::now(),
+            rss_connected_since: None,
+            rss_conn30_done: false,
+            rss_disconnected_at: None,
+            rss_disconnect_10s_done: false,
+            last_atlas_fill: 0.0,
+            log_text_cache: String::new(),
+            log_text_dirty: true,
+            order_cache: None,
+            rows_cache: None,
+            #[cfg(test)]
+            rows_built: 0,
+            restarting: false,
+            resume_pending: false,
             event_tx: tx,
             event_rx: Some(rx),
         }
@@ -1174,8 +1287,8 @@ impl Default for GuiApp {
 }
 
 /// Brand palette, coordinated with the app icon (solid indigo #1E40AF
-/// + bold white V since v3.13; before that an indigo → cyan gradient).
-/// Restrained on purpose: one accent (indigo), one
+/// + bold white shield since v3.14; a bold white V in v3.13, an indigo
+/// → cyan gradient before that). Restrained on purpose: one accent (indigo), one
 /// success accent (cyan/teal, used for the ∞ connected-node mark),
 /// muted amber for warnings, soft red for errors — no multi-colour
 /// mixing. Both themes follow the OS setting; these are per-theme
@@ -1355,6 +1468,11 @@ impl GuiApp {
         );
         app.status = loaded.clone();
         app.log_line(loaded);
+        // v3.14 restart-resume: a marker written by the instance
+        // that restarted into this one auto-connects to the same
+        // node once, via the normal start_connect path. No marker
+        // (a manual open) → nothing happens here.
+        app.try_resume(cc.egui_ctx.clone());
         app
     }
 
@@ -1585,6 +1703,177 @@ impl GuiApp {
             let excess = self.log.len() - 100;
             self.log.drain(..excess);
         }
+        // The log panel's cached join is stale now (v3.14 §3 item 4).
+        self.log_text_dirty = true;
+    }
+
+    /// The log panel's text: `log.join("\n")`, cached and rebuilt
+    /// only when a line was added since the last call (v3.14,
+    /// diagnosis §3 item 4 — the old code re-joined up to 100 lines
+    /// every frame). The `TextEdit` shows it read-only.
+    fn cached_log_text(&mut self) -> &str {
+        if self.log_text_dirty {
+            self.log_text_cache = self.log.join("\n");
+            self.log_text_dirty = false;
+        }
+        &self.log_text_cache
+    }
+
+    // --- RSS sampling (v3.14, diagnosis §7) -------------------------
+
+    /// This process's working set + pagefile usage, in bytes.
+    /// Windows: `GetProcessMemoryInfo` via a direct `psapi` extern
+    /// — zero new dependencies, no `Cargo.toml` change. The task
+    /// manager's "内存" column is the PRIVATE working set while
+    /// `WorkingSetSize` includes shared pages, so the absolute
+    /// numbers differ by a few MB; the log lines are for the
+    /// longitudinal growth curve (same口径, deltas), not for
+    /// matching a screenshot. `None` on Linux (the VM build logs
+    /// the line with `n/a` so the plumbing is still verifiable).
+    #[cfg(windows)]
+    fn read_working_set() -> Option<(u64, u64)> {
+        use std::ffi::c_void;
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct ProcessMemoryCounters {
+            cb: u32,
+            PageFaultCount: u32,
+            PeakWorkingSetSize: usize,
+            WorkingSetSize: usize,
+            QuotaPeakPagedPoolUsage: usize,
+            QuotaPagedPoolUsage: usize,
+            QuotaPeakNonPagedPoolUsage: usize,
+            QuotaNonPagedPoolUsage: usize,
+            PagefileUsage: usize,
+            PeakPagefileUsage: usize,
+        }
+        #[link(name = "psapi")]
+        extern "system" {
+            fn GetCurrentProcess() -> *mut c_void;
+            fn GetProcessMemoryInfo(
+                h_process: *mut c_void,
+                ppsmem_counters: *mut ProcessMemoryCounters,
+                cb: u32,
+            ) -> i32;
+        }
+        let mut counters = ProcessMemoryCounters {
+            cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
+            PageFaultCount: 0,
+            PeakWorkingSetSize: 0,
+            WorkingSetSize: 0,
+            QuotaPeakPagedPoolUsage: 0,
+            QuotaPagedPoolUsage: 0,
+            QuotaPeakNonPagedPoolUsage: 0,
+            QuotaNonPagedPoolUsage: 0,
+            PagefileUsage: 0,
+            PeakPagefileUsage: 0,
+        };
+        let ok = unsafe {
+            GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters,
+                counters.cb,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        Some((counters.WorkingSetSize as u64, counters.PagefileUsage as u64))
+    }
+
+    #[cfg(not(windows))]
+    fn read_working_set() -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Write one `[RSS]` line to the on-screen + file log (diagnosis
+    /// §7.2): `t` (elapsed since startup), `tag` (the event),
+    /// working set + pagefile, font-atlas fill ratio, live tunnel
+    /// sessions, connected?, node count, dropped `ConnLog` lines.
+    /// Leo sends `vpngate-gui.log` back and the curve is read off
+    /// these lines; the three tiers (diagnosis §7.3) are judged
+    /// from them, not from a screenshot.
+    fn sample_rss(&mut self, tag: &str) {
+        let elapsed = self.started_at.elapsed();
+        let t = format!(
+            "+{:03}:{:02}",
+            elapsed.as_secs() / 3600,
+            (elapsed.as_secs() % 3600) / 60
+        );
+        let sessions = self
+            .conn
+            .as_ref()
+            .map(|c| c.tunnel.session_count())
+            .unwrap_or(0);
+        let (ws, pf) = match Self::read_working_set() {
+            Some((w, p)) => (
+                format!("{:.1}MB", w as f64 / 1_048_576.0),
+                format!("{:.1}MB", p as f64 / 1_048_576.0),
+            ),
+            None => ("n/a".to_string(), "n/a".to_string()),
+        };
+        self.log_line(format!(
+            "[RSS] t={} tag={} working_set={} pagefile={} atlas_fill={:.2} sessions={} conn={} nodes={} conn_log_dropped={}",
+            t,
+            tag,
+            ws,
+            pf,
+            self.last_atlas_fill,
+            sessions,
+            self.conn.is_some(),
+            self.nodes.len(),
+            vpngate_client::socks5::conn_log_dropped()
+        ));
+    }
+
+    /// Which timed RSS samples are due at `now` (pure: takes the
+    /// clock so tests can drive it without waiting). One-shot tags
+    /// fire once; `periodic` fires every 30 minutes from startup.
+    fn rss_timer_tags(&self, now: Instant) -> Vec<&'static str> {
+        let mut tags = Vec::new();
+        if !self.rss_t0_done {
+            tags.push("startup");
+        }
+        if !self.rss_t5_done
+            && now.duration_since(self.started_at) >= Duration::from_secs(5 * 60)
+        {
+            tags.push("startup_plus_5min");
+        }
+        if !self.rss_conn30_done {
+            if let Some(since) = self.rss_connected_since {
+                if now.duration_since(since) >= Duration::from_secs(30 * 60) {
+                    tags.push("connected_plus_30min");
+                }
+            }
+        }
+        if !self.rss_disconnect_10s_done {
+            if let Some(at) = self.rss_disconnected_at {
+                if now.duration_since(at) >= Duration::from_secs(10) {
+                    tags.push("disconnected_plus_10s");
+                }
+            }
+        }
+        if now.duration_since(self.rss_last_periodic) >= Duration::from_secs(30 * 60) {
+            tags.push("periodic");
+        }
+        tags
+    }
+
+    /// Sample every RSS tag due now (called once per frame from
+    /// `ui()`). Marks one-shot tags done as they fire.
+    fn check_rss_timers(&mut self) {
+        let now = Instant::now();
+        for tag in self.rss_timer_tags(now) {
+            match tag {
+                "startup" => self.rss_t0_done = true,
+                "startup_plus_5min" => self.rss_t5_done = true,
+                "connected_plus_30min" => self.rss_conn30_done = true,
+                "disconnected_plus_10s" => self.rss_disconnect_10s_done = true,
+                "periodic" => self.rss_last_periodic = now,
+                _ => {}
+            }
+            self.sample_rss(tag);
+        }
     }
 
     /// Set the error banner AND log it at [ERROR] (both logs). Use
@@ -1694,7 +1983,7 @@ impl GuiApp {
     /// `start_probe` builds it). A snapshot, not indices: the list
     /// can gain a manually-added node mid-sweep, which would shift
     /// indices under a stored queue.
-    fn probe_all_targets(&self) -> Vec<(String, String)> {
+    fn probe_all_targets(&mut self) -> Vec<(String, String)> {
         self.display_indices()
             .into_iter()
             .filter_map(|i| {
@@ -1827,9 +2116,15 @@ impl GuiApp {
             // Per-connection lines from the mixed proxy go through
             // this channel into the GUI log (GuiEvent::ConnLog);
             // the forwarder joins the connection's serve tasks, so
-            // disconnecting aborts it too.
+            // disconnecting aborts it too. v3.14: BOUNDED (512,
+            // `CONN_LOG_CAPACITY`) — the old unbounded channel could
+            // queue log lines without limit while the UI was stalled;
+            // overflow lines are now dropped + counted (see
+            // `emit_conn_log`), never queued.
             let (conn_tx, mut conn_rx) =
-                tokio::sync::mpsc::unbounded_channel::<String>();
+                tokio::sync::mpsc::channel::<String>(
+                    vpngate_client::socks5::CONN_LOG_CAPACITY,
+                );
             let tx2 = tx.clone();
             match connect_flow(
                 connector,
@@ -1903,6 +2198,13 @@ impl GuiApp {
         }
         self.status = "未连接".to_string();
         self.error.clear();
+        // v3.14 RSS: disconnect sample now + another 10 s later
+        // (whether the disconnect actually released the tunnel is
+        // the §4.1 evidence — see `check_rss_timers`).
+        self.rss_connected_since = None;
+        self.rss_disconnected_at = Some(Instant::now());
+        self.rss_disconnect_10s_done = false;
+        self.sample_rss("disconnected");
     }
 
     /// Whether a live tray icon exists (Windows only; always false
@@ -1937,10 +2239,18 @@ impl GuiApp {
     /// The real-quit path, shared by the File-menu 退出, the tray
     /// 退出, and (via close_requested) the X button when there is no
     /// tray: disconnect first, persist settings, drop the tray icon
-    /// (dropping the handle removes it from the tray).
+    /// (dropping the handle removes it from the tray). A manual quit
+    /// also deletes any resume marker (v3.14): a later manual open
+    /// must never auto-connect. A restart (`restarting == true`)
+    /// keeps the marker the restart just wrote.
     fn perform_quit(&mut self) {
         self.disconnect();
         self.auto_save_if_dirty();
+        if !self.restarting {
+            if let Some(path) = tray::resume_file_path() {
+                tray::clear_resume_target(&path);
+            }
+        }
         #[cfg(windows)]
         {
             self.tray.take();
@@ -1957,16 +2267,52 @@ impl GuiApp {
     }
 
     /// Restart the client: launch a fresh instance of this exe
-    /// (same arguments) and quit this one. The new instance starts
-    /// disconnected; the tunnel is never restored automatically.
+    /// (same arguments) and quit this one. v3.14: when a node is
+    /// connected right now, a one-shot resume marker is written
+    /// FIRST (`resume.json` next to the exe — target + label), so
+    /// the new instance auto-connects to the same node once
+    /// (`try_resume`, called from `new()`); when nothing is
+    /// connected, no marker is written and the new instance starts
+    /// disconnected, as before. A marker that cannot be written
+    /// only loses the resume — the restart itself still happens,
+    /// and the user reconnects by hand.
     /// (Windows only — only the tray calls it.)
     #[cfg(windows)]
     fn restart_client(&mut self, ctx: &egui::Context) {
+        if let Some(c) = &self.conn {
+            let target = c.node_label.clone();
+            match tray::resume_file_path() {
+                Some(path) => {
+                    match tray::write_resume_target(&path, &target, &target) {
+                        Ok(()) => {
+                            self.log_line(format!(
+                                "正在重启客户端，重启后自动连回 {}……",
+                                target
+                            ));
+                        }
+                        Err(e) => {
+                            self.log_line(format!(
+                                "正在重启客户端（恢复标记写不进 {}：{}，重启后需手动再连）……",
+                                path.display(),
+                                e
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    self.log_line(
+                        "正在重启客户端（找不到程序目录，写不了恢复标记，重启后需手动再连）……".to_string(),
+                    );
+                }
+            }
+        } else {
+            self.log_line("正在重启客户端……".to_string());
+        }
         match tray::restart_command() {
             Ok((exe, args)) => {
                 match std::process::Command::new(&exe).args(&args).spawn() {
                     Ok(_) => {
-                        self.log_line("正在重启客户端……".to_string());
+                        self.restarting = true;
                         self.quit_requested = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -1979,6 +2325,65 @@ impl GuiApp {
             Err(e) => {
                 self.error = format!("重启失败：{e}");
                 self.log_line(format!("重启客户端失败：找不到当前程序路径：{e}。"));
+            }
+        }
+    }
+
+    /// Consume a restart-resume marker, if one was written by the
+    /// instance that restarted into this one (v3.14, Leo 11:37 —
+    /// "重启后自动连回原来那个节点"). Called once from `new()`,
+    /// after the node list is loaded. Rules:
+    /// * No marker → nothing happens (a manual open never
+    ///   auto-connects — only a restart writes a marker, and
+    ///   `perform_quit` deletes any stale one on a manual quit).
+    /// * Marker + target in the list → select it and `start_connect`
+    ///   (the normal path, one attempt, `resume_pending` set so the
+    ///   Connected / ConnectFailed handlers log the outcome).
+    /// * Marker + target NOT in the list → log why and stay
+    ///   disconnected, no retry.
+    /// * The marker is deleted by the read itself
+    ///   (`take_resume_target`), before connecting — it can only
+    ///   ever fire once, even if this connect fails or the app
+    ///   crashes mid-connect. A stale marker (> 10 min, the new
+    ///   instance crashed before consuming it) is ignored the same
+    ///   way.
+    /// * Port race: the old instance may still hold the local
+    ///   listen port when this connect binds — `connect_flow`
+    ///   retries the bind once after 2 s.
+    fn try_resume(&mut self, ctx: egui::Context) {
+        let Some(path) = tray::resume_file_path() else {
+            return;
+        };
+        let Some(rt) = tray::take_resume_target(&path) else {
+            return;
+        };
+        let idx = self.nodes.iter().position(|n| {
+            let t = match n.port {
+                Some(p) => format!(
+                    "{}:{}",
+                    vpngate::complete_ddns_host(&n.host),
+                    p
+                ),
+                None => vpngate::complete_ddns_host(&n.host),
+            };
+            t == rt.target
+        });
+        match idx {
+            Some(i) => {
+                self.selected = Some(i);
+                self.selected_set = BTreeSet::from([i]);
+                self.log_line(format!(
+                    "重启恢复：上次连接的是 {}，自动连回它……",
+                    rt.label
+                ));
+                self.resume_pending = true;
+                self.start_connect(ctx);
+            }
+            None => {
+                self.log_line(format!(
+                    "重启恢复：节点 {} 不在列表里，不自动连接。",
+                    rt.label
+                ));
             }
         }
     }
@@ -2250,6 +2655,8 @@ impl GuiApp {
                         total, ok, failed
                     ));
                 }
+                // v3.14 RSS: probe-all-done sample (Tier C).
+                self.sample_rss("probe_all_done");
             }
             GuiEvent::Connected(c) => {
                 self.busy = None;
@@ -2259,12 +2666,29 @@ impl GuiApp {
                     "已连接 {}，虚拟 IP {}，本地混合代理（SOCKS5+HTTP）{}。浏览器/应用连这个端口即可上网。",
                     c.node_label, c.vip, c.listen_addr
                 ));
+                if self.resume_pending {
+                    self.resume_pending = false;
+                    self.log_line(format!(
+                        "重启恢复：已自动连回 {}。",
+                        c.node_label
+                    ));
+                }
                 self.conn = Some(*c);
+                // v3.14 RSS: connection-start sample + 30-min timer.
+                self.rss_connected_since = Some(Instant::now());
+                self.rss_conn30_done = false;
+                self.sample_rss("connected");
             }
             GuiEvent::ConnectFailed(e) => {
                 self.busy = None;
                 self.status = "连接失败。".to_string();
                 self.set_error(format!("连接失败：{}。换一个节点，或检查前置 SOCKS5 设置。", e));
+                if self.resume_pending {
+                    self.resume_pending = false;
+                    self.log_line(
+                        "重启恢复：自动连接失败，保持断开，不再重试。".to_string(),
+                    );
+                }
             }
             GuiEvent::ConnLog(line) => {
                 self.log_line(line);
@@ -2338,13 +2762,162 @@ impl GuiApp {
         })
     }
 
+    /// The rows for this frame, from the cache when
+    /// `list_fingerprint()` is unchanged, freshly built otherwise.
+    /// Takes the cache out (the caller puts it back after the
+    /// frame — see `ui()`); returns the fingerprint alongside, so
+    /// the caller can store the pair back. The build counter
+    /// (`rows_built`, test-only) is what the cache tests assert on.
+    fn cached_rows(&mut self) -> (u64, Vec<NodeRow>) {
+        let fp = self.list_fingerprint();
+        let rows = match self.rows_cache.take() {
+            Some((cached_fp, cached)) if cached_fp == fp => cached,
+            _ => self.build_rows(),
+        };
+        (fp, rows)
+    }
+
+    /// Build the rendered node-list rows in display order (see
+    /// `display_indices`). Pure construction — the caller
+    /// (`ui()`) caches the result in `rows_cache` and only calls
+    /// this when `list_fingerprint()` changed.
+    fn build_rows(&mut self) -> Vec<NodeRow> {
+        #[cfg(test)]
+        {
+            self.rows_built += 1;
+        }
+        let connected_host = self.connected_node_host();
+        self.display_indices()
+            .into_iter()
+            .map(|idx| {
+                let n = &self.nodes[idx];
+                let status = self
+                    .probes
+                    .get(&n.host)
+                    .cloned()
+                    .unwrap_or_else(|| "未探测".to_string());
+                let full = match n.port {
+                    Some(p) => format!("{}:{}", n.host, p),
+                    None => n.host.clone(),
+                };
+                let status_icon =
+                    if connected_host.as_deref().is_some_and(|h| {
+                        vpngate::complete_ddns_host(&n.host) == h
+                    }) {
+                        "∞".to_string()
+                    } else {
+                        String::new()
+                    };
+                (
+                    idx,
+                    status_icon,
+                    // Full text here: the cells truncate with "…"
+                    // to the current column width (see below), so
+                    // widening a column shows more instead of a
+                    // fixed 12/14-character cut. Empty
+                    // country/operator shows "—": no literal
+                    // placeholder value ("导入", "手动", "未知")
+                    // is ever stored in these fields (v3.12).
+                    if n.country.is_empty() {
+                        "—".to_string()
+                    } else {
+                        n.country.clone()
+                    },
+                    if !n.isp.is_empty() {
+                        n.isp.clone()
+                    } else if !n.name.is_empty() {
+                        n.name.clone()
+                    } else {
+                        "—".to_string()
+                    },
+                    sessions_cell(n),
+                    quality_cell(n),
+                    per_capita_cell(n),
+                    // All curated hosts end in .opengw.net; drop
+                    // the suffix for display (full host is in
+                    // the tooltip).
+                    match n.port {
+                        Some(p) => format!(
+                            "{}:{}",
+                            n.host.strip_suffix(".opengw.net").unwrap_or(&n.host),
+                            p
+                        ),
+                        None => n
+                            .host
+                            .strip_suffix(".opengw.net")
+                            .unwrap_or(&n.host)
+                            .to_string(),
+                    },
+                    status,
+                    full,
+                )
+            })
+            .collect()
+    }
+
+    /// Fingerprint of everything the node list's display order and
+    /// built rows read (v3.14, diagnosis §3 item 7): every displayed
+    /// node field, `probes`, `probe_ms`, `sort`, and the connected
+    /// node's label (the ∞ mark). The `order_cache` / `rows_cache`
+    /// rebuild only when this changes; any input missed here would
+    /// show a stale list, so the hashed inputs ARE the contract.
+    /// `HashMap` iteration order is stable within a run (it only
+    /// changes when the map rehashes, which also changes content),
+    /// so no sorting allocation is needed — a different order with
+    /// the same content can only cause a spurious rebuild, never a
+    /// stale read.
+    fn list_fingerprint(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        let mut h = DefaultHasher::new();
+        self.nodes.len().hash(&mut h);
+        for n in &self.nodes {
+            n.host.hash(&mut h);
+            n.port.hash(&mut h);
+            n.country.hash(&mut h);
+            n.country_code.hash(&mut h);
+            n.isp.hash(&mut h);
+            n.name.hash(&mut h);
+            n.score.hash(&mut h);
+            n.ping_ms.hash(&mut h);
+            n.speed_mbps.hash(&mut h);
+            n.sessions.hash(&mut h);
+            n.ip.hash(&mut h);
+        }
+        for (k, v) in &self.probes {
+            k.hash(&mut h);
+            v.hash(&mut h);
+        }
+        for (k, v) in &self.probe_ms {
+            k.hash(&mut h);
+            v.hash(&mut h);
+        }
+        self.sort.hash(&mut h);
+        self.conn.as_ref().map(|c| &c.node_label).hash(&mut h);
+        h.finish()
+    }
+
     /// Node indices in display order: fetch order by default, or
     /// sorted by the column the user picked (see `sort`) — the
     /// whole row follows the sort key, and `selected` still stores
     /// a node index, so sorting never misaligns the selection. A
     /// refresh replaces `self.nodes` and the sort re-applies
     /// automatically, since the order is computed here, not stored.
-    fn display_indices(&self) -> Vec<usize> {
+    /// v3.14: cached by `list_fingerprint()` — the sort over ~125
+    /// rows is re-run only when the list actually changed.
+    fn display_indices(&mut self) -> Vec<usize> {
+        let fp = self.list_fingerprint();
+        if let Some((cached_fp, cached)) = &self.order_cache {
+            if *cached_fp == fp {
+                return cached.clone();
+            }
+        }
+        let order = self.compute_display_indices();
+        self.order_cache = Some((fp, order.clone()));
+        order
+    }
+
+    /// The uncached sort (see `display_indices`).
+    fn compute_display_indices(&self) -> Vec<usize> {
         let mut idx: Vec<usize> = (0..self.nodes.len()).collect();
         if let Some((col, dir)) = self.sort {
             idx.sort_by(|&a, &b| {
@@ -2707,7 +3280,7 @@ impl GuiApp {
     /// The selected nodes in display order (see `display_indices`,
     /// so a sorted list exports in the shown order). Cloned: the
     /// export text is built from this snapshot.
-    fn selected_nodes_in_display_order(&self) -> Vec<Node> {
+    fn selected_nodes_in_display_order(&mut self) -> Vec<Node> {
         self.display_indices()
             .into_iter()
             .filter(|i| self.selected_set.contains(i))
@@ -3070,6 +3643,14 @@ impl eframe::App for GuiApp {
         // Background results first.
         self.drain_events();
 
+        // v3.14 RSS sampling: atlas fill is read once per frame
+        // (cheap float read) so the RSS log lines — including the
+        // ones written from apply_event/disconnect, which have no
+        // Context — always carry a fresh value; the timers fire the
+        // one-shot + periodic samples.
+        self.last_atlas_fill = ui.ctx().fonts(|f| f.font_atlas_fill_ratio());
+        self.check_rss_timers();
+
         // Escape closes the About window.
         if self.show_about && ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
             self.show_about = false;
@@ -3328,84 +3909,13 @@ impl eframe::App for GuiApp {
             // order (see display_indices): fetch order by default, or
             // sorted by the column the user clicked. `selected` still
             // stores a node index.
-            let connected_host = self.connected_node_host();
-            let rows: Vec<(
-                usize,
-                String,
-                String,
-                String,
-                String,
-                String,
-                String,
-                String,
-                String,
-                String,
-            )> = self.display_indices()
-                    .into_iter()
-                    .map(|idx| {
-                        let n = &self.nodes[idx];
-                        let status = self
-                            .probes
-                            .get(&n.host)
-                            .cloned()
-                            .unwrap_or_else(|| "未探测".to_string());
-                        let full = match n.port {
-                            Some(p) => format!("{}:{}", n.host, p),
-                            None => n.host.clone(),
-                        };
-                        let status_icon =
-                            if connected_host.as_deref().is_some_and(|h| {
-                                vpngate::complete_ddns_host(&n.host) == h
-                            }) {
-                                "∞".to_string()
-                            } else {
-                                String::new()
-                            };
-                        (
-                            idx,
-                            status_icon,
-                            // Full text here: the cells truncate with "…"
-                            // to the current column width (see below), so
-                            // widening a column shows more instead of a
-                            // fixed 12/14-character cut. Empty
-                            // country/operator shows "—": no literal
-                            // placeholder value ("导入", "手动", "未知")
-                            // is ever stored in these fields (v3.12).
-                            if n.country.is_empty() {
-                                "—".to_string()
-                            } else {
-                                n.country.clone()
-                            },
-                            if !n.isp.is_empty() {
-                                n.isp.clone()
-                            } else if !n.name.is_empty() {
-                                n.name.clone()
-                            } else {
-                                "—".to_string()
-                            },
-                            sessions_cell(n),
-                            quality_cell(n),
-                            per_capita_cell(n),
-                            // All curated hosts end in .opengw.net; drop
-                            // the suffix for display (full host is in
-                            // the tooltip).
-                            match n.port {
-                                Some(p) => format!(
-                                    "{}:{}",
-                                    n.host.strip_suffix(".opengw.net").unwrap_or(&n.host),
-                                    p
-                                ),
-                                None => n
-                                    .host
-                                    .strip_suffix(".opengw.net")
-                                    .unwrap_or(&n.host)
-                                    .to_string(),
-                            },
-                            status,
-                            full,
-                        )
-                    })
-                    .collect();
+            // v3.14 rows cache (diagnosis §3 item 7): the built rows
+            // are reused while `list_fingerprint()` is unchanged, so
+            // the ~1100 per-frame `String` allocations happen only
+            // when the list actually changed. Taken out of the cache
+            // for this frame (the row loop below still mutates
+            // `self`) and put back after the outer scroll area.
+            let (rows_fp, rows) = self.cached_rows();
             // v3.13: the dragged height wins; until the first drag the
             // old formula is the default (see effective_list_height).
             let list_h = self.effective_list_height(panel_h);
@@ -4249,10 +4759,16 @@ impl eframe::App for GuiApp {
 
             // Log.
             ui.label("日志");
-            let log_text = self.log.join("\n");
+            // v3.14: cached join (see cached_log_text) — the old
+            // `self.log.join("\n")` re-allocated up to 100 lines
+            // every frame. The height is read into a local first:
+            // `log_view` borrows `self`, so no `self.*` field may
+            // be touched while it lives.
+            let log_height = self.log_height;
+            let mut log_view = self.cached_log_text();
             egui::ScrollArea::vertical()
                 .id_salt("log")
-                .max_height(self.log_height)
+                .max_height(log_height)
                 .auto_shrink([false, false])
                 // v3.13: the log bar is always visible too (it was the
                 // only one left on the default floating style).
@@ -4262,13 +4778,13 @@ impl eframe::App for GuiApp {
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     ui.add(
-                        egui::TextEdit::multiline(&mut log_text.as_str())
+                        egui::TextEdit::multiline(&mut log_view)
                             .font(egui::TextStyle::Monospace)
                             .desired_width(f32::INFINITY),
                     );
                 });
             // v3.13 resize handle for the log box (60–400 px).
-            let mut log_h = self.log_height;
+            let mut log_h = log_height;
             let log_rect = height_drag_handle(
                 ui,
                 "log_height_handle",
@@ -4284,6 +4800,8 @@ impl eframe::App for GuiApp {
             #[cfg(not(test))]
             let _ = log_rect;
             self.log_height = vpngate_client::config::clamp_log_height(log_h);
+            // v3.14: put the rows back in the cache for the next frame.
+            self.rows_cache = Some((rows_fp, rows));
             });
         });
 
@@ -4315,11 +4833,21 @@ impl eframe::App for GuiApp {
 fn main() -> eframe::Result {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let _guard = rt.enter(); // lets tokio::spawn find the runtime
+    // v3.14: the window/taskbar icon is set explicitly from the
+    // 32 px entry of the same assets/icon.ico the tray and the exe
+    // use (decoded, never a loose PNG — icon-256.png is gitignored).
+    // Without it the window fell back to the exe default.
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("VPNGate 客户端")
+        .with_inner_size([800.0, 600.0])
+        .with_min_inner_size([560.0, 420.0]);
+    if let Some(icon) =
+        vpngate_client::tray::window_icon_data(include_bytes!("../../assets/icon.ico"))
+    {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("VPNGate 客户端")
-            .with_inner_size([800.0, 600.0])
-            .with_min_inner_size([560.0, 420.0]),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -6751,6 +7279,286 @@ mod tests {
         );
     }
 
+    // --- v3.14 -------------------------------------------------------
+
+    /// v3.14 RSS (diagnosis §7): `sample_rss` writes one `[RSS]`
+    /// line carrying every field the growth curve needs — tag,
+    /// working set, atlas fill, sessions, conn, nodes, dropped log
+    /// lines. On Linux the working set reads `n/a` (no Windows
+    /// RSS in the VM); the line itself must still be written, so
+    /// the plumbing is verifiable here and the numbers on Leo's
+    /// machine.
+    #[test]
+    fn sample_rss_writes_log_line_with_all_fields() {
+        let mut app = GuiApp::for_tests();
+        app.sample_rss("startup");
+        let line = app
+            .log
+            .iter()
+            .find(|l| l.contains("[RSS]"))
+            .expect("an [RSS] line must be logged");
+        assert!(line.contains("tag=startup"), "tag: {}", line);
+        assert!(line.contains("working_set="), "working set: {}", line);
+        assert!(line.contains("atlas_fill="), "atlas fill: {}", line);
+        assert!(line.contains("sessions=0"), "sessions: {}", line);
+        assert!(line.contains("conn=false"), "conn: {}", line);
+        assert!(
+            line.contains(&format!("nodes={}", app.nodes.len())),
+            "nodes: {}",
+            line
+        );
+        assert!(line.contains("conn_log_dropped="), "dropped: {}", line);
+    }
+
+    /// v3.14 RSS timers: each one-shot tag fires once, at the right
+    /// elapsed time — driven with fake clocks, no waiting.
+    #[test]
+    fn rss_timer_tags_fire_once_at_right_times() {
+        let mut app = GuiApp::for_tests();
+        let start = app.started_at;
+        // Align the periodic anchor exactly with startup (Default
+        // sets it a few ns after started_at, which would push the
+        // first periodic sample a few ns past the 30-minute mark).
+        app.rss_last_periodic = start;
+        assert!(
+            app.rss_timer_tags(start).contains(&"startup"),
+            "T0 fires on the first frame"
+        );
+        assert!(
+            !app.rss_timer_tags(start + Duration::from_secs(299))
+                .contains(&"startup_plus_5min"),
+            "T+5min must not fire early"
+        );
+        assert!(
+            app.rss_timer_tags(start + Duration::from_secs(300))
+                .contains(&"startup_plus_5min"),
+            "T+5min fires at 5 minutes"
+        );
+        app.rss_connected_since = Some(start);
+        assert!(
+            !app.rss_timer_tags(start + Duration::from_secs(1799))
+                .contains(&"connected_plus_30min"),
+            "C+30min must not fire early"
+        );
+        assert!(
+            app.rss_timer_tags(start + Duration::from_secs(1800))
+                .contains(&"connected_plus_30min"),
+            "C+30min fires at 30 minutes connected"
+        );
+        app.rss_disconnected_at = Some(start);
+        assert!(
+            app.rss_timer_tags(start + Duration::from_secs(10))
+                .contains(&"disconnected_plus_10s"),
+            "D+10s fires 10 s after disconnect"
+        );
+        assert!(
+            app.rss_timer_tags(start + Duration::from_secs(1800))
+                .contains(&"periodic"),
+            "periodic fires every 30 minutes"
+        );
+        // Marking them done stops them firing again.
+        app.rss_t0_done = true;
+        app.rss_t5_done = true;
+        app.rss_conn30_done = true;
+        app.rss_disconnect_10s_done = true;
+        app.rss_last_periodic = start + Duration::from_secs(1800);
+        let tags = app.rss_timer_tags(start + Duration::from_secs(1800));
+        assert!(tags.is_empty(), "done tags must not refire: {:?}", tags);
+    }
+
+    /// v3.14 RSS: disconnecting writes the D0 sample immediately.
+    #[test]
+    fn disconnect_logs_rss_disconnected_line() {
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut app = connected_test_app(tunnel);
+        app.disconnect();
+        assert!(
+            app.log.iter().any(|l| l.contains("[RSS]")
+                && l.contains("tag=disconnected")),
+            "disconnect must sample RSS: {:?}",
+            app.log
+        );
+        assert_eq!(app.status, "未连接");
+    }
+
+    /// v3.14 log cache (diagnosis §3 item 4): the cached join is
+    /// rebuilt only when a line was added — the dirty flag is the
+    /// contract, and `log_line_at` (the only writer) sets it.
+    #[test]
+    fn cached_log_text_rebuilds_only_on_new_lines() {
+        let mut app = GuiApp::for_tests();
+        app.log = vec!["a".to_string(), "b".to_string()];
+        app.log_text_dirty = true;
+        assert_eq!(app.cached_log_text(), "a\nb");
+        assert!(!app.log_text_dirty, "clean after rebuild");
+        assert_eq!(app.cached_log_text(), "a\nb", "no rebuild, same text");
+        app.log_line("c".to_string());
+        assert!(app.log_text_dirty, "a new line dirties the cache");
+        assert_eq!(app.cached_log_text(), "a\nb\nc");
+    }
+
+    /// v3.14 list fingerprint (diagnosis §3 item 7): stable while
+    /// nothing the list reads changes; moves on every input that
+    /// changes what the rows show (probe result, sort, connect).
+    #[test]
+    fn list_fingerprint_moves_only_on_list_inputs() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![node_in("a.opengw.net", "日本"), node_in("b.opengw.net", "美国")];
+        let fp0 = app.list_fingerprint();
+        assert_eq!(app.list_fingerprint(), fp0, "stable with no change");
+        app.probes
+            .insert("a.opengw.net".to_string(), "10 ms".to_string());
+        app.probe_ms.insert("a.opengw.net".to_string(), 10);
+        let fp1 = app.list_fingerprint();
+        assert_ne!(fp1, fp0, "a probe result must move the fingerprint");
+        assert_eq!(app.list_fingerprint(), fp1, "stable again");
+        app.toggle_sort(SortCol::Sessions);
+        assert_ne!(
+            app.list_fingerprint(),
+            fp1,
+            "a sort change must move the fingerprint"
+        );
+    }
+
+    /// v3.14 rows cache (diagnosis §3 item 7): a second frame with
+    /// an unchanged list does NOT rebuild the rows; a probe result
+    /// (which changes a row's status cell) does — and the rebuilt
+    /// rows show the new status.
+    #[test]
+    fn rows_cache_reuses_unchanged_list_and_rebuilds_on_probe() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![node_in("a.opengw.net", "日本"), node_in("b.opengw.net", "美国")];
+        let (fp, rows) = app.cached_rows();
+        assert_eq!(app.rows_built, 1, "first frame builds");
+        assert_eq!(rows[0].8, "未探测");
+        app.rows_cache = Some((fp, rows));
+        let (fp2, rows2) = app.cached_rows();
+        assert_eq!(app.rows_built, 1, "unchanged list must not rebuild");
+        assert_eq!(fp2, fp);
+        assert_eq!(rows2[0].8, "未探测");
+        app.rows_cache = Some((fp2, rows2));
+        app.probes
+            .insert("a.opengw.net".to_string(), "10 ms".to_string());
+        app.probe_ms.insert("a.opengw.net".to_string(), 10);
+        let (_fp3, rows3) = app.cached_rows();
+        assert_eq!(app.rows_built, 2, "a probe result must rebuild");
+        assert_eq!(rows3[0].8, "10 ms", "rebuilt rows show the new status");
+    }
+
+    /// v3.14 display-order cache: the order is computed once and
+    /// reused, and a sort toggle invalidates it.
+    #[test]
+    fn display_indices_cached_and_invalidated_by_sort() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "美国"),
+            node_in("c.opengw.net", "德国"),
+        ];
+        assert_eq!(app.display_indices(), vec![0, 1, 2]);
+        assert!(app.order_cache.is_some(), "first call fills the cache");
+        assert_eq!(app.display_indices(), vec![0, 1, 2], "cached reuse");
+        app.toggle_sort(SortCol::Country);
+        assert_eq!(
+            app.display_indices(),
+            vec![2, 0, 1],
+            "sort by country (code-point order: 德国/日本/美国) must invalidate"
+        );
+    }
+
+    /// v3.14 restart-resume, case 1: a marker for a node that IS in
+    /// the list makes the new instance select it and start the
+    /// normal connect — and the marker file is already gone (it is
+    /// consumed before connecting, so it can only ever fire once).
+    /// The connect itself cannot complete in a headless test (no
+    /// tokio runtime in `for_tests`), so the assertion is the
+    /// started connect: busy + selected + log.
+    #[test]
+    fn resume_connects_back_to_same_node_when_marker_present() {
+        let _lock = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let path = tray::resume_file_path().expect("exe path known in tests");
+        let _ = std::fs::remove_file(&path);
+        tray::write_resume_target(&path, "a.opengw.net:992", "a.opengw.net:992")
+            .expect("write resume");
+        let ctx = egui::Context::default();
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![node_in("a.opengw.net", "日本"), node_in("b.opengw.net", "美国")];
+        app.try_resume(ctx);
+        assert!(!path.exists(), "marker must be consumed before connecting");
+        assert_eq!(app.selected, Some(0), "the resumed node is selected");
+        assert_eq!(app.busy, Some(Busy::Connecting), "the connect must start");
+        assert!(app.resume_pending, "resume outcome is tracked");
+        assert!(
+            app.log.iter().any(|l| l.contains("重启恢复")
+                && l.contains("a.opengw.net:992")),
+            "log names the resumed node: {:?}",
+            app.log
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v3.14 restart-resume, case 2: the marker's node is NOT in
+    /// the list — log why, stay disconnected, do not retry.
+    #[test]
+    fn resume_missing_target_stays_disconnected_and_logs() {
+        let _lock = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let path = tray::resume_file_path().expect("exe path known in tests");
+        let _ = std::fs::remove_file(&path);
+        tray::write_resume_target(&path, "gone.opengw.net:992", "gone.opengw.net:992")
+            .expect("write resume");
+        let ctx = egui::Context::default();
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![node_in("a.opengw.net", "日本")];
+        app.try_resume(ctx);
+        assert!(!path.exists(), "marker consumed even when the node is gone");
+        assert_eq!(app.selected, None, "nothing selected");
+        assert_eq!(app.busy, None, "no connect started");
+        assert!(app.conn.is_none(), "stays disconnected");
+        assert!(
+            app.log.iter().any(|l| l.contains("重启恢复")
+                && l.contains("不在列表里")),
+            "log explains the missing node: {:?}",
+            app.log
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v3.14 restart-resume, case 3: no marker (a manual open) —
+    /// nothing happens: no selection, no connect, no resume log.
+    #[test]
+    fn resume_no_marker_stays_disconnected() {
+        let _lock = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let path = tray::resume_file_path().expect("exe path known in tests");
+        let _ = std::fs::remove_file(&path);
+        let ctx = egui::Context::default();
+        let mut app = GuiApp::for_tests();
+        let log_len = app.log.len();
+        app.try_resume(ctx);
+        assert_eq!(app.selected, None);
+        assert_eq!(app.busy, None);
+        assert!(app.conn.is_none());
+        assert_eq!(app.log.len(), log_len, "no resume log without a marker");
+    }
+
+    /// v3.14 restart-resume, case 4: a manual quit deletes any
+    /// resume marker (e.g. a stale one from a crashed restart), so
+    /// the next manual open can never auto-connect.
+    #[test]
+    fn manual_quit_clears_resume_marker() {
+        let _lock = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let path = tray::resume_file_path().expect("exe path known in tests");
+        tray::write_resume_target(&path, "a.opengw.net:992", "a.opengw.net:992")
+            .expect("write resume");
+        assert!(path.exists());
+        let mut app = GuiApp::for_tests();
+        app.perform_quit();
+        assert!(!path.exists(), "manual quit must delete the marker");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// v3.13 switch through the real UI (kittest): connected to A,
     /// click row B, press Enter — the old connection is dropped and
     /// a connect to B starts. Needs a graphics adapter + the mock
@@ -7807,7 +8615,7 @@ mod tests {
                 app
             });
         harness.run_steps(10);
-        assert_eq!(harness.state().display_indices(), vec![2, 1, 3, 0]);
+        assert_eq!(harness.state_mut().display_indices(), vec![2, 1, 3, 0]);
         // Click the 法国 row: display position 2, node index 3.
         click_row_label(&mut harness, "法国");
         assert_eq!(harness.state().selected, Some(3));
@@ -7857,7 +8665,7 @@ mod tests {
                 app
             });
         harness.run_steps(10);
-        assert_eq!(harness.state().display_indices(), vec![2, 1, 3, 0]);
+        assert_eq!(harness.state_mut().display_indices(), vec![2, 1, 3, 0]);
         // Click 德国 (node 2) then Ctrl+click 美国 (node 0).
         click_row_label(&mut harness, "德国");
         assert_eq!(
@@ -8039,7 +8847,7 @@ mod tests {
             "first header click sorts A-Z"
         );
         assert_eq!(
-            harness.state().display_indices(),
+            harness.state_mut().display_indices(),
             vec![1, 0],
             "日本 before 美国 in A-Z order"
         );
@@ -8052,7 +8860,7 @@ mod tests {
             Some((SortCol::Country, SortDir::Desc)),
             "second header click sorts Z-A"
         );
-        assert_eq!(harness.state().display_indices(), vec![0, 1]);
+        assert_eq!(harness.state_mut().display_indices(), vec![0, 1]);
     }
 
     /// Clicking the 当前人数 / 线路质量 headers sorts by that column
@@ -8088,7 +8896,7 @@ mod tests {
             Some((SortCol::Sessions, SortDir::Asc)),
             "first 当前人数 click sorts few-first"
         );
-        assert_eq!(harness.state().display_indices(), vec![1, 0, 2]);
+        assert_eq!(harness.state_mut().display_indices(), vec![1, 0, 2]);
         // Same header again: most first.
         harness.drag_at(sessions_center);
         harness.run();
@@ -8099,7 +8907,7 @@ mod tests {
             Some((SortCol::Sessions, SortDir::Desc)),
             "second 当前人数 click sorts most-first"
         );
-        assert_eq!(harness.state().display_indices(), vec![2, 0, 1]);
+        assert_eq!(harness.state_mut().display_indices(), vec![2, 0, 1]);
         // 线路质量, first click: fastest first (a 500, c 200, b 100).
         let quality_header = harness.get_by_label("线路质量");
         let quality_center = quality_header.rect().center();
@@ -8112,7 +8920,7 @@ mod tests {
             Some((SortCol::Quality, SortDir::Desc)),
             "first 线路质量 click sorts fastest-first"
         );
-        assert_eq!(harness.state().display_indices(), vec![0, 2, 1]);
+        assert_eq!(harness.state_mut().display_indices(), vec![0, 2, 1]);
         // 国家/地区: the arrow moves there alone (德国 < 日本 < 美国）.
         let country_header = harness.get_by_label("国家/地区");
         let country_center = country_header.rect().center();
@@ -8125,7 +8933,7 @@ mod tests {
             Some((SortCol::Country, SortDir::Asc)),
             "switching to the country header starts A-Z"
         );
-        assert_eq!(harness.state().display_indices(), vec![2, 0, 1]);
+        assert_eq!(harness.state_mut().display_indices(), vec![2, 0, 1]);
         harness.get_by_label("国家/地区 ▲");
         assert!(
             harness.query_by_label("当前人数 ▲").is_none(),
@@ -8193,7 +9001,7 @@ mod tests {
             Some((SortCol::Latency, SortDir::Asc)),
             "first latency click: available by ms, unprobed middle, failed last"
         );
-        assert_eq!(harness.state().display_indices(), vec![0, 1, 2]);
+        assert_eq!(harness.state_mut().display_indices(), vec![0, 1, 2]);
         harness.drag_at(center);
         harness.run();
         harness.drop_at(center);
@@ -8203,7 +9011,7 @@ mod tests {
             Some((SortCol::Latency, SortDir::Desc)),
             "second latency click reverses the whole order"
         );
-        assert_eq!(harness.state().display_indices(), vec![2, 1, 0]);
+        assert_eq!(harness.state_mut().display_indices(), vec![2, 1, 0]);
     }
 
     /// Clicking the 人均带宽 header sorts by per-capita bandwidth
@@ -8243,7 +9051,7 @@ mod tests {
             Some((SortCol::PerCapita, SortDir::Desc)),
             "first per-capita click: highest first"
         );
-        assert_eq!(harness.state().display_indices(), vec![2, 1, 0]);
+        assert_eq!(harness.state_mut().display_indices(), vec![2, 1, 0]);
         harness.get_by_label("人均带宽 ▼");
         harness.drag_at(center);
         harness.run();
@@ -8254,7 +9062,7 @@ mod tests {
             Some((SortCol::PerCapita, SortDir::Asc)),
             "second per-capita click reverses the whole order"
         );
-        assert_eq!(harness.state().display_indices(), vec![0, 1, 2]);
+        assert_eq!(harness.state_mut().display_indices(), vec![0, 1, 2]);
     }
 
     /// Enter connects the selected node and Ctrl+R probes it (the

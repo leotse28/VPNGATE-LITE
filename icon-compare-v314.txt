@@ -1,0 +1,13 @@
+v3.14 shield icon: generated (assets/make_icon.py) vs design稿 (icon-candidates/shield/)
+method: per-pixel class (white/indigo/transparent, AA blends excluded) + raw RGBA diff
+ 16px: hard 0, raw-diff 0 px (0.00%) — pixel map embedded verbatim, identical
+ 24px: hard 0, raw-diff 124 px (21.5%) — all AA shade differences, no structural pixel
+ 32px: hard 0, raw-diff 237 px (23.1%) — AA only
+ 48px: hard 0, raw-diff 471 px (20.4%) — AA only
+ 256px: hard 14 px of 65536 (0.02%), raw-diff 4569 px (7.0%) — the 14 are all on the
+        lower diagonal edges near the bottom point (y 177-221), candidate edge ~1px
+        outward of the vector polygon there; a vertex tweak (127,221)/(128,192) was
+        tried and made it worse (30 px), so it was reverted. Invisible below 256px
+        (hard 0 at every size <= 48px). LANCZOS 4x supersampling kept: fewest AA
+        shade diffs at the small sizes vs BOX/BICUBIC/BILINEAR (measured).
+.ico: 5 native PNG entries 16/24/32/48/256 (16px entry 179 bytes, 256px entry 8607 bytes)

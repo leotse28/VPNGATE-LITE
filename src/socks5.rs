@@ -135,12 +135,38 @@ pub async fn socks5_connect(
 /// the CONNECT / SOCKS5 target host — plus a second line only when
 /// the connection fails, carrying the reason. Never a path, a body,
 /// or credentials: a CONNECT line names the host, nothing else.
-pub type ConnLog = tokio::sync::mpsc::UnboundedSender<String>;
+///
+/// v3.14 (diagnosis §4.2): BOUNDED (512 lines). The old unbounded
+/// channel could pile log lines up while the UI frame was stalled —
+/// the producer (one line per accepted connection) never blocks,
+/// but a stalled consumer lets the queue grow without limit. A log
+/// line is droppable by design (the on-screen log only keeps 100
+/// lines anyway): when the channel is full the line is dropped and
+/// `CONN_LOG_DROPPED` counts it, so a burst is visible in the RSS
+/// log instead of silently eating memory.
+pub type ConnLog = tokio::sync::mpsc::Sender<String>;
+
+/// Capacity of the `ConnLog` channel (see above).
+pub const CONN_LOG_CAPACITY: usize = 512;
+
+/// Log lines dropped because the `ConnLog` channel was full (or its
+/// receiver was gone). Read by the GUI's RSS log line; a rising
+/// count under load is expected behaviour, not a bug.
+pub static CONN_LOG_DROPPED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How many `ConnLog` lines have been dropped so far.
+pub fn conn_log_dropped() -> usize {
+    CONN_LOG_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 fn emit_conn_log(sink: &Option<ConnLog>, line: String) {
     match sink {
         Some(tx) => {
-            let _ = tx.send(line);
+            if tx.try_send(line).is_err() {
+                CONN_LOG_DROPPED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         None => eprintln!("{}", line),
     }
@@ -197,6 +223,17 @@ pub async fn serve_mixed(
     // set, which aborts every forwarder and frees the UDP socket —
     // no leaked relay, no leaked port.
     let mut forwarders: JoinSet<()> = JoinSet::new();
+    // Accepted TCP connections live in this JoinSet too (v3.14,
+    // diagnosis §4.1): each accepted connection used to be a
+    // detached `tokio::spawn` whose handle was thrown away, so
+    // aborting the mixed server did NOT stop them — a stalled
+    // long-lived connection kept its `Arc<SstpTunnel>` alive and
+    // "disconnect" never released the tunnel. JoinSet-owned tasks
+    // are aborted when this set is dropped, i.e. when the mixed
+    // server itself is aborted on disconnect. (A connection that is
+    // mid-transfer when the user disconnects is cut immediately —
+    // that is what disconnect means.)
+    let mut conns: JoinSet<()> = JoinSet::new();
     let mut sweep = tokio::time::interval(UDP_SWEEP_INTERVAL);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -213,7 +250,7 @@ pub async fn serve_mixed(
                 let log = conn_log.clone();
                 let relay_addr = relay.as_ref().map(|r| r.socket_addr());
                 let relay_for_assoc = relay.clone();
-                tokio::spawn(async move {
+                conns.spawn(async move {
                     if let Err(e) =
                         handle_mixed_conn(socket, t, timeout, &log, relay_addr, relay_for_assoc).await
                     {
@@ -237,6 +274,9 @@ pub async fn serve_mixed(
             }
             Some(_done) = forwarders.join_next(), if !forwarders.is_empty() => {
                 // Reap a finished reply-forwarder (its flow closed).
+            }
+            Some(_done) = conns.join_next(), if !conns.is_empty() => {
+                // Reap a finished accepted connection.
             }
         }
     }
@@ -1677,5 +1717,26 @@ mod tests {
         assert_eq!(removed.len(), 2, "both flows from that IP go");
         assert_eq!(table.len(), 1);
         assert!(table.get(&other.key).is_some());
+    }
+
+    /// v3.14 (diagnosis §4.2): `ConnLog` is a BOUNDED channel
+    /// (512). A full channel drops the line and counts it instead
+    /// of queueing without limit while the UI is stalled — the
+    /// first line still gets through, the overflow is counted.
+    #[test]
+    fn conn_log_bounded_drops_when_full_and_counts() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+        let sink = Some(tx);
+        let before = conn_log_dropped();
+        emit_conn_log(&sink, "first".to_string());
+        emit_conn_log(&sink, "second".to_string()); // full -> dropped
+        emit_conn_log(&sink, "third".to_string()); // dropped too
+        assert_eq!(rx.try_recv().unwrap(), "first");
+        assert_eq!(
+            conn_log_dropped() - before,
+            2,
+            "two overflow lines must be counted as dropped"
+        );
+        assert!(rx.try_recv().is_err(), "nothing else queued");
     }
 }

@@ -626,6 +626,23 @@ impl TunnelStream {
     }
 }
 
+impl Drop for TunnelStream {
+    // v3.14 (diagnosis §4.5): the ONLY confirmed monotonically
+    // growing leak — a finished TCP session stayed in the tunnel's
+    // `sessions` table forever, because only the handshake-failure
+    // paths called `remove_session` and `TunnelStream` had no
+    // `Drop` (contrast `UdpFlow`, which always had one). Dropping
+    // the stream now removes its table entry. `remove_session` is
+    // idempotent (a missing key is a no-op) and uses `try_lock`,
+    // so the handshake-failure paths that already removed the entry
+    // stay correct, and dropping while the table is briefly locked
+    // just skips the removal — the entry then lives until the whole
+    // tunnel is dropped, exactly as before.
+    fn drop(&mut self) {
+        self.tunnel.remove_session(self.session.src_port);
+    }
+}
+
 impl AsyncRead for TunnelStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -1242,6 +1259,15 @@ impl SstpTunnel {
         }
     }
 
+    /// Current TCP sessions in the table (v3.14 RSS log + leak
+    /// watch: a healthy tunnel holds only its live connections;
+    /// a count far above the live connections is the §4.5 leak).
+    /// `try_lock` failure reads as 0 rather than blocking — this
+    /// is only ever called from the GUI's log path.
+    pub fn session_count(&self) -> usize {
+        self.sessions.try_lock().map(|g| g.len()).unwrap_or(0)
+    }
+
     /// Open a UDP flow to `dst_host:dst_port` (host resolved the same
     /// way as TCP: DoH, then the system resolver). UDP has no
     /// handshake — sending works immediately; replies arrive on
@@ -1377,5 +1403,56 @@ mod tests {
             udp_frame(src, dst, 20001, 443, &over).is_none(),
             "1473-byte payload must be refused, not fragmented"
         );
+    }
+
+    /// v3.14 (diagnosis §4.5): dropping a `TunnelStream` removes
+    /// its session from the tunnel's table — before this fix the
+    /// table only grew until the whole tunnel was dropped. Built
+    /// without any network: a bare tunnel + one registered session,
+    /// straight from the module's own fields.
+    #[test]
+    fn tunnel_stream_drop_removes_session() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let tunnel = Arc::new(SstpTunnel {
+            host: "127.0.0.1".to_string(),
+            port: 8443,
+            vip: Ipv4Addr::new(10, 0, 0, 2),
+            connector: crate::net::Connector::new(None),
+            tx,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            udp_flows: Arc::new(Mutex::new(HashMap::new())),
+            dead: AtomicBool::new(false),
+        });
+        let (payload_tx, payload_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let session = Arc::new(Session {
+            src_port: 20001,
+            dst_ip: Ipv4Addr::new(8, 8, 8, 8),
+            dst_port: 80,
+            state: Mutex::new(SessionState::default()),
+            handshake: Notify::new(),
+            payload_tx: Mutex::new(Some(payload_tx)),
+        });
+        tunnel
+            .sessions
+            .try_lock()
+            .unwrap()
+            .insert(20001, session.clone());
+        assert_eq!(tunnel.session_count(), 1);
+        let stream = TunnelStream {
+            tunnel: tunnel.clone(),
+            session,
+            payload_rx,
+            pending: std::collections::VecDeque::new(),
+        };
+        drop(stream);
+        assert_eq!(
+            tunnel.session_count(),
+            0,
+            "dropping the stream must remove its session"
+        );
+        // Double removal (the handshake-failure path already
+        // removed it, then the stream drops) is a harmless no-op.
+        tunnel.remove_session(20001);
+        assert_eq!(tunnel.session_count(), 0);
     }
 }

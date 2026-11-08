@@ -357,7 +357,7 @@ async fn connect_relay_carries_tls_client_hello_against_mock() {
     let timeout = Duration::from_secs(10);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (log_tx, mut log_rx) = tokio::sync::mpsc::channel::<String>(vpngate_client::socks5::CONN_LOG_CAPACITY);
     let serve = tokio::spawn(vpngate_client::socks5::serve_mixed(
         listener,
         tunnel.clone(),
@@ -644,7 +644,7 @@ async fn socks5_udp_associate_echo_against_mock() {
     let timeout = Duration::from_secs(10);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (log_tx, mut log_rx) = tokio::sync::mpsc::channel::<String>(vpngate_client::socks5::CONN_LOG_CAPACITY);
     let serve = tokio::spawn(vpngate_client::socks5::serve_mixed(
         listener,
         tunnel.clone(),
@@ -849,4 +849,69 @@ async fn udp_available() -> bool {
         Err(_) => return false,
     };
     s.send_to(b"probe", addr).await.is_ok()
+}
+
+// --- v3.14 ------------------------------------------------------------
+
+/// v3.14, diagnosis §3 item 1: a stream opened through the mock
+/// tunnel registers one session, and dropping the stream removes
+/// it — the end-to-end form of the lib unit test, over a real
+/// (mock) SSTP tunnel. Pre-fix this failed: normal-close sessions
+/// were only removed when the whole tunnel dropped, so the count
+/// stayed 1 after the drop.
+#[tokio::test]
+async fn tunnel_stream_drop_removes_session_against_mock() {
+    let Some((_guard, _mock, tunnel)) = setup_mock_tunnel().await else {
+        return;
+    };
+    let timeout = Duration::from_secs(10);
+    assert_eq!(tunnel.session_count(), 0, "no sessions before opening");
+    let s = tunnel
+        .open_stream("www.gstatic.com", 80, timeout)
+        .await
+        .expect("open stream through the mock tunnel");
+    assert_eq!(tunnel.session_count(), 1, "one live session while open");
+    drop(s);
+    assert_eq!(
+        tunnel.session_count(),
+        0,
+        "dropping the stream must remove its session immediately"
+    );
+}
+
+/// v3.14, diagnosis §3 item 2: the mixed server's accepted
+/// connections belong to its JoinSet, so aborting the server (what
+/// `disconnect()` does) closes even a connection that never sent
+/// a byte and would otherwise sit stalled forever. Pre-fix this
+/// failed: the accepted task was a detached `tokio::spawn`, the
+/// abort left it alive, and the client read timed out instead of
+/// returning EOF.
+#[tokio::test]
+async fn disconnect_aborts_stalled_connection_against_mock() {
+    let Some((_guard, _mock, tunnel)) = setup_mock_tunnel().await else {
+        return;
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve = tokio::spawn(vpngate_client::socks5::serve_mixed(
+        listener,
+        tunnel.clone(),
+        Duration::from_secs(10),
+        None,
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // A client that connects and then never sends anything —
+    // the worst case for the old code: no byte, no timeout, the
+    // handler blocks in its first read forever.
+    let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    serve.abort();
+    let mut buf = [0u8; 1];
+    let res = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf)).await;
+    assert!(
+        matches!(res, Ok(Ok(0))),
+        "aborting the mixed server must close stalled connections (EOF), got {:?}",
+        res
+    );
+    drop(tunnel);
 }

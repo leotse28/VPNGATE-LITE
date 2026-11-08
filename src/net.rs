@@ -92,10 +92,20 @@ impl Connector {
 /// natively and — more importantly — sends a browser-like handshake.
 #[cfg(not(windows))]
 pub fn verified_tls_config() -> Arc<ClientConfig> {
-    let cfg = ClientConfig::builder()
-        .with_root_certificates(verified_roots())
-        .with_no_client_auth();
-    Arc::new(cfg)
+    // v3.14 (diagnosis §6 item 8): one shared config, built once.
+    // Every verified handshake used to rebuild the whole root store
+    // (Mozilla roots + system store, hundreds of certs) from scratch
+    // — pure per-handshake allocation/CPU, not RSS, but free to save.
+    static CONFIG: std::sync::OnceLock<Arc<ClientConfig>> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(verified_roots())
+                    .with_no_client_auth(),
+            )
+        })
+        .clone()
 }
 
 /// The root store behind [`verified_tls_config`]: the Mozilla roots,
@@ -122,6 +132,40 @@ fn verified_roots() -> RootCertStore {
 pub trait TlsStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> TlsStream for T {}
 
+/// One shared SChannel connector for verified HTTPS (Windows),
+/// built once and cloned per handshake (`native_tls::TlsConnector`
+/// is a cheap `Arc` clone). v3.14 (diagnosis §6 item 8): every
+/// handshake used to build a fresh connector. If the build ever
+/// fails, the caller gets the error and the next handshake retries
+/// the build — nothing is cached on failure.
+#[cfg(windows)]
+fn shared_verified_tls_connector() -> Result<native_tls::TlsConnector, String> {
+    static CONNECTOR: std::sync::OnceLock<native_tls::TlsConnector> =
+        std::sync::OnceLock::new();
+    if let Some(c) = CONNECTOR.get() {
+        return Ok(c.clone());
+    }
+    let fresh = native_tls::TlsConnector::new().map_err(|e| e.to_string())?;
+    Ok(CONNECTOR.get_or_init(|| fresh).clone())
+}
+
+/// One shared SChannel connector for accept-any SSTP (Windows),
+/// same pattern as `shared_verified_tls_connector`.
+#[cfg(windows)]
+fn shared_accept_any_tls_connector() -> Result<native_tls::TlsConnector, String> {
+    static CONNECTOR: std::sync::OnceLock<native_tls::TlsConnector> =
+        std::sync::OnceLock::new();
+    if let Some(c) = CONNECTOR.get() {
+        return Ok(c.clone());
+    }
+    let fresh = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(CONNECTOR.get_or_init(|| fresh).clone())
+}
+
 /// Verified TLS handshake over an already-connected stream: the
 /// Google check inside an established tunnel, and the verified leg of
 /// `https_get`. Windows: SChannel (native-tls) — the handshake
@@ -139,9 +183,8 @@ where
 {
     #[cfg(windows)]
     {
-        let connector = tokio_native_tls::TlsConnector::from(
-            native_tls::TlsConnector::new().map_err(|e| e.to_string())?,
-        );
+        let connector =
+            tokio_native_tls::TlsConnector::from(shared_verified_tls_connector()?);
         let stream = connector
             .connect(host, stream)
             .await
@@ -182,12 +225,19 @@ async fn tls_connect(tcp: TcpStream, host: &str, verify: bool) -> Result<Box<dyn
 
 /// Build an accept-any rustls client config (self-signed VPNGate nodes).
 /// Only used for the SSTP TLS layer, never for vpngate.net / DoH.
+/// v3.14: built once and shared (see `verified_tls_config`).
 pub fn accept_any_tls_config() -> Arc<ClientConfig> {
-    let cfg = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyVerifier))
-        .with_no_client_auth();
-    Arc::new(cfg)
+    static CONFIG: std::sync::OnceLock<Arc<ClientConfig>> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            Arc::new(
+                ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(AcceptAnyVerifier))
+                    .with_no_client_auth(),
+            )
+        })
+        .clone()
 }
 
 /// Accept-any TLS handshake over an already-connected stream, for
@@ -206,13 +256,8 @@ where
 {
     #[cfg(windows)]
     {
-        let connector = tokio_native_tls::TlsConnector::from(
-            native_tls::TlsConnector::builder()
-                .danger_accept_invalid_certs(true)
-                .danger_accept_invalid_hostnames(true)
-                .build()
-                .map_err(|e| e.to_string())?,
-        );
+        let connector =
+            tokio_native_tls::TlsConnector::from(shared_accept_any_tls_connector()?);
         let stream = connector
             .connect(host, stream)
             .await
@@ -487,6 +532,22 @@ mod tests {
         fp.enabled = true;
         fp.addr = addr.to_string();
         Connector::new(Some(fp))
+    }
+
+    /// v3.14 (diagnosis §6 item 8): the TLS configs are built once
+    /// and shared — two calls return the very same `Arc`, not two
+    /// separately built root stores.
+    #[test]
+    fn tls_configs_are_shared_singletons() {
+        assert!(
+            std::sync::Arc::ptr_eq(&accept_any_tls_config(), &accept_any_tls_config()),
+            "accept-any config must be a single shared instance"
+        );
+        #[cfg(not(windows))]
+        assert!(
+            std::sync::Arc::ptr_eq(&verified_tls_config(), &verified_tls_config()),
+            "verified config must be a single shared instance"
+        );
     }
 
     /// A port that (almost certainly) has nothing listening: bind an

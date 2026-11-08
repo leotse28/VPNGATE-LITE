@@ -65,10 +65,13 @@ pub fn decide_close(tray_active: bool, quit_requested: bool) -> CloseDecision {
 
 /// Build the command that restarts the client: the current exe path
 /// with the current arguments, so the new instance starts exactly
-/// like this one was started (but fresh and disconnected — a
-/// restart never restores the tunnel; the user reconnects by hand).
-/// Only the command is built here; spawning it is the GUI's job,
-/// so this stays unit-testable without launching a process.
+/// like this one was started. Since v3.14 a restart while connected
+/// also writes a one-shot resume marker (`resume.json`, see
+/// `write_resume_target`) so the new instance auto-connects to the
+/// same node once; the command itself carries no node — the marker
+/// is a file, not an argument. Only the command is built here;
+/// spawning it is the GUI's job, so this stays unit-testable
+/// without launching a process.
 pub fn restart_command() -> std::io::Result<(PathBuf, Vec<String>)> {
     let exe = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -89,46 +92,272 @@ const PNG_MAGIC: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 /// directory entry per image: width, height, colour count, reserved,
 /// planes (u16), bit count (u16), byte size (u32 LE), offset
 /// (u32 LE). Vista-style .ico files embed PNGs; our
-/// `assets/icon.ico` holds four (16/32/48/256 px) and the 256 px
-/// one is the tray icon. Entries that are not PNGs (old BMP entries)
-/// are skipped; a malformed file yields `None`.
+/// `assets/icon.ico` holds five (16/24/32/48/256 px, v3.14) and the
+/// 256 px one is the largest. Entries that are not PNGs (old BMP
+/// entries) are skipped; a malformed file yields `None`. A width or
+/// height byte of 0 means 256 px.
 pub fn largest_png_in_ico(ico: &[u8]) -> Option<&[u8]> {
+    let mut best: Option<&[u8]> = None;
+    for png in ico_png_entries(ico) {
+        if best.map_or(true, |b: &[u8]| png.len() > b.len()) {
+            best = Some(png);
+        }
+    }
+    best
+}
+
+/// Every PNG entry in a .ico file's bytes, in directory order.
+/// Shared by `largest_png_in_ico` and `png_in_ico` so the directory
+/// parsing lives in exactly one place.
+fn ico_png_entries(ico: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
     if ico.len() < 6 {
-        return None;
+        return out;
     }
     let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
-    let mut best: Option<&[u8]> = None;
     for i in 0..count {
         let off = 6 + i * 16;
         if off + 16 > ico.len() {
             break;
         }
         let size = u32::from_le_bytes(
+            ico[off + 8..off + 12].try_into().unwrap_or([0; 4]),
+        ) as usize;
+        let at = u32::from_le_bytes(
+            ico[off + 12..off + 16].try_into().unwrap_or([0; 4]),
+        ) as usize;
+        let Some(end) = at.checked_add(size) else {
+            continue;
+        };
+        let Some(data) = ico.get(at..end) else {
+            continue;
+        };
+        if data.len() >= PNG_MAGIC.len() && &data[..8] == PNG_MAGIC {
+            out.push(data);
+        }
+    }
+    out
+}
+
+/// Extract the PNG entry of exactly `size` px from a .ico file's
+/// bytes (`size` is the edge length: 16, 24, 32, 48 or 256 — a
+/// directory byte of 0 means 256). `None` when the .ico has no such
+/// entry or is malformed. v3.14: the tray takes the 16 px entry and
+/// the window icon the 32 px entry, instead of both scaling the
+/// largest one.
+pub fn png_in_ico(ico: &[u8], size: u32) -> Option<&[u8]> {
+    if ico.len() < 6 {
+        return None;
+    }
+    let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+    for i in 0..count {
+        let off = 6 + i * 16;
+        if off + 16 > ico.len() {
+            break;
+        }
+        let w = ico[off];
+        let entry_size: u32 = if w == 0 { 256 } else { w as u32 };
+        if entry_size != size {
+            continue;
+        }
+        let data_size = u32::from_le_bytes(
             ico[off + 8..off + 12].try_into().ok()?,
         ) as usize;
         let at = u32::from_le_bytes(
             ico[off + 12..off + 16].try_into().ok()?,
         ) as usize;
-        let data = ico.get(at..at.checked_add(size)?)?;
+        let data = ico.get(at..at.checked_add(data_size)?)?;
         if data.len() >= PNG_MAGIC.len() && &data[..8] == PNG_MAGIC {
-            if best.map_or(true, |b: &[u8]| data.len() > b.len()) {
-                best = Some(data);
-            }
+            return Some(data);
         }
     }
-    best
+    None
 }
 
-/// Decode the tray icon's RGBA pixels from the .ico bytes:
+/// Decode one .ico entry of exactly `size` px into RGBA pixels:
 /// `(rgba bytes, width, height)`. The caller feeds this to
-/// `tray_icon::Icon::from_rgba` (Windows only); the decode itself
-/// is plain PNG work, so it is tested on Linux too.
-pub fn decode_tray_icon_rgba(ico: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
-    let png = largest_png_in_ico(ico)?;
+/// `tray_icon::Icon::from_rgba` (tray, 16 px) or to
+/// `egui::IconData` (window icon, 32 px). Plain PNG work, so it is
+/// tested on Linux too.
+pub fn decode_icon_rgba(ico: &[u8], size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let png = png_in_ico(ico, size)?;
     let img = image::load_from_memory(png).ok()?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     Some((rgba.into_raw(), w, h))
+}
+
+/// Decode the tray icon's RGBA pixels from the .ico bytes:
+/// `(rgba bytes, width, height)`. v3.14: the 16 px entry — the
+/// hand-tuned pixel稿 — not the 256 px entry downscaled by Windows
+/// (that downscale is what made the v3.13 tray icon unreadable).
+/// Falls back to the largest entry if a 16 px entry is missing, so
+/// an old .ico still yields a tray icon instead of none.
+/// High-DPI note: `tray-icon` 0.19 takes a single RGBA bitmap, so
+/// only one size can be handed over. The tray's logical size is
+/// 16 px; handing it the 16 px稿 means standard-DPI trays show the
+/// hand-tuned pixels exactly, and on high-DPI Windows the shell
+/// upscales those 16 px (slightly soft, but the 2 px strokes stay
+/// legible). Handing it the 32 px稿 instead would make Windows
+/// downscale on standard DPI — the same blur that v3.13 had, just
+/// less of it — so 16 px is the right single choice.
+pub fn decode_tray_icon_rgba(ico: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    decode_icon_rgba(ico, 16).or_else(|| {
+        let png = largest_png_in_ico(ico)?;
+        let img = image::load_from_memory(png).ok()?;
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        Some((rgba.into_raw(), w, h))
+    })
+}
+
+/// Decode the window/taskbar icon's RGBA pixels: the 32 px entry
+/// of the same .ico (v3.14 — the window icon used to be unset and
+/// fell back to the exe default).
+pub fn decode_window_icon_rgba(ico: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    decode_icon_rgba(ico, 32)
+}
+
+/// The window icon as `egui::IconData` for
+/// `ViewportBuilder::with_icon`, decoded from the 32 px entry of
+/// the .ico (never from a loose PNG file: `assets/icon-256.png`
+/// is gitignored, so a checkout without a generated icon would
+/// otherwise break the build). `None` when the .ico has no usable
+/// 32 px entry — the caller then builds the viewport without an
+/// icon, exactly as before v3.14.
+pub fn window_icon_data(ico: &[u8]) -> Option<eframe::egui::IconData> {
+    let (rgba, width, height) = decode_window_icon_rgba(ico)?;
+    Some(eframe::egui::IconData {
+        rgba,
+        width,
+        height,
+    })
+}
+
+/// What happened on the tray icon itself, in platform-neutral terms
+/// (the `tray-icon` event types are Windows-only, so the mapping
+/// from event to request is split: the Windows code classifies the
+/// event into one of these, and `tray_click_request` — plain code,
+/// tested on Linux — decides what it means).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayClickKind {
+    /// Left button released (a single click).
+    SingleClickUp,
+    /// Left button double-clicked.
+    DoubleClick,
+    /// Anything else on the icon (right click, middle click, …).
+    Other,
+}
+
+/// Map a tray-icon click to the request it makes. v3.14 (Leo
+/// 11:36): a left single-click is IGNORED — it no longer pops the
+/// main window; only a left double-click shows it. The right-click
+/// menu's 显示主界面 is a different path (`menu_action`) and is
+/// unchanged.
+pub fn tray_click_request(kind: TrayClickKind) -> Option<TrayRequest> {
+    match kind {
+        TrayClickKind::DoubleClick => Some(TrayRequest::Show),
+        TrayClickKind::SingleClickUp | TrayClickKind::Other => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Restart-resume marker (v3.14): a one-shot "reconnect to this node"
+// note, written by the old instance just before it restarts and
+// consumed (file deleted) by the new instance at startup. A small
+// JSON file next to the exe (`resume.json`), NOT a config.toml key:
+// the portable config is user settings + auto-save, and a transient
+// marker there would survive a manual quit and fire on the next
+// manual open. The file carries the dialled target (`host:port`,
+// DDNS suffix already completed, exactly as `node_label`), a display
+// label, and the write time (unix seconds); a marker older than
+// `RESUME_MAX_AGE_SECS` is stale (the new instance crashed before
+// consuming it) and is ignored + removed, so it can never
+// auto-connect a later manual open.
+// ---------------------------------------------------------------------------
+
+/// How long a resume marker stays valid: restart-to-startup is
+/// seconds, so 10 minutes is generous and still bounds the
+/// crash-window.
+pub const RESUME_MAX_AGE_SECS: u64 = 600;
+
+/// File name of the resume marker, next to the exe.
+pub const RESUME_FILE_NAME: &str = "resume.json";
+
+/// One restart-resume marker, as read back from `resume.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeTarget {
+    /// Dialled target, e.g. "a.opengw.net:992".
+    pub target: String,
+    /// Display label (same string as `target` today).
+    pub label: String,
+}
+
+/// `resume.json` next to the exe (portable location). `None` when
+/// the exe path cannot be determined.
+pub fn resume_file_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(RESUME_FILE_NAME)))
+}
+
+/// Write a resume marker (overwrites any stale one). Best-effort
+/// from the caller's side: the restart proceeds without resume when
+/// this fails.
+pub fn write_resume_target(
+    path: &std::path::Path,
+    target: &str,
+    label: &str,
+) -> Result<(), String> {
+    let created_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let text = serde_json::json!({
+        "target": target,
+        "label": label,
+        "created_unix": created_unix,
+    })
+    .to_string();
+    std::fs::write(path, text).map_err(|e| format!("cannot write {}: {}", path.display(), e))
+}
+
+/// Read + delete the resume marker, if there is a fresh valid one.
+/// `None` (and the file removed when present) for a missing,
+/// unparseable, target-less, or stale marker — a bad marker must
+/// never auto-connect, and must not linger to fire later.
+pub fn take_resume_target(path: &std::path::Path) -> Option<ResumeTarget> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    // Consume exactly once: delete first, whatever the content says.
+    let _ = std::fs::remove_file(path);
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let target = v.get("target")?.as_str()?.to_string();
+    if target.is_empty() {
+        return None;
+    }
+    let label = v
+        .get("label")
+        .and_then(|l| l.as_str())
+        .unwrap_or(&target)
+        .to_string();
+    let created = v.get("created_unix").and_then(|c| c.as_u64()).unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if created == 0 || now.saturating_sub(created) > RESUME_MAX_AGE_SECS {
+        return None;
+    }
+    Some(ResumeTarget { target, label })
+}
+
+/// Best-effort removal of a resume marker (manual quit: a later
+/// manual open must never auto-connect). Ignores all errors.
+pub fn clear_resume_target(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 // ---------------------------------------------------------------------------
@@ -182,24 +411,28 @@ impl TrayHandle {
     }
 
     /// Drain pending tray-icon and menu events into requests.
-    /// Left single-click (button released) and left double-click
-    /// both show the main window; anything else on the icon itself
-    /// is ignored. The right-click menu is the tray-icon default:
+    /// Left single-click (button released) is IGNORED in v3.14 —
+    /// it no longer shows the main window (Leo 11:36); only a left
+    /// double-click shows it. Anything else on the icon itself is
+    /// ignored. The right-click menu is the tray-icon default:
     /// right-clicking the icon pops the menu, no code needed.
     pub fn drain_requests(&self) -> Vec<TrayRequest> {
         let mut out = Vec::new();
         while let Ok(ev) = tray_icon::TrayIconEvent::receiver().try_recv() {
-            match ev {
+            let kind = match ev {
                 tray_icon::TrayIconEvent::Click {
                     button: tray_icon::MouseButton::Left,
                     button_state: tray_icon::MouseButtonState::Up,
                     ..
-                } => out.push(TrayRequest::Show),
+                } => TrayClickKind::SingleClickUp,
                 tray_icon::TrayIconEvent::DoubleClick {
                     button: tray_icon::MouseButton::Left,
                     ..
-                } => out.push(TrayRequest::Show),
-                _ => {}
+                } => TrayClickKind::DoubleClick,
+                _ => TrayClickKind::Other,
+            };
+            if let Some(req) = tray_click_request(kind) {
+                out.push(req);
             }
         }
         while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
@@ -268,24 +501,156 @@ mod tests {
         let ico = include_bytes!("../assets/icon.ico");
         let png = largest_png_in_ico(ico).expect("icon.ico must hold a PNG");
         assert_eq!(&png[..8], PNG_MAGIC);
-        // The 256 px entry is the largest of the four (v3.13 bold-V
-        // icon; was 3902 bytes for the old globe + swoosh).
-        assert_eq!(png.len(), 2266);
+        // The 256 px entry is the largest of the five (v3.14 shield
+        // icon; was 2266 bytes for the v3.13 bold-V). Assert the
+        // decoded size, not a byte count — the byte count changes
+        // with every redraw.
+        let img = image::load_from_memory(png).expect("256 px entry decodes");
+        assert_eq!(img.to_rgba8().dimensions(), (256, 256));
     }
 
     #[test]
-    fn largest_png_in_ico_rejects_garbage() {
-        assert_eq!(largest_png_in_ico(&[]), None);
-        assert_eq!(largest_png_in_ico(&[0, 0, 1, 0]), None);
-        assert_eq!(largest_png_in_ico(b"not an icon at all"), None);
+    fn png_in_ico_finds_all_five_sizes() {
+        // v3.14: the .ico carries one native PNG per size (v3.13
+        // lacked the 24 px entry). Each must be found by exact size.
+        let ico = include_bytes!("../assets/icon.ico");
+        for size in [16u32, 24, 32, 48] {
+            let png = png_in_ico(ico, size)
+                .unwrap_or_else(|| panic!("icon.ico must hold a {} px entry", size));
+            assert_eq!(&png[..8], PNG_MAGIC);
+            let img = image::load_from_memory(png).expect("entry decodes");
+            assert_eq!(img.to_rgba8().dimensions(), (size as u32, size as u32));
+        }
+        // 256 px is stored with a 0 width/height byte.
+        let png = png_in_ico(ico, 256).expect("icon.ico must hold a 256 px entry");
+        let img = image::load_from_memory(png).expect("256 px entry decodes");
+        assert_eq!(img.to_rgba8().dimensions(), (256, 256));
+        assert_eq!(png_in_ico(ico, 20), None, "no 20 px entry exists");
+        assert_eq!(png_in_ico(&[], 16), None);
     }
 
     #[test]
-    fn decode_tray_icon_rgba_is_256x256() {
+    fn decode_tray_icon_rgba_is_16x16() {
+        // v3.14: the tray uses the hand-tuned 16 px稿, NOT the
+        // 256 px entry downscaled by Windows (that was the v3.13
+        // tray blur).
         let ico = include_bytes!("../assets/icon.ico");
         let (rgba, w, h) =
             decode_tray_icon_rgba(ico).expect("icon.ico must decode");
-        assert_eq!((w, h), (256, 256));
-        assert_eq!(rgba.len(), 256 * 256 * 4);
+        assert_eq!((w, h), (16, 16));
+        assert_eq!(rgba.len(), 16 * 16 * 4);
+    }
+
+    #[test]
+    fn decode_window_icon_rgba_is_32x32() {
+        // v3.14: the window/taskbar icon is the 32 px entry from
+        // the same .ico (ViewportBuilder.with_icon).
+        let ico = include_bytes!("../assets/icon.ico");
+        let (rgba, w, h) =
+            decode_window_icon_rgba(ico).expect("icon.ico must decode");
+        assert_eq!((w, h), (32, 32));
+        assert_eq!(rgba.len(), 32 * 32 * 4);
+    }
+
+    #[test]
+    fn window_icon_data_is_32x32_rgba() {
+        let ico = include_bytes!("../assets/icon.ico");
+        let icon = window_icon_data(ico).expect("window icon must decode");
+        assert_eq!((icon.width, icon.height), (32, 32));
+        assert_eq!(icon.rgba.len(), 32 * 32 * 4);
+        assert_eq!(window_icon_data(&[]), None);
+        assert_eq!(window_icon_data(b"not an icon"), None);
+    }
+
+    #[test]
+    fn tray_click_single_is_ignored_double_shows() {
+        // v3.14 (Leo 11:36): a left single-click on the tray icon
+        // must NOT pop the main window; a left double-click still
+        // does. The right-click menu's 显示主界面 is untouched
+        // (menu_action test above still maps it to Show).
+        assert_eq!(
+            tray_click_request(TrayClickKind::SingleClickUp),
+            None,
+            "single click must produce no request"
+        );
+        assert_eq!(
+            tray_click_request(TrayClickKind::DoubleClick),
+            Some(TrayRequest::Show),
+            "double-click must still show the window"
+        );
+        assert_eq!(
+            tray_click_request(TrayClickKind::Other),
+            None,
+            "anything else on the icon is ignored"
+        );
+    }
+
+    fn resume_tmp_path(name: &str) -> std::path::PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("vpngate-resume-test-{}-{}.json", n, name))
+    }
+
+    #[test]
+    fn resume_roundtrip_and_consumed_once() {
+        // v3.14 restart-resume: write once, take once, second take
+        // finds nothing (the marker is single-use) and the file is
+        // gone.
+        let path = resume_tmp_path("once");
+        write_resume_target(&path, "a.opengw.net:992", "a.opengw.net:992")
+            .expect("write resume");
+        assert!(path.exists(), "resume file must exist after write");
+        let rt = take_resume_target(&path).expect("first take must find it");
+        assert_eq!(rt.target, "a.opengw.net:992");
+        assert_eq!(rt.label, "a.opengw.net:992");
+        assert!(!path.exists(), "take must delete the file");
+        assert_eq!(take_resume_target(&path), None, "second take finds nothing");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resume_stale_file_is_ignored_and_removed() {
+        // A resume file older than the 10-minute window (e.g. the
+        // new instance crashed before consuming it) must NOT
+        // auto-connect on the next manual open — it is ignored and
+        // the stale file is removed.
+        let path = resume_tmp_path("stale");
+        let old = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3600;
+        let text = format!(
+            "{{\"target\":\"a.opengw.net:992\",\"label\":\"a.opengw.net:992\",\"created_unix\":{}}}",
+            old
+        );
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(take_resume_target(&path), None, "stale resume ignored");
+        assert!(!path.exists(), "stale file must be removed");
+    }
+
+    #[test]
+    fn resume_bad_file_is_ignored_and_removed() {
+        // Missing file, garbage, or a JSON without the target must
+        // never auto-connect — and the bad file is removed so it
+        // cannot fire later.
+        let path = resume_tmp_path("bad");
+        assert_eq!(take_resume_target(&path), None, "missing file is fine");
+        std::fs::write(&path, "not json at all").unwrap();
+        assert_eq!(take_resume_target(&path), None, "garbage ignored");
+        assert!(!path.exists(), "garbage file must be removed");
+        std::fs::write(&path, "{\"label\":\"x\"}").unwrap();
+        assert_eq!(take_resume_target(&path), None, "no-target JSON ignored");
+        assert!(!path.exists());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resume_file_path_is_next_to_exe() {
+        let p = resume_file_path().expect("exe path known in tests");
+        assert_eq!(p.file_name().unwrap(), "resume.json");
+        assert!(p.parent().is_some());
     }
 }
