@@ -1,6 +1,6 @@
 [package]
 name = "vpngate-client"
-version = "0.3.10"
+version = "0.3.11"
 edition = "2021"
 description = "Minimal Rust client for VPNGate volunteer nodes over MS-SSTP + PPP, exposing a local SOCKS5 port (no TUN, no GUI)"
 license = "MIT"
@@ -34,6 +34,8 @@ rand = "0.8"
 # Local timestamps for the GUI file log (src/filelog.rs).
 chrono = "0.4"
 eframe = "0.36"
+rfd = "0.18.0"
+arboard = "3"
 
 # Windows only: verified HTTPS (vpngate.net API / web scrape, DoH,
 # front-proxy test) and node SSTP both go through the OS TLS stack

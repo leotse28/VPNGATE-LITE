@@ -589,6 +589,126 @@ fn parse_manual_target(text: &str, curated_len: usize) -> Result<String, String>
     Err("格式不对：主机名:端口，例如 kanratown.opengw.net:992".to_string())
 }
 
+/// One `host:port` line per node, in the given (display) order.
+/// The host is the completed DDNS hostname — the same target a
+/// connect dials (a bare API label like "public-vpn-192" becomes
+/// "public-vpn-192.opengw.net"). A node with no known port exports
+/// as a bare host: the app never invents a port (API nodes arrive
+/// port-less and connect tries 443/992/995 in parallel, so no
+/// single port is "the" port for them).
+fn export_nodes_text(nodes: &[Node]) -> String {
+    nodes
+        .iter()
+        .map(|n| match n.port {
+            Some(p) => format!("{}:{}", vpngate::complete_ddns_host(&n.host), p),
+            None => vpngate::complete_ddns_host(&n.host),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One line of an import text (clipboard or node-list file).
+enum ImportLine {
+    /// Empty line or `#` comment: ignored, not an error.
+    Skip,
+    /// Not a `host[:port]` line: counted, never fails the import.
+    Malformed,
+    /// A node to add (`port` is `None` for a bare hostname — the
+    /// connect path then tries the candidate ports).
+    Node { host: String, port: Option<u16> },
+}
+
+/// Parse one import line. A hostname is ASCII letters/digits, `.`
+/// and `-` (the same alphabet `parse_manual_target` accepts for a
+/// bare host); a port, when present, must be 1–65535. A bare
+/// VPNGate label without a dot ("public-vpn-192") is accepted — it
+/// completes to `.opengw.net` when dialled, unlike the manual-add
+/// field, which insists on a dot to keep out stray numbers.
+fn parse_import_line(line: &str) -> ImportLine {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('#') {
+        return ImportLine::Skip;
+    }
+    let valid_host = |h: &str| {
+        !h.is_empty()
+            && h.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    };
+    match t.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() => {
+            let Ok(port) = p.parse::<u16>() else {
+                return ImportLine::Malformed;
+            };
+            if port == 0 || !valid_host(h) {
+                return ImportLine::Malformed;
+            }
+            ImportLine::Node {
+                host: h.to_string(),
+                port: Some(port),
+            }
+        }
+        Some(_) => ImportLine::Malformed,
+        None => {
+            if valid_host(t) {
+                ImportLine::Node {
+                    host: t.to_string(),
+                    port: None,
+                }
+            } else {
+                ImportLine::Malformed
+            }
+        }
+    }
+}
+
+/// What one import run did (see `import_nodes_text`).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ImportReport {
+    added: usize,
+    duplicates: usize,
+    malformed: usize,
+    /// Blocked hosts the import unblocked (completed hostnames).
+    unblocked: Vec<String>,
+}
+
+/// One-line refresh summary, logged for every refresh so a small
+/// list is diagnosable at a glance: which source served the list,
+/// how many hosts the refresh cleared from the blocklist first,
+/// and how many nodes the list finally holds.
+///
+/// v3.11 semantics (Leo's call, 2026-11-08): delete is session-only
+/// hiding — a refresh clears the blocklist before fetching, so the
+/// incoming list is shown in full and a refresh always brings the
+/// many nodes back. The old line ("返回 N 个、屏蔽滤掉 M 个") no
+/// longer applies: there is no filtering left to count, only the
+/// cleared count and the final count. (Before v3.11 only the final
+/// count was logged, so "refresh shows 8 nodes" could mean a
+/// failing API or a big blocklist — indistinguishable from the log.)
+fn refresh_summary_line(
+    source: vpngate::NodeListSource,
+    cleared: usize,
+    final_count: usize,
+) -> String {
+    let name = match source {
+        vpngate::NodeListSource::Api => "官方 API",
+        vpngate::NodeListSource::WebScrape => "网页抓取",
+        vpngate::NodeListSource::Cache => "缓存",
+        vpngate::NodeListSource::Curated => "内嵌列表",
+    };
+    format!(
+        "刷新完成（{}）：已清空屏蔽 {} 个，获取到 {} 个。",
+        name, cleared, final_count
+    )
+}
+
+/// Read the system clipboard as text (`arboard`). Used by the
+/// Ctrl+V keypress path and the File menu's clipboard import — the
+/// `Event::Paste` path needs no read (eframe already read it).
+fn read_clipboard_text() -> Result<String, String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard.get_text().map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // CJK font: egui's default fonts have no Chinese glyphs, so load one from
 // the OS in the constructor. Tries system paths in order; returns the
@@ -670,8 +790,10 @@ struct GuiApp {
     /// Hostnames deleted from the list, kept out of every list load
     /// until unblocked. Mirrors `Config::blocked_hosts` (canonical
     /// completed hostnames — see `blocked_key`); persisted via
-    /// auto-save. There is no restore button (v3.10): to unblock a
-    /// host, delete it from `blocked_hosts` in config.toml.
+    /// auto-save. There is no restore button (v3.10): a host comes
+    /// back by importing it (import unblocks it), by clearing the
+    /// whole list with the File menu's 清空屏蔽列表 (v3.11), or by
+    /// deleting it from `blocked_hosts` in config.toml.
     blocked_hosts: BTreeSet<String>,
     probes: HashMap<String, String>,
     /// Last successful probe latency per host (ms), parallel to
@@ -764,6 +886,17 @@ struct GuiApp {
     /// loop from the clip rect; `false` when nothing is selected).
     /// The arrow-key test reads it to prove the follow-scroll works.
     selected_row_in_view: bool,
+    /// Drop the `Event::Paste` eframe sends one frame after a Ctrl+V
+    /// we already handled via the direct clipboard read (see
+    /// `handle_clipboard_events`): without this the same paste would
+    /// import twice. Set on the keypress frame, consumed (cleared)
+    /// on the next frame whether or not a Paste event shows up.
+    drop_next_paste: bool,
+    /// How many hosts the in-flight refresh cleared from the
+    /// blocklist when it started (see `start_fetch`). The Nodes
+    /// handler consumes it for the refresh summary line, then
+    /// resets it to 0. Always 0 outside a refresh.
+    refresh_cleared_blocked: usize,
     /// Whether 高级设置 starts open. Production default is closed;
     /// the render test opens it so the review screenshots show the
     /// front-proxy section and the log.
@@ -826,6 +959,8 @@ impl Default for GuiApp {
             scroll_to_selected: false,
             node_list_scroll_y: 0.0,
             selected_row_in_view: false,
+            drop_next_paste: false,
+            refresh_cleared_blocked: 0,
             advanced_open: false,
             render_scroll_bottom: false,
             manual_host: String::new(),
@@ -1231,11 +1366,23 @@ impl GuiApp {
         if self.busy.is_some() {
             return;
         }
+        // v3.11 (Leo's call): a refresh always brings the full list
+        // back. Delete is session-only hiding from here on — the
+        // blocklist is cleared (in memory AND in config.toml, so a
+        // restart does not resurrect it) BEFORE fetching, and the
+        // incoming list is shown unfiltered. The cleared count is
+        // stashed for the Nodes handler's summary line. Startup
+        // loads do NOT clear: only an explicit refresh does.
+        self.refresh_cleared_blocked = self.clear_blocklist();
         self.busy = Some(Busy::Fetching);
         self.status = "正在拉取节点列表…".to_string();
         let tx = self.event_tx.clone();
         let connector = self.connector();
-        tokio::spawn(async move {
+        // spawn_task (not raw tokio::spawn): no-ops when there is no
+        // runtime, so the kittest harness can click 刷新节点 and
+        // observe the busy flag + the cleared blocklist, then drive
+        // the Nodes event by hand.
+        Self::spawn_task(async move {
             let res = fetch_flow(&connector).await;
             let _ = tx.send(GuiEvent::Nodes(res));
             ctx.request_repaint();
@@ -1548,12 +1695,22 @@ impl GuiApp {
                 ) {
                     let _ = vpngate::save_cached_nodes(&upd.nodes);
                 }
-                // Deleted hosts never come back: the blocklist filters
-                // every load — API, web scrape, cache, embedded.
-                // (The cache above still stores the full list; the
-                // filter re-applies when the cache is loaded.)
+                // The blocklist was cleared when this refresh started
+                // (see `start_fetch`), so the incoming list is shown
+                // in full: delete only hides nodes until the next
+                // refresh. `apply_blocklist` stays as the guard for
+                // a node deleted mid-fetch — it filters that one host
+                // out — and for the startup load path, which still
+                // filters (only an explicit refresh clears).
+                // (The cache above still stores the full list.)
+                let cleared = std::mem::take(&mut self.refresh_cleared_blocked);
                 self.nodes = self.apply_blocklist(upd.nodes);
                 let n = self.nodes.len();
+                // One explicit line for every refresh — source, how
+                // many blocked hosts the refresh cleared first, and
+                // the final count — so a small list is diagnosable
+                // at a glance.
+                self.log_line(refresh_summary_line(upd.source, cleared, n));
                 self.nodes_source = upd.source.label(n, upd.cache_age_secs);
                 self.clear_selection();
                 match upd.source {
@@ -1580,8 +1737,10 @@ impl GuiApp {
                         ));
                     }
                     vpngate::NodeListSource::Curated => {
-                        self.status =
-                            "官方 API 与网页都不可用，显示内嵌列表（28 个）。".to_string();
+                        self.status = format!(
+                            "官方 API 与网页都不可用，显示内嵌列表（{} 个）。",
+                            n
+                        );
                         self.log_line(format!(
                             "官方 API 拉取失败：{}；网页抓取失败：{}；已改用内嵌列表。",
                             upd.api_error.as_deref().unwrap_or("未知原因"),
@@ -2095,9 +2254,11 @@ impl GuiApp {
 
     /// Delete the multi-selected nodes. The connected node is never
     /// deleted — if it is selected it is skipped and logged.
-    /// Deleted hosts go on the persistent blocklist (so a refresh
-    /// never brings them back). Probe results for deleted hosts are
-    /// cleaned up, and the selection is cleared.
+    /// Deleted hosts go on the blocklist, which only hides them for
+    /// this session: the next refresh clears the blocklist and
+    /// brings the full list back (v3.11, Leo's call). Probe results
+    /// for deleted hosts are cleaned up, and the selection is
+    /// cleared.
     fn delete_selected(&mut self) {
         if !self.can_delete() {
             return;
@@ -2118,7 +2279,7 @@ impl GuiApp {
         }
         if removed > 0 {
             self.status = format!(
-                "已删除 {} 个节点（已记入屏蔽列表，刷新后也不会回来）。",
+                "已删除 {} 个节点（本次会话里隐藏，刷新后会带回来）。",
                 removed
             );
             self.log_line(format!(
@@ -2169,6 +2330,303 @@ impl GuiApp {
             .into_iter()
             .filter(|n| !self.blocked_hosts.contains(&Self::blocked_key(&n.host)))
             .collect()
+    }
+
+    /// The selected nodes in display order (see `display_indices`,
+    /// so a sorted list exports in the shown order). Cloned: the
+    /// export text is built from this snapshot.
+    fn selected_nodes_in_display_order(&self) -> Vec<Node> {
+        self.display_indices()
+            .into_iter()
+            .filter(|i| self.selected_set.contains(i))
+            .filter_map(|i| self.nodes.get(i).cloned())
+            .collect()
+    }
+
+    /// Copy the selected nodes to the system clipboard, one
+    /// `host:port` line per node (see `export_nodes_text`). Same
+    /// guard as the delete button — a non-empty selection and no job
+    /// running — so the button, the Ctrl+C shortcut and the File menu
+    /// item all share this one path. The clipboard write itself is
+    /// egui's fire-and-forget `copy_text` (the OS call happens in
+    /// the eframe backend, which reports no result back to the app);
+    /// the only failure the app can see is an empty selection, and
+    /// that is reported as such instead of claiming success.
+    fn export_selected(&mut self, ctx: &egui::Context) {
+        if !self.can_delete() {
+            return;
+        }
+        let nodes = self.selected_nodes_in_display_order();
+        let text = export_nodes_text(&nodes);
+        if text.is_empty() {
+            self.status = "没有选中的节点可导出。".to_string();
+            self.log_line("导出选中：没有选中的节点，未写入剪贴板。".to_string());
+            return;
+        }
+        let n = nodes.len();
+        ctx.copy_text(text);
+        self.status = format!("已导出 {} 个节点到剪贴板。", n);
+        self.log_line(format!("已导出 {} 个节点到剪贴板。", n));
+    }
+
+    /// Write the selected nodes to a plain-text node-list file
+    /// (same `host:port` lines as the clipboard export) through a
+    /// native save dialog (`rfd`, default name `nodes_export.txt`).
+    /// Same guard as the delete button. A cancelled dialog is not
+    /// an error — it just says so.
+    fn export_selected_to_file(&mut self) {
+        if !self.can_delete() {
+            return;
+        }
+        let nodes = self.selected_nodes_in_display_order();
+        let text = export_nodes_text(&nodes);
+        if text.is_empty() {
+            self.status = "没有选中的节点可导出。".to_string();
+            self.log_line("导出到文件：没有选中的节点，未写文件。".to_string());
+            return;
+        }
+        let n = nodes.len();
+        let picked = rfd::FileDialog::new()
+            .set_file_name("nodes_export.txt")
+            .add_filter("文本文件", &["txt"])
+            .save_file();
+        match picked {
+            Some(path) => match std::fs::write(&path, &text) {
+                Ok(()) => {
+                    self.status = format!("已导出 {} 个节点到 {}。", n, path.display());
+                    self.log_line(format!("已导出 {} 个节点到 {}。", n, path.display()));
+                }
+                Err(e) => {
+                    self.status = format!("写文件失败：{}。", e);
+                    self.log_line(format!(
+                        "导出到文件失败：写 {} 失败：{}。",
+                        path.display(),
+                        e
+                    ));
+                }
+            },
+            None => {
+                self.status = "已取消保存文件。".to_string();
+                self.log_line("导出到文件：用户取消了保存对话框。".to_string());
+            }
+        }
+    }
+
+    /// Import nodes from text (clipboard or file — one shared path).
+    /// `source` is the short noun used in the messages ("剪贴板" /
+    /// "文件"). Does nothing while a job is running: a fetch that
+    /// finishes mid-import would replace the list and silently drop
+    /// the imported nodes. After a successful import the node cache
+    /// is rewritten so the nodes survive a restart, and a blocklist
+    /// change (imported hosts are unblocked) is auto-saved.
+    fn import_from_text(&mut self, text: &str, source: &str) {
+        if self.busy.is_some() {
+            self.status = "正在忙，请稍后再导入。".to_string();
+            self.log_line(format!("从{}导入：正在忙，未导入。", source));
+            return;
+        }
+        let report = self.import_nodes_text(text);
+        if report.added > 0 {
+            if let Err(e) = vpngate::save_cached_nodes(&self.nodes) {
+                self.log_warn(format!("导入后写节点缓存失败：{}。", e));
+            }
+            self.auto_save_if_dirty();
+        }
+        for host in &report.unblocked {
+            self.log_line(format!("已从屏蔽列表里拿掉 {}（导入把它要回来了）。", host));
+        }
+        if report.added == 0 && report.duplicates == 0 && report.malformed == 0 {
+            self.status = format!("{}里没有可导入的节点。", source);
+            self.log_line(format!("从{}导入：没有可解析的行，未导入任何节点。", source));
+        } else {
+            self.status = format!(
+                "已导入 {} 个节点（跳过重复 {} 个，格式不对 {} 个）。",
+                report.added, report.duplicates, report.malformed
+            );
+            self.log_line(format!(
+                "从{}导入：成功 {} 个，跳过重复 {} 个，格式不对 {} 个。",
+                source, report.added, report.duplicates, report.malformed
+            ));
+        }
+    }
+
+    /// The mutation core of `import_from_text`, split out so the
+    /// parse/insert/count logic is unit-testable without status/log
+    /// side effects (and without touching the cache or the config).
+    /// Nodes are appended at the end, in the file's order; the
+    /// selection is left untouched. A host already in the list (by
+    /// completed hostname) is a duplicate; a host on the blocklist
+    /// is unblocked — importing it is an explicit request to have it
+    /// back — and reported in `unblocked`.
+    fn import_nodes_text(&mut self, text: &str) -> ImportReport {
+        let mut report = ImportReport::default();
+        for line in text.lines() {
+            match parse_import_line(line) {
+                ImportLine::Skip => {}
+                ImportLine::Malformed => report.malformed += 1,
+                ImportLine::Node { host, port } => {
+                    let key = Self::blocked_key(&host);
+                    if self
+                        .nodes
+                        .iter()
+                        .any(|n| Self::blocked_key(&n.host) == key)
+                    {
+                        report.duplicates += 1;
+                        continue;
+                    }
+                    if self.blocked_hosts.remove(&key) {
+                        report.unblocked.push(key);
+                    }
+                    let target = match port {
+                        Some(p) => format!("{}:{}", host, p),
+                        None => host.clone(),
+                    };
+                    self.nodes.push(Node {
+                        host,
+                        port,
+                        country: "导入".to_string(),
+                        country_code: String::new(),
+                        isp: "导入".to_string(),
+                        name: target,
+                        score: 0,
+                        ping_ms: 0,
+                        speed_mbps: 0,
+                        sessions: 0,
+                        ip: String::new(),
+                        backups: Vec::new(),
+                        port_source: "import".to_string(),
+                        source: "import".to_string(),
+                    });
+                    report.added += 1;
+                }
+            }
+        }
+        report
+    }
+
+    /// Import from the system clipboard, read directly (`arboard`) —
+    /// the File menu item's path (a menu click carries no Paste
+    /// event). Ctrl+V instead goes through `handle_clipboard_events`
+    /// (Paste event first, keypress + direct read as fallback).
+    fn import_from_clipboard(&mut self) {
+        if self.busy.is_some() {
+            self.status = "正在忙，请稍后再导入。".to_string();
+            self.log_line("从剪切板导入：正在忙，未导入。".to_string());
+            return;
+        }
+        match read_clipboard_text() {
+            Ok(text) => self.import_from_text(&text, "剪贴板"),
+            Err(e) => {
+                self.status = format!("读剪贴板失败：{}。", e);
+                self.log_line(format!("从剪切板导入失败：读剪贴板失败：{}。", e));
+            }
+        }
+    }
+
+    /// Import from a plain-text node-list file through a native open
+    /// dialog (`rfd`). Same line format as the clipboard import.
+    fn import_from_file_dialog(&mut self) {
+        if self.busy.is_some() {
+            self.status = "正在忙，请稍后再导入。".to_string();
+            self.log_line("从文件导入：正在忙，未导入。".to_string());
+            return;
+        }
+        let picked = rfd::FileDialog::new()
+            .add_filter("文本文件", &["txt"])
+            .add_filter("全部文件", &["*"])
+            .pick_file();
+        match picked {
+            Some(path) => match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    self.log_line(format!("正在从文件 {} 导入…", path.display()));
+                    self.import_from_text(&text, "文件");
+                }
+                Err(e) => {
+                    self.status = format!("读文件失败：{}。", e);
+                    self.log_line(format!(
+                        "从文件导入失败：读 {} 失败：{}。",
+                        path.display(),
+                        e
+                    ));
+                }
+            },
+            None => {
+                self.status = "已取消选择文件。".to_string();
+                self.log_line("从文件导入：用户取消了打开对话框。".to_string());
+            }
+        }
+    }
+
+    /// Clear the blocklist (in memory and in config.toml) and return
+    /// how many hosts were cleared. The caller owns the messaging:
+    /// `start_fetch` calls this before fetching, and the Nodes
+    /// handler logs the cleared count in the refresh summary line.
+    /// This is NOT the v3.10-removed "恢复已删除" button — nothing
+    /// is put back into the current list here; the hosts come back
+    /// with the fresh list the refresh fetches.
+    fn clear_blocklist(&mut self) -> usize {
+        let n = self.blocked_hosts.len();
+        if n == 0 {
+            return 0;
+        }
+        self.blocked_hosts.clear();
+        self.auto_save_if_dirty();
+        n
+    }
+
+    /// Ctrl+C / Ctrl+V on the node list, called once per frame from
+    /// `ui()` (after the Enter/Ctrl+R shortcuts). The caller guards
+    /// it with the same focus rule — no text field focused and the
+    /// About window closed — so a focused text field keeps its own
+    /// copy/paste.
+    ///
+    /// Ctrl+C arrives as `Event::Copy` (eframe translates the
+    /// keypress) and exports the selection, exactly like the
+    /// 导出选中 button. Ctrl+V arrives as `Event::Paste` — but one
+    /// frame AFTER the keypress (eframe reads the clipboard after
+    /// rendering and pushes the event for the next frame), and an
+    /// empty clipboard sends no event at all. So the keypress itself
+    /// is the trigger: `consume_shortcut` (Ctrl+V) + a direct
+    /// `arboard` read, which reports an empty clipboard instead of
+    /// staying silent. The Paste event that follows the same
+    /// keypress is dropped (`drop_next_paste`, lives exactly one
+    /// frame) so the import does not run twice; a Paste event with
+    /// no preceding keypress imports directly.
+    fn handle_clipboard_events(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| {
+            i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+        }) {
+            self.export_selected(ctx);
+        }
+        let pasted = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Paste(t) => Some(t.clone()),
+                _ => None,
+            })
+        });
+        if self.drop_next_paste {
+            self.drop_next_paste = false;
+        } else if let Some(text) = pasted {
+            self.import_from_text(&text, "剪贴板");
+        } else if ctx.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::V,
+            ))
+        }) {
+            match read_clipboard_text() {
+                Ok(text) => {
+                    if !text.trim().is_empty() {
+                        self.drop_next_paste = true;
+                    }
+                    self.import_from_text(&text, "剪贴板");
+                }
+                Err(e) => {
+                    self.status = format!("读剪贴板失败：{}。", e);
+                    self.log_line(format!("从剪贴板导入失败：读剪贴板失败：{}。", e));
+                }
+            }
+        }
     }
 
     /// Keyboard shortcuts (Enter = connect, Ctrl+R = probe): the pure
@@ -2258,6 +2716,14 @@ impl eframe::App for GuiApp {
                 self.move_selection(1);
             }
         }
+        // Ctrl+C exports the selection, Ctrl+V imports from the
+        // clipboard (see `handle_clipboard_events`): same focus
+        // guard as the shortcuts above — a focused text field owns
+        // its own copy/paste, and stealing it would break typing in
+        // the manual-add / port / front-proxy fields.
+        if !text_focused && !self.show_about {
+            self.handle_clipboard_events(&ctx);
+        }
         // Quitting while connected disconnects first (no confirm needed).
         if ui.ctx().input(|i| i.viewport().close_requested()) {
             self.disconnect();
@@ -2268,6 +2734,60 @@ impl eframe::App for GuiApp {
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("文件", |ui| {
+                    // Export / import share the button and shortcut
+                    // paths — no second implementation of either.
+                    let can_export = self.can_delete();
+                    let export_disabled_hint = if self.selected_set.is_empty() {
+                        "请先选择要导出的节点（单击选一行，Ctrl+单击多选）"
+                    } else {
+                        "正在忙，请稍候"
+                    };
+                    if ui
+                        .add_enabled(
+                            can_export,
+                            egui::Button::new("导出到剪切板").shortcut_text("Ctrl+C"),
+                        )
+                        .on_hover_text("把选中的节点按显示顺序导出到剪贴板（每行 主机:端口）")
+                        .on_disabled_hover_text(export_disabled_hint)
+                        .clicked()
+                    {
+                        let ctx = ui.ctx().clone();
+                        self.export_selected(&ctx);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(can_export, egui::Button::new("导出到config"))
+                        .on_hover_text("把选中的节点写进一个节点清单文件（默认 nodes_export.txt，每行 主机:端口）")
+                        .on_disabled_hover_text(export_disabled_hint)
+                        .clicked()
+                    {
+                        self.export_selected_to_file();
+                        ui.close();
+                    }
+                    ui.separator();
+                    let can_import = self.busy.is_none();
+                    if ui
+                        .add_enabled(
+                            can_import,
+                            egui::Button::new("从剪切板导入").shortcut_text("Ctrl+V"),
+                        )
+                        .on_hover_text("读剪贴板里的节点清单（每行 主机:端口），加进列表")
+                        .on_disabled_hover_text("正在忙，请稍候")
+                        .clicked()
+                    {
+                        self.import_from_clipboard();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(can_import, egui::Button::new("从文件config导入"))
+                        .on_hover_text("从一个节点清单文件导入（每行 主机:端口）")
+                        .on_disabled_hover_text("正在忙，请稍候")
+                        .clicked()
+                    {
+                        self.import_from_file_dialog();
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("退出").clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -2990,7 +3510,7 @@ impl eframe::App for GuiApp {
                         self.can_delete(),
                         egui::Button::new(delete_label).min_size(btn_size),
                     )
-                    .on_hover_text("删除选中的节点，并记入屏蔽列表（刷新后也不会回来）")
+                    .on_hover_text("删除选中的节点，并记入屏蔽列表（本次会话里隐藏，刷新后会带回来）")
                     .on_disabled_hover_text(if n_sel == 0 {
                         "请先选择要删除的节点（单击选一行，Ctrl+单击多选）"
                     } else {
@@ -2999,6 +3519,31 @@ impl eframe::App for GuiApp {
                     .clicked()
                 {
                     self.delete_selected();
+                }
+                // Export the selection to the clipboard (same guard
+                // as delete): one `host:port` line per node, in
+                // display order. Ctrl+C and the File menu use the
+                // same `export_selected` path.
+                let export_label = if n_sel > 0 {
+                    format!("导出选中 ({})", n_sel)
+                } else {
+                    "导出选中".to_string()
+                };
+                if ui
+                    .add_enabled(
+                        self.can_delete(),
+                        egui::Button::new(export_label).min_size(btn_size),
+                    )
+                    .on_hover_text("把选中的节点按显示顺序导出到剪贴板（每行 主机:端口）")
+                    .on_disabled_hover_text(if n_sel == 0 {
+                        "请先选择要导出的节点（单击选一行，Ctrl+单击多选）"
+                    } else {
+                        "正在忙，请稍候"
+                    })
+                    .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.export_selected(&ctx);
                 }
                 ui.label("Ctrl+单击多选，Shift+单击选一个范围。");
             });
@@ -3237,6 +3782,14 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both tests that touch the shared portable config path
+    /// (`config.toml` next to the test exe) must serialize: parallel
+    /// writes to one path tear each other's files (a v3.11 run
+    /// produced a half-written `node_col_widths` line) and a
+    /// `remove_file` in one test can delete the other's file
+    /// mid-assert. Hold this for the whole test body.
+    static PORTABLE_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn node(host: &str) -> Node {
         Node {
@@ -3986,6 +4539,236 @@ mod tests {
         assert!(!app.can_delete());
     }
 
+    #[test]
+    fn export_nodes_text_joins_display_order_with_ports() {
+        // Order is the caller's (display) order, not sorted here.
+        let mut a = node_in("b.opengw.net", "美国");
+        a.port = Some(443);
+        let mut b = node_in("a.opengw.net", "日本");
+        b.port = Some(992);
+        let mut c = node_in("c.opengw.net", "德国");
+        c.port = Some(995);
+        assert_eq!(
+            export_nodes_text(&[a, b, c]),
+            "b.opengw.net:443\na.opengw.net:992\nc.opengw.net:995"
+        );
+    }
+
+    #[test]
+    fn export_nodes_text_bare_host_for_unknown_port() {
+        // A port-less node (API nodes arrive without one) exports
+        // as a bare host — never an invented port — and a bare API
+        // label is completed, the same target a connect dials.
+        let mut a = node_in("public-vpn-192", "日本");
+        a.port = None;
+        let mut b = node_in("x.opengw.net", "美国");
+        b.port = None;
+        assert_eq!(
+            export_nodes_text(&[a, b]),
+            "public-vpn-192.opengw.net\nx.opengw.net"
+        );
+        assert_eq!(export_nodes_text(&[]), "");
+    }
+
+    #[test]
+    fn export_selected_with_empty_selection_claims_nothing() {
+        // The guard returns before touching the clipboard: no status
+        // change, no log line claiming an export happened.
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![node_in("a.opengw.net", "日本")];
+        let ctx = egui::Context::default();
+        app.export_selected(&ctx);
+        assert_eq!(app.status, "未连接");
+        assert!(!app.log.iter().any(|l| l.contains("导出")));
+    }
+
+    #[test]
+    fn parse_import_line_cases() {
+        assert_eq!(
+            match parse_import_line("a.opengw.net:443") {
+                ImportLine::Node { host, port } => (host, port),
+                _ => panic!("expected a node"),
+            },
+            ("a.opengw.net".to_string(), Some(443))
+        );
+        assert_eq!(
+            match parse_import_line("  public-vpn-192  ") {
+                ImportLine::Node { host, port } => (host, port),
+                _ => panic!("expected a node"),
+            },
+            ("public-vpn-192".to_string(), None)
+        );
+        assert!(matches!(parse_import_line(""), ImportLine::Skip));
+        assert!(matches!(parse_import_line("   "), ImportLine::Skip));
+        assert!(matches!(
+            parse_import_line("# a comment"),
+            ImportLine::Skip
+        ));
+        assert!(matches!(
+            parse_import_line("  # indented comment"),
+            ImportLine::Skip
+        ));
+        for bad in [":443", "a.opengw.net:", "a.opengw.net:0", "a.opengw.net:70000", "a.opengw.net:notaport", "ho st:443", "a:b:443", "a_b.opengw.net:443"] {
+            assert!(
+                matches!(parse_import_line(bad), ImportLine::Malformed),
+                "{bad} must be malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn import_nodes_text_adds_dedups_and_unblocks() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![node_in("a.opengw.net", "日本")];
+        app.blocked_hosts
+            .insert("blocked.opengw.net".to_string());
+        let report = app.import_nodes_text(
+            "b.opengw.net:992\n\
+             a.opengw.net:443\n\
+             blocked.opengw.net:443\n\
+             b.opengw.net:992\n\
+             not a host:port\n\
+             # comment\n\
+             \n\
+             c.opengw.net",
+        );
+        assert_eq!(
+            report,
+            ImportReport {
+                added: 3,
+                duplicates: 2,
+                malformed: 1,
+                unblocked: vec!["blocked.opengw.net".to_string()],
+            }
+        );
+        assert_eq!(app.nodes.len(), 4);
+        assert_eq!(app.nodes[1].host, "b.opengw.net");
+        assert_eq!(app.nodes[1].port, Some(992));
+        assert_eq!(app.nodes[1].country, "导入");
+        assert_eq!(app.nodes[1].source, "import");
+        assert_eq!(app.nodes[2].host, "blocked.opengw.net");
+        assert_eq!(app.nodes[3].host, "c.opengw.net");
+        assert_eq!(app.nodes[3].port, None);
+        assert!(app.blocked_hosts.is_empty(), "import unblocks its hosts");
+        // The pre-existing selection is untouched by an import.
+        assert!(app.selected_set.is_empty());
+    }
+
+    #[test]
+    fn import_nodes_text_empty_reports_nothing() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![node_in("a.opengw.net", "日本")];
+        let report = app.import_nodes_text("  \n# only comments\n\n");
+        assert_eq!(report, ImportReport::default());
+        assert_eq!(app.nodes.len(), 1);
+    }
+
+    #[test]
+    fn refresh_summary_line_states_source_and_counts() {
+        assert_eq!(
+            refresh_summary_line(vpngate::NodeListSource::Api, 116, 125),
+            "刷新完成（官方 API）：已清空屏蔽 116 个，获取到 125 个。"
+        );
+        assert_eq!(
+            refresh_summary_line(vpngate::NodeListSource::WebScrape, 96, 100),
+            "刷新完成（网页抓取）：已清空屏蔽 96 个，获取到 100 个。"
+        );
+        assert_eq!(
+            refresh_summary_line(vpngate::NodeListSource::Cache, 0, 96),
+            "刷新完成（缓存）：已清空屏蔽 0 个，获取到 96 个。"
+        );
+        assert_eq!(
+            refresh_summary_line(vpngate::NodeListSource::Curated, 20, 28),
+            "刷新完成（内嵌列表）：已清空屏蔽 20 个，获取到 28 个。"
+        );
+    }
+
+    /// v3.11 refresh flow (Leo's call): a refresh clears the
+    /// blocklist first — in memory and in config.toml — then the
+    /// incoming list is shown in full, including hosts deleted
+    /// earlier in the session. The summary line states the cleared
+    /// count, the source and the final count.
+    #[test]
+    fn refresh_clears_blocklist_and_restores_full_list() {
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let mut app = GuiApp::for_tests();
+        // Session state: b was deleted earlier (blocklist 1 host,
+        // persisted in config); the current list is [a, c].
+        app.config.blocked_hosts = vec!["b.opengw.net".to_string()];
+        app.blocked_hosts = app.config.blocked_hosts.iter().cloned().collect();
+        app.nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("c.opengw.net", "德国"),
+        ];
+        // The refresh start (start_fetch itself spawns a task, so the
+        // test drives its two halves directly): clear first.
+        let cleared = app.clear_blocklist();
+        assert_eq!(cleared, 1);
+        assert!(app.blocked_hosts.is_empty());
+        // Persistence: the saved config file lost the entry too, so
+        // a restart does not resurrect it.
+        let path = Config::portable_config_path().expect("exe dir known");
+        let back = Config::load(Some(&path)).expect("saved config loads");
+        assert!(back.blocked_hosts.is_empty());
+        let _ = std::fs::remove_file(&path);
+        // The fetch completes: the full list comes back, b included.
+        app.refresh_cleared_blocked = cleared;
+        app.apply_event(GuiEvent::Nodes(vpngate::NodeListUpdate {
+            nodes: vec![
+                node_in("a.opengw.net", "日本"),
+                node_in("b.opengw.net", "美国"),
+                node_in("c.opengw.net", "德国"),
+            ],
+            source: vpngate::NodeListSource::Api,
+            cache_age_secs: None,
+            api_error: None,
+            web_error: None,
+        }));
+        assert_eq!(app.nodes.len(), 3);
+        assert_eq!(app.nodes[1].host, "b.opengw.net");
+        assert!(
+            app.log.iter().any(|l| l
+                == "刷新完成（官方 API）：已清空屏蔽 1 个，获取到 3 个。"),
+            "log must carry the cleared count and final count, got: {:?}",
+            app.log
+        );
+        // The Api branch also cached the fresh list next to the test
+        // exe; clean it up like the config file above.
+        if let Some(cache) = vpngate::cache_path() {
+            let _ = std::fs::remove_file(&cache);
+        }
+    }
+
+    #[test]
+    fn curated_status_uses_filtered_count() {
+        // The curated branch used to hardcode "（28 个）" in the
+        // status while the list only showed the filtered count.
+        // (A non-empty blocklist at Nodes time now only happens for
+        // a node deleted mid-fetch — the refresh itself clears it
+        // first — but the status must still show the shown count.)
+        let mut app = GuiApp::for_tests();
+        app.blocked_hosts.insert("a.opengw.net".to_string());
+        app.blocked_hosts.insert("b.opengw.net".to_string());
+        app.apply_event(GuiEvent::Nodes(vpngate::NodeListUpdate {
+            nodes: vec![
+                node_in("a.opengw.net", "日本"),
+                node_in("b.opengw.net", "美国"),
+                node_in("c.opengw.net", "德国"),
+            ],
+            source: vpngate::NodeListSource::Curated,
+            cache_age_secs: None,
+            api_error: Some("api down".to_string()),
+            web_error: Some("web down".to_string()),
+        }));
+        assert_eq!(app.nodes.len(), 1);
+        assert!(
+            app.status.contains("（1 个）"),
+            "curated status must show the filtered count, got: {}",
+            app.status
+        );
+        assert!(!app.status.contains("28 个"));
+    }
+
     /// The blocklist filters every list load: an incoming list that
     /// still contains a blocked host loses it before it is shown,
     /// and the selection is cleared (indices from the old list are
@@ -4656,6 +5439,9 @@ mod tests {
     fn auto_save_if_dirty_persists_front_proxy() {
         // Auto-save writes next to the test exe (portable dir); verify
         // the file round-trips the front-proxy fields, then clean up.
+        // Serialized with the other portable-config test (see
+        // PORTABLE_CONFIG_LOCK) — parallel writes tear the file.
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
         let mut app = GuiApp::for_tests();
         app.front_enabled = true;
         app.front_addr = "127.0.0.1:1081".to_string();
@@ -6251,6 +7037,388 @@ mod tests {
             "status: {}",
             harness.state().status
         );
+    }
+
+    /// Click a button by label and return the text it copied (if
+    /// any). The press runs via run(); the release is queued as a
+    /// single event and stepped once, so `harness.output()` is
+    /// exactly the frame where the click fired and the CopyText
+    /// command lives. (`drop_at` would queue a second PointerGone
+    /// event, and a plain run() would settle past the copy frame.)
+    fn click_button_label_copied_text(
+        harness: &mut egui_kittest::Harness<'_, GuiApp>,
+        label: &str,
+    ) -> Option<String> {
+        use egui_kittest::kittest::Queryable;
+        let btn = harness.get_by_label(label);
+        let center = btn.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.event(egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        copied_text(harness)
+    }
+
+    /// The CopyText command of the last frame, if the app copied
+    /// anything in it.
+    fn copied_text(harness: &egui_kittest::Harness<'_, GuiApp>) -> Option<String> {
+        harness
+            .output()
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            })
+    }
+
+    /// Ctrl+click a row by its cell label in a kittest harness
+    /// (mirrors `shift_click_row_label`: egui only tracks modifiers
+    /// from ModifiersChanged events, so queue one before the press
+    /// and again before the release).
+    fn ctrl_click_row_label(
+        harness: &mut egui_kittest::Harness<'_, GuiApp>,
+        label: &str,
+    ) {
+        use egui_kittest::kittest::Queryable;
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let cell = harness.get_by_label(label);
+        let center = cell.rect().center();
+        harness.event(egui::Event::ModifiersChanged(ctrl));
+        harness.drag_at(center);
+        harness.run();
+        harness.event(egui::Event::ModifiersChanged(ctrl));
+        harness.drop_at(center);
+        harness.run();
+        harness.event(egui::Event::ModifiersChanged(
+            egui::Modifiers::default(),
+        ));
+        harness.run();
+    }
+
+    /// 导出选中 copies the selected rows in display order — one
+    /// `host:port` line per node — to the clipboard. Clicking c
+    /// first and then Ctrl+clicking a selects {a, c} in that click
+    /// order; the copied text must still be display order (a, c),
+    /// with each node's own port. Needs a graphics adapter, like
+    /// the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn export_button_copies_selected_rows_in_display_order() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                let mut a = node_in("a.opengw.net", "日本");
+                a.port = Some(443);
+                let mut b = node_in("b.opengw.net", "美国");
+                b.port = Some(992);
+                let mut c = node_in("c.opengw.net", "德国");
+                c.port = Some(995);
+                app.nodes = vec![a, b, c];
+                app
+            });
+        harness.run_steps(10);
+        click_row_label(&mut harness, "德国");
+        ctrl_click_row_label(&mut harness, "日本");
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0, 2]),
+            "c then Ctrl+a must select rows 0 and 2"
+        );
+        let copied =
+            click_button_label_copied_text(&mut harness, "导出选中 (2)");
+        assert_eq!(
+            copied.as_deref(),
+            Some("a.opengw.net:443\nc.opengw.net:995"),
+            "export must list the selection in display order, each with its own port"
+        );
+        assert_eq!(
+            harness.state().status,
+            "已导出 2 个节点到剪贴板。",
+            "status must confirm the export: {}",
+            harness.state().status
+        );
+    }
+
+    /// With nothing selected the export button is disabled: clicking
+    /// it copies nothing and changes no status. Needs a graphics
+    /// adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn export_button_disabled_with_no_selection() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![node_in("a.opengw.net", "日本")];
+                app
+            });
+        harness.run_steps(10);
+        assert!(harness.state().selected_set.is_empty());
+        let _btn = harness.get_by_label("导出选中");
+        let copied = click_button_label_copied_text(&mut harness, "导出选中");
+        assert_eq!(copied, None, "a disabled export button must copy nothing");
+        assert_eq!(harness.state().status, "未连接");
+    }
+
+    /// Ctrl+C exports the selection exactly like the 导出选中
+    /// button. Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn ctrl_c_exports_selection() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        click_row_label(&mut harness, "日本");
+        shift_click_row_label(&mut harness, "美国");
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0, 1]),
+            "Shift+click must select the range"
+        );
+        harness.event(egui::Event::Copy);
+        harness.step();
+        assert_eq!(
+            copied_text(&harness).as_deref(),
+            Some("a.opengw.net:992\nb.opengw.net:992"),
+            "Ctrl+C must copy the selection in display order"
+        );
+        assert_eq!(harness.state().status, "已导出 2 个节点到剪贴板。");
+    }
+
+    /// Ctrl+V imports the pasted node list: rows are appended and
+    /// the status reports the counts. Needs a graphics adapter,
+    /// like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn ctrl_v_imports_from_clipboard() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![node_in("a.opengw.net", "日本")];
+                app
+            });
+        harness.run_steps(10);
+        harness.event(egui::Event::Paste(
+            "b.opengw.net:992\nc.opengw.net".to_string(),
+        ));
+        harness.step();
+        assert_eq!(harness.state().nodes.len(), 3);
+        assert_eq!(harness.state().nodes[1].host, "b.opengw.net");
+        assert_eq!(harness.state().nodes[1].port, Some(992));
+        assert_eq!(harness.state().nodes[2].host, "c.opengw.net");
+        assert_eq!(harness.state().nodes[2].port, None);
+        assert_eq!(
+            harness.state().status,
+            "已导入 2 个节点（跳过重复 0 个，格式不对 0 个）。",
+            "status must report the import counts: {}",
+            harness.state().status
+        );
+        // The import cached the list next to the test exe; clean up.
+        if let Some(cache) = vpngate::cache_path() {
+            let _ = std::fs::remove_file(&cache);
+        }
+    }
+
+    /// With a text field focused, Ctrl+C stays the field's own copy:
+    /// no export runs, nothing is copied, the status does not move.
+    /// Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn ctrl_c_ignored_when_text_field_focused() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        // Short window: the node list height scales with the panel
+        // (`panel_h - 250`, min 120), so a TALL window pushes
+        // 高级设置 further down; a short one brings the manual-add
+        // field into view.
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 500.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![node_in("a.opengw.net", "日本")];
+                app
+            });
+        harness.run_steps(10);
+        // Select a row first, so an export would have something to
+        // copy; then focus the manual-add field (first text input in
+        // tree order; 高级设置 starts open in the render-test
+        // constructor). The order matters: clicking a row steals the
+        // text field's focus, so the field is focused last.
+        click_row_label(&mut harness, "日本");
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0]),
+            "the row must be selected before the field takes focus"
+        );
+        // The manual-add field sits below the fold at first (the
+        // node list takes most of the window). Scroll the outer area
+        // down with the wheel, then re-read the field's rect: the
+        // accesskit rect follows the scroll offset.
+        harness.event(egui::Event::PointerMoved(egui::pos2(400.0, 300.0)));
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -5.0),
+            modifiers: egui::Modifiers::default(),
+            phase: egui::TouchPhase::Move,
+        });
+        harness.run_steps(5);
+        let field = harness
+            .query_all_by_role(egui::accesskit::Role::TextInput)
+            .next()
+            .expect("a text input must exist");
+        let center = field.rect().center();
+        assert!(
+            center.y < 500.0,
+            "the field must have scrolled into view, rect={:?}",
+            field.rect()
+        );
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert!(
+            harness.ctx.text_edit_focused(),
+            "clicking the text field must focus it"
+        );
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0]),
+            "focusing the field must not clear the selection"
+        );
+        harness.event(egui::Event::Copy);
+        harness.step();
+        assert_eq!(
+            copied_text(&harness),
+            None,
+            "Ctrl+C with a focused text field must not export"
+        );
+        assert_eq!(harness.state().status, "未连接");
+    }
+
+    /// v3.11 refresh flow end to end: delete two nodes (the
+    /// blocklist grows), click 刷新节点, and the deleted nodes come
+    /// back with the fresh list — the blocklist is cleared when the
+    /// refresh starts. Also asserts the two removed features stay
+    /// gone: no "恢复已删除" button, and no "清空屏蔽列表" item in
+    /// the File menu (the four import/export items are still there).
+    /// Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn refresh_clears_blocklist_and_restores_deleted_nodes() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        // Delete a and b: only c is left, the blocklist holds 2.
+        click_row_label(&mut harness, "日本");
+        ctrl_click_row_label(&mut harness, "美国");
+        click_button_label(&mut harness, "删除选中 (2)");
+        assert_eq!(harness.state().nodes.len(), 1);
+        assert_eq!(harness.state().nodes[0].host, "c.opengw.net");
+        assert_eq!(harness.state().blocked_hosts.len(), 2);
+        assert!(harness
+            .query_by_label_contains("恢复已删除")
+            .is_none());
+        // Refresh: the blocklist is cleared synchronously when the
+        // refresh starts (before any network), the busy flag is set.
+        // run_steps, not run(): the fetch spinner requests a repaint
+        // every frame, so run() never settles.
+        let btn = harness.get_by_label("刷新节点");
+        let center = btn.rect().center();
+        harness.drag_at(center);
+        harness.run_steps(3);
+        harness.drop_at(center);
+        harness.run_steps(3);
+        assert!(
+            harness.state().blocked_hosts.is_empty(),
+            "refresh must clear the blocklist at once, got: {:?}",
+            harness.state().blocked_hosts
+        );
+        assert!(
+            matches!(harness.state().busy, Some(Busy::Fetching)),
+            "refresh must set the fetching flag, busy={:?}",
+            harness.state().busy
+        );
+        assert_eq!(harness.state().status, "正在拉取节点列表…");
+        // Drive the fetch result through by hand (no runtime in the
+        // harness): the full list comes back, a and b included.
+        harness.state_mut().apply_event(GuiEvent::Nodes(
+            vpngate::NodeListUpdate {
+                nodes: vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                ],
+                source: vpngate::NodeListSource::Api,
+                cache_age_secs: None,
+                api_error: None,
+                web_error: None,
+            },
+        ));
+        harness.run_steps(3);
+        assert_eq!(harness.state().nodes.len(), 3);
+        assert_eq!(harness.state().nodes[0].host, "a.opengw.net");
+        assert_eq!(harness.state().nodes[1].host, "b.opengw.net");
+        assert!(harness.state().blocked_hosts.is_empty());
+        assert!(
+            harness.state().log.iter().any(|l| l
+                == "刷新完成（官方 API）：已清空屏蔽 2 个，获取到 3 个。"),
+            "log must carry the cleared count and final count, got: {:?}",
+            harness.state().log
+        );
+        // The File menu has the four import/export items and no
+        // "清空屏蔽列表" (Leo rejected that fix in favour of the
+        // refresh auto-clear). Note the menu items carrying a
+        // shortcut show it in their accesskit label.
+        click_button_label(&mut harness, "文件");
+        assert!(harness.query_by_label("清空屏蔽列表").is_none());
+        let _export = harness.get_by_label("导出到剪切板 Ctrl+C");
+        let _export_file = harness.get_by_label("导出到config");
+        let _import = harness.get_by_label("从剪切板导入 Ctrl+V");
+        let _import_file = harness.get_by_label("从文件config导入");
+        click_button_label(&mut harness, "文件");
+        // The delete + the hand-driven Api result wrote config.toml
+        // and nodes_cache.json next to the test exe; clean up.
+        if let Some(path) = Config::portable_config_path() {
+            let _ = std::fs::remove_file(&path);
+        }
+        if let Some(cache) = vpngate::cache_path() {
+            let _ = std::fs::remove_file(&cache);
+        }
     }
 
     /// The ∞ mark (U+221E) must render as a glyph, not a missing-glyph

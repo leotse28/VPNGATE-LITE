@@ -47,10 +47,14 @@ pub struct Config {
     #[serde(default)]
     pub ui: UiSettings,
     /// Hostnames the user deleted from the node list (multi-select
-    /// delete). They stay out of every list load — API refresh, web
-    /// scrape, cache, embedded fallback — until restored. Stored as
-    /// canonical completed hostnames (see `blocked_key` in the GUI);
-    /// empty by default, so old config files load unchanged.
+    /// delete). They stay hidden for this session only: the next
+    /// explicit refresh clears the whole list first and brings the
+    /// full list back (v3.11, Leo's call — delete is session-only
+    /// hiding). Until then they stay out of every list load — API
+    /// refresh, web scrape, cache, embedded fallback — and out of
+    /// the startup load. Stored as canonical completed hostnames
+    /// (see `blocked_key` in the GUI); empty by default, so old
+    /// config files load unchanged.
     #[serde(default)]
     pub blocked_hosts: Vec<String>,
 }
