@@ -236,6 +236,11 @@ struct ActiveConnection {
 
 enum GuiEvent {
     Nodes(vpngate::NodeListUpdate),
+    /// v3.15 "从API刷新节点" failed: the official API could not be
+    /// reached. The reason is the API error verbatim; the list and
+    /// the blocklist stay exactly as they were — this event carries
+    /// no nodes, so there is nothing to fall back to.
+    ApiRefreshFailed { reason: String },
     Probe {
         host: String,
         result: Result<(Ipv4Addr, Duration), ProbeFailure>,
@@ -315,6 +320,13 @@ fn connector_for(front_enabled: bool, front_addr: &str, user: &str, pass: &str) 
 
 async fn fetch_flow(connector: &Connector) -> vpngate::NodeListUpdate {
     vpngate::fetch_nodes_with_fallback(connector).await
+}
+
+/// v3.15: API-only refresh — the official API (CSV) and nothing
+/// else. Any failure is an `Err`; the caller reports it plainly
+/// instead of falling back to the scrape.
+async fn fetch_api_flow(connector: &Connector) -> Result<Vec<vpngate::Node>, String> {
+    vpngate::fetch_api_only(connector).await
 }
 
 async fn probe_flow(
@@ -886,6 +898,20 @@ fn refresh_summary_line(
     }
 }
 
+/// The shared refresh-failure notice (Leo's exact wording,
+/// 2026-11-08): both refresh buttons write this sentence VERBATIM
+/// — in the log AND in the status bar — when their refresh fails,
+/// with the way + reason appended in parentheses. Never reword it,
+/// never split it into two sentences: the sentence is the prefix of
+/// the returned line, so `contains` on the exact sentence always
+/// matches.
+fn refresh_failure_line(way: &str, reason: &str) -> String {
+    format!(
+        "当前方式刷新节点失败，请用另一种方式刷新（方式：{}；原因：{}）。",
+        way, reason
+    )
+}
+
 /// Read the system clipboard as text (`arboard`). Used by the
 /// Ctrl+V keypress path and the File menu's clipboard import — the
 /// `Event::Paste` path needs no read (eframe already read it).
@@ -1121,6 +1147,12 @@ struct GuiApp {
     /// so the quit path `take()`s it.
     #[cfg(windows)]
     tray: Option<vpngate_client::tray::TrayHandle>,
+    /// A second launch asked this instance to come forward
+    /// (v3.15 single-instance): set by the watcher thread
+    /// (`single_instance::spawn_show_watcher`, started in `new()`),
+    /// consumed in `ui()` — the same effect as a tray double-click
+    /// (`show_main_window`).
+    show_requested: Arc<AtomicBool>,
     /// An explicit quit was requested (File menu 退出 / tray menu
     /// 退出): the next close request really quits instead of hiding
     /// to the tray. Set just before sending `ViewportCommand::Close`.
@@ -1256,6 +1288,11 @@ impl Default for GuiApp {
             show_about: false,
             #[cfg(windows)]
             tray: None,
+            // A second launch asked this instance to come forward
+            // (v3.15 single-instance): set by the watcher thread
+            // in `single_instance::spawn_show_watcher`, consumed
+            // in `ui()` — the same effect as a tray double-click.
+            show_requested: Arc::new(AtomicBool::new(false)),
             quit_requested: false,
             hidden_to_tray: false,
             tray_hint_shown: false,
@@ -1287,7 +1324,7 @@ impl Default for GuiApp {
 }
 
 /// Brand palette, coordinated with the app icon (solid indigo #1E40AF
-/// + bold white shield since v3.14; a bold white V in v3.13, an indigo
+/// + bold white ring since v3.15; a bold white shield in v3.14, a bold white V in v3.13, an indigo
 /// → cyan gradient before that). Restrained on purpose: one accent (indigo), one
 /// success accent (cyan/teal, used for the ∞ connected-node mark),
 /// muted amber for warnings, soft red for errors — no multi-colour
@@ -1431,6 +1468,19 @@ impl GuiApp {
             Ok(t) => app.tray = Some(t),
             Err(e) => app.log_warn(format!("托盘创建失败：{e}，点 X 会直接退出。")),
         }
+        // v3.15 single-instance: a second launch signals this
+        // instance (named event on Windows) instead of opening
+        // another window. The watcher thread raises
+        // `show_requested` and asks for a repaint; `ui()` shows
+        // the window — the same effect as a tray double-click.
+        // Only the primary instance ever reaches `new()` (a second
+        // launch exits in `main()`), so the watcher always belongs
+        // to the lock owner.
+        let show_flag = app.show_requested.clone();
+        let show_ctx = cc.egui_ctx.clone();
+        vpngate_client::single_instance::spawn_show_watcher(show_flag, move || {
+            show_ctx.request_repaint();
+        });
         if !app.font_ok {
             app.log_warn("未找到系统里的中文字体，中文可能显示为方框。".to_string());
         }
@@ -1684,6 +1734,15 @@ impl GuiApp {
         self.log_line_at(LogLevel::Info, line);
     }
 
+    /// Write Leo's verbatim refresh-failure notice (see
+    /// `refresh_failure_line`) to the status bar AND the log.
+    /// Both refresh buttons use this when their refresh fails.
+    fn report_refresh_failure(&mut self, way: &str, reason: &str) {
+        let line = refresh_failure_line(way, reason);
+        self.status = line.clone();
+        self.log_line(line);
+    }
+
     /// Warning: on-screen log + file log at [WARN].
     fn log_warn(&mut self, line: String) {
         self.log_line_at(LogLevel::Warn, line);
@@ -1908,6 +1967,46 @@ impl GuiApp {
         Self::spawn_task(async move {
             let res = fetch_flow(&connector).await;
             let _ = tx.send(GuiEvent::Nodes(res));
+            ctx.request_repaint();
+        });
+    }
+
+    /// v3.15 "从API刷新节点": refresh from the official API (CSV)
+    /// ONLY — no web scrape, no cache, no curated list. Unlike
+    /// `start_fetch` it does NOT clear the blocklist first: the
+    /// blocklist keeps filtering as usual (deleted nodes stay
+    /// hidden), and a failed API fetch changes nothing at all — the
+    /// list and the blocklist stay exactly as they were. Success
+    /// goes through the same `Nodes` path as a normal refresh
+    /// (merge, cache, summary); failure arrives as
+    /// `ApiRefreshFailed` and is reported in Leo's exact words
+    /// instead of falling back silently.
+    fn start_fetch_api_only(&mut self, ctx: egui::Context) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.busy = Some(Busy::Fetching);
+        self.status = "正在从官方 API 拉取节点列表…".to_string();
+        let tx = self.event_tx.clone();
+        let connector = self.connector();
+        // spawn_task no-ops without a runtime (kittest): the busy
+        // flag stays set and the caller drives the result by hand,
+        // same as `start_fetch`.
+        Self::spawn_task(async move {
+            match fetch_api_flow(&connector).await {
+                Ok(nodes) => {
+                    let _ = tx.send(GuiEvent::Nodes(vpngate::NodeListUpdate {
+                        nodes,
+                        source: vpngate::NodeListSource::Api,
+                        cache_age_secs: None,
+                        api_error: None,
+                        web_error: None,
+                    }));
+                }
+                Err(reason) => {
+                    let _ = tx.send(GuiEvent::ApiRefreshFailed { reason });
+                }
+            }
             ctx.request_repaint();
         });
     }
@@ -2259,31 +2358,43 @@ impl GuiApp {
 
     /// Show the main window again after hiding to the tray
     /// (Windows only — only the tray calls it).
-    #[cfg(windows)]
     fn show_main_window(&mut self, ctx: &egui::Context) {
         self.hidden_to_tray = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
-    /// Restart the client: launch a fresh instance of this exe
-    /// (same arguments) and quit this one. v3.14: when a node is
-    /// connected right now, a one-shot resume marker is written
-    /// FIRST (`resume.json` next to the exe — target + label), so
-    /// the new instance auto-connects to the same node once
-    /// (`try_resume`, called from `new()`); when nothing is
-    /// connected, no marker is written and the new instance starts
-    /// disconnected, as before. A marker that cannot be written
-    /// only loses the resume — the restart itself still happens,
-    /// and the user reconnects by hand.
-    /// (Windows only — only the tray calls it.)
-    #[cfg(windows)]
-    fn restart_client(&mut self, ctx: &egui::Context) {
-        if let Some(c) = &self.conn {
-            let target = c.node_label.clone();
+    /// The restart itself, in Leo's order (v3.15 — "断开 → 退出 →
+    /// 重启 → 连回"): disconnect FIRST, then write the resume
+    /// marker, then hand back the command that launches the
+    /// successor. The caller (`restart_client`, Windows only)
+    /// spawns it and quits; the successor waits for this process
+    /// to exit (`--restart-wait-pid`, see `single_instance`) before
+    /// it binds the port or connects, so the v3.14 race — the new
+    /// instance binding 10818 while the old one still held it,
+    /// retrying once after 2 s, giving up with the marker already
+    /// consumed — cannot happen any more.
+    ///
+    /// Returns the exe + arguments for the successor: the current
+    /// arguments (any stale `--restart-wait-pid` pair dropped)
+    /// plus a fresh `--restart-wait-pid <this pid>`.
+    fn prepare_restart(&mut self) -> Result<(std::path::PathBuf, Vec<String>), String> {
+        // (a) Disconnect first, while this instance still owns the
+        // tunnel: the tunnel closes, the 10818 listeners are
+        // aborted, the system proxy is restored. `disconnect`
+        // logs "已断开 …", so the log reads断开 → 正在重启 → …
+        let target = self.conn.as_ref().map(|c| c.node_label.clone());
+        if target.is_some() {
+            self.disconnect();
+        }
+        // (b) Resume marker — only when a node was connected, so
+        // a disconnected restart still starts disconnected.
+        // Written AFTER the disconnect, and `perform_quit` keeps
+        // it when `restarting` is set (a manual quit deletes it).
+        if let Some(target) = &target {
             match tray::resume_file_path() {
                 Some(path) => {
-                    match tray::write_resume_target(&path, &target, &target) {
+                    match tray::write_resume_target(&path, target, target) {
                         Ok(()) => {
                             self.log_line(format!(
                                 "正在重启客户端，重启后自动连回 {}……",
@@ -2301,14 +2412,42 @@ impl GuiApp {
                 }
                 None => {
                     self.log_line(
-                        "正在重启客户端（找不到程序目录，写不了恢复标记，重启后需手动再连）……".to_string(),
+                        "正在重启客户端（找不到程序目录，写不了恢复标记，重启后需手动再连）……"
+                            .to_string(),
                     );
                 }
             }
         } else {
             self.log_line("正在重启客户端……".to_string());
         }
-        match tray::restart_command() {
+        // (c) Successor command: this exe + current arguments,
+        // with the old pid attached so the successor waits for
+        // this process to exit before it takes the lock, binds
+        // 10818, or connects.
+        let (exe, args) = tray::restart_command().map_err(|e| {
+            format!("重启失败：找不到当前程序路径：{}", e)
+        })?;
+        let mut args =
+            vpngate_client::single_instance::restart_args_without_wait_pid(&args);
+        args.push(
+            vpngate_client::single_instance::RESTART_WAIT_PID_ARG.to_string(),
+        );
+        args.push(std::process::id().to_string());
+        Ok((exe, args))
+    }
+
+    /// Restart the client: launch a fresh instance of this exe
+    /// (same arguments) and quit this one. v3.15: the order is
+    /// Leo's — disconnect, then exit, then the successor starts
+    /// and connects back (`prepare_restart` does the disconnect +
+    /// marker + successor command; the successor itself waits for
+    /// this process to exit before binding or connecting). A
+    /// marker that cannot be written only loses the resume — the
+    /// restart itself still happens, and the user reconnects by hand.
+    /// (Windows only — only the tray calls it.)
+    #[cfg(windows)]
+    fn restart_client(&mut self, ctx: &egui::Context) {
+        match self.prepare_restart() {
             Ok((exe, args)) => {
                 match std::process::Command::new(&exe).args(&args).spawn() {
                     Ok(_) => {
@@ -2324,7 +2463,7 @@ impl GuiApp {
             }
             Err(e) => {
                 self.error = format!("重启失败：{e}");
-                self.log_line(format!("重启客户端失败：找不到当前程序路径：{e}。"));
+                self.log_line(format!("重启客户端失败：{e}。"));
             }
         }
     }
@@ -2468,6 +2607,18 @@ impl GuiApp {
                             upd.web_error.as_deref().unwrap_or("未知原因"),
                             n
                         ));
+                        // v3.15: the whole fallback chain failed —
+                        // say so in Leo's exact words, in the log
+                        // AND the status bar, so the user knows to
+                        // try the other button.
+                        self.report_refresh_failure(
+                            "官方 API 与网页抓取",
+                            &format!(
+                                "{}；{}",
+                                upd.api_error.as_deref().unwrap_or("未知原因"),
+                                upd.web_error.as_deref().unwrap_or("未知原因")
+                            ),
+                        );
                     }
                     vpngate::NodeListSource::Curated => {
                         self.status = format!(
@@ -2479,8 +2630,28 @@ impl GuiApp {
                             upd.api_error.as_deref().unwrap_or("未知原因"),
                             upd.web_error.as_deref().unwrap_or("未知原因")
                         ));
+                        // v3.15: same as the Cache arm — the whole
+                        // fallback chain failed, say so in Leo's
+                        // exact words (log AND status bar).
+                        self.report_refresh_failure(
+                            "官方 API 与网页抓取",
+                            &format!(
+                                "{}；{}",
+                                upd.api_error.as_deref().unwrap_or("未知原因"),
+                                upd.web_error.as_deref().unwrap_or("未知原因")
+                            ),
+                        );
                     }
                 }
+            }
+            GuiEvent::ApiRefreshFailed { reason } => {
+                self.busy = None;
+                // v3.15: the API-only button failed. The list and
+                // the blocklist stay exactly as they were — this
+                // event carries no nodes — and the failure is
+                // reported plainly, in Leo's exact words, instead
+                // of silently falling back to the scrape.
+                self.report_refresh_failure("官方 API", &reason);
             }
             GuiEvent::Probe { host, result } => {
                 self.busy = None;
@@ -3074,6 +3245,22 @@ impl GuiApp {
             self.selected_set = BTreeSet::from([order[new_pos]]);
             self.scroll_to_selected = true;
         }
+    }
+
+    /// Select every currently displayed node (v3.15, Ctrl+A):
+    /// the display order from `display_indices` — the sorted
+    /// order, with blocked hosts already excluded at load — so
+    /// this is exactly the set "导出选中" / Ctrl+C exports (see
+    /// `selected_nodes_in_display_order`). The anchor moves to
+    /// the first displayed row, so Enter / Ctrl+R after a Ctrl+A
+    /// act on it. An empty list is a no-op.
+    fn select_all(&mut self) {
+        let order = self.display_indices();
+        if order.is_empty() {
+            return;
+        }
+        self.selected = Some(order[0]);
+        self.selected_set = order.into_iter().collect();
     }
 
     /// Clear both halves of the selection: the anchor and the
@@ -3705,6 +3892,21 @@ impl eframe::App for GuiApp {
         {
             self.delete_selected();
         }
+        // Ctrl+A selects all displayed nodes (v3.15) — same focus
+        // guard as the shortcuts above: in a text field Ctrl+A
+        // stays the field's own select-all-text, never a node
+        // selection; with the About window open it does nothing.
+        if !text_focused
+            && !self.show_about
+            && ctx.input_mut(|i| {
+                i.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::COMMAND,
+                    egui::Key::A,
+                ))
+            })
+        {
+            self.select_all();
+        }
         // Ctrl+C exports the selection, Ctrl+V imports from the
         // clipboard (see `handle_clipboard_events`): same focus
         // guard as the shortcuts above — a focused text field owns
@@ -3717,6 +3919,12 @@ impl eframe::App for GuiApp {
         // tray click can show the window on this very frame.
         #[cfg(windows)]
         self.poll_tray_events(&ctx);
+        // v3.15 single-instance: a second launch asked this
+        // instance to come forward — same effect as a tray
+        // double-click (`show_main_window`).
+        if self.show_requested.swap(false, Ordering::SeqCst) {
+            self.show_main_window(&ctx);
+        }
         // While hidden in the tray the window gets no input, so keep
         // the event loop ticking — otherwise the tray poll above
         // would never run and a tray click could not bring the
@@ -3751,7 +3959,7 @@ impl eframe::App for GuiApp {
                     // paths — no second implementation of either.
                     let can_export = self.can_delete();
                     let export_disabled_hint = if self.selected_set.is_empty() {
-                        "请先选择要导出的节点（单击选一行，Ctrl+单击多选）"
+                        "请先选择要导出的节点（单击选一行，Ctrl+单击多选，或按 Ctrl+A 全选）"
                     } else {
                         "正在忙，请稍候"
                     };
@@ -3798,6 +4006,23 @@ impl eframe::App for GuiApp {
                         .clicked()
                     {
                         self.import_from_file_dialog();
+                        ui.close();
+                    }
+                    ui.separator();
+                    // Select-all (v3.15): same action as the Ctrl+A
+                    // shortcut — every displayed row, in display
+                    // order. Always enabled: on an empty list it is
+                    // a no-op, and it never needs a prior selection.
+                    if ui
+                        .add_enabled(
+                            self.busy.is_none(),
+                            egui::Button::new("全选").shortcut_text("Ctrl+A"),
+                        )
+                        .on_hover_text("选中当前显示的全部节点（按显示顺序；文本框里按 Ctrl+A 仍是选中文字）")
+                        .on_disabled_hover_text("正在忙，请稍候")
+                        .clicked()
+                    {
+                        self.select_all();
                         ui.close();
                     }
                     ui.separator();
@@ -3882,6 +4107,24 @@ impl eframe::App for GuiApp {
                         .clicked()
                     {
                         self.start_fetch(ui.ctx().clone());
+                    }
+                    // v3.15: API-only refresh, immediately left of
+                    // "刷新节点" (right_to_left layout: added after
+                    // it, so it lands on its left). Official API
+                    // (CSV) only — no web scrape, no cache, no
+                    // curated list; a failure is reported plainly
+                    // and the list stays as it was.
+                    if ui
+                        .add_enabled(
+                            can_refresh,
+                            egui::Button::new("从API刷新节点")
+                                .min_size(egui::vec2(124.0, 32.0)),
+                        )
+                        .on_disabled_hover_text("正在忙，请稍候")
+                        .on_hover_text("只从官方 API（CSV）刷新，不含网页抓取备用；失败时明着失败，不会悄悄退到网页抓取。")
+                        .clicked()
+                    {
+                        self.start_fetch_api_only(ui.ctx().clone());
                     }
                     if let Some(b) = self.busy {
                         ui.spinner();
@@ -4532,7 +4775,7 @@ impl eframe::App for GuiApp {
                     )
                     .on_hover_text("删除选中的节点，并记入屏蔽列表（本次会话里隐藏，刷新后会带回来；或按 Del 键）")
                     .on_disabled_hover_text(if n_sel == 0 {
-                        "请先选择要删除的节点（单击选一行，Ctrl+单击多选）"
+                        "请先选择要删除的节点（单击选一行，Ctrl+单击多选，或按 Ctrl+A 全选）"
                     } else {
                         "正在忙，请稍候"
                     })
@@ -4556,7 +4799,7 @@ impl eframe::App for GuiApp {
                     )
                     .on_hover_text("把选中的节点按显示顺序导出到剪贴板（每行 主机:端口）")
                     .on_disabled_hover_text(if n_sel == 0 {
-                        "请先选择要导出的节点（单击选一行，Ctrl+单击多选）"
+                        "请先选择要导出的节点（单击选一行，Ctrl+单击多选，或按 Ctrl+A 全选）"
                     } else {
                         "正在忙，请稍候"
                     })
@@ -4565,7 +4808,7 @@ impl eframe::App for GuiApp {
                     let ctx = ui.ctx().clone();
                     self.export_selected(&ctx);
                 }
-                ui.label("Ctrl+单击多选，Shift+单击选一个范围。");
+                ui.label("Ctrl+单击多选，Shift+单击选一个范围，Ctrl+A 全选。");
             });
             // 常用开关和端口放主面板上，不用展开高级设置也能看到；改动会自动保存。
             // 本地端口只在连接时生效，连接中锁住；局域网分享用同一个
@@ -4642,6 +4885,23 @@ impl eframe::App for GuiApp {
                                     self.selected = Some(0);
                                     self.selected_set = BTreeSet::from([0]);
                                     self.log_line(format!("手动添加节点：{}。", target));
+                                    // The node must survive a restart
+                                    // (and a restart-resume must find
+                                    // it in the startup list): rewrite
+                                    // the node cache, like an import
+                                    // does — v3.15: without this, a
+                                    // manually added node that was
+                                    // connected and then restarted
+                                    // came back as "不在列表里" and
+                                    // never reconnected.
+                                    if let Err(e) =
+                                        vpngate::save_cached_nodes(&self.nodes)
+                                    {
+                                        self.log_warn(format!(
+                                            "手动添加后写节点缓存失败：{}。",
+                                            e
+                                        ));
+                                    }
                                     self.manual_host.clear();
                                 }
                                 Err(e) => {
@@ -4833,18 +5093,49 @@ impl eframe::App for GuiApp {
 fn main() -> eframe::Result {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let _guard = rt.enter(); // lets tokio::spawn find the runtime
+    // v3.15 single-instance (GUI only — the CLI is exempt): a
+    // second launch signals the running instance to show its
+    // window and exits, instead of opening a second window. A
+    // restart successor (spawned with `--restart-wait-pid <old
+    // pid>`) is NOT a duplicate: it waits for the old process to
+    // exit first, then takes the lock — the two waits share one
+    // policy in `single_instance::acquire_startup`. The guard
+    // lives on this stack until the process exits; dropping it
+    // would release the lock.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let wait_pid =
+        vpngate_client::single_instance::parse_restart_wait_pid(&args);
+    let _single_instance_guard =
+        match vpngate_client::single_instance::acquire_startup(wait_pid) {
+            vpngate_client::single_instance::StartupOutcome::Primary(guard) => {
+                guard
+            }
+            vpngate_client::single_instance::StartupOutcome::SecondInstance => {
+                std::process::exit(0);
+            }
+        };
     // v3.14: the window/taskbar icon is set explicitly from the
     // 32 px entry of the same assets/icon.ico the tray and the exe
     // use (decoded, never a loose PNG — icon-256.png is gitignored).
     // Without it the window fell back to the exe default.
+    // v3.15: the lib returns a plain RGBA tuple
+    // (`decode_window_icon_rgba`) and the GUI wraps it in
+    // `egui::IconData` here, so the shared module no longer
+    // references eframe — the CLI binary stops linking it.
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("VPNGate 客户端")
         .with_inner_size([800.0, 600.0])
         .with_min_inner_size([560.0, 420.0]);
-    if let Some(icon) =
-        vpngate_client::tray::window_icon_data(include_bytes!("../../assets/icon.ico"))
+    if let Some((rgba, width, height)) =
+        vpngate_client::tray::decode_window_icon_rgba(include_bytes!(
+            "../../assets/icon.ico"
+        ))
     {
-        viewport = viewport.with_icon(icon);
+        viewport = viewport.with_icon(egui::IconData {
+            rgba,
+            width,
+            height,
+        });
     }
     let options = eframe::NativeOptions {
         viewport,
@@ -5463,6 +5754,56 @@ mod tests {
     }
 
     /// The click modifiers are the press-time latch OR the release
+    /// v3.15: select_all takes every displayed row (display
+    /// order, not insertion order) and moves the anchor to the
+    /// first displayed row; the export set follows the same
+    /// order, so Ctrl+A then Ctrl+C exports the whole list.
+    #[test]
+    fn select_all_selects_display_order_and_sets_anchor_to_first() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "美国"),
+            node_in("c.opengw.net", "德国"),
+            node_in("d.opengw.net", "日本"),
+        ];
+        // Display order by country: 德国 (c) / 日本 (a, d) / 美国 (b).
+        app.sort = Some((SortCol::Country, SortDir::Asc));
+        app.click_row(1, false, false);
+        assert_eq!(app.selected, Some(1), "anchor starts on 美国");
+        app.select_all();
+        assert_eq!(app.selected_set, BTreeSet::from([0, 1, 2, 3]));
+        assert_eq!(
+            app.selected,
+            Some(2),
+            "the anchor must be the first DISPLAYED row (德国, node 2)"
+        );
+        let exported = app.selected_nodes_in_display_order();
+        assert_eq!(
+            exported
+                .iter()
+                .map(|n| n.host.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "c.opengw.net",
+                "a.opengw.net",
+                "d.opengw.net",
+                "b.opengw.net"
+            ],
+            "the export set must follow display order"
+        );
+    }
+
+    /// v3.15: select_all on an empty list changes nothing.
+    #[test]
+    fn select_all_on_empty_list_is_a_noop() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![];
+        app.select_all();
+        assert!(app.selected_set.is_empty());
+        assert_eq!(app.selected, None);
+    }
+
     /// frame's: releasing Shift/Ctrl a beat before the mouse button
     /// must not lose the gesture (the v3.7 Shift+click failure),
     /// Shift pressed mid-click counts too, and Cmd counts as Ctrl.
@@ -6031,6 +6372,177 @@ mod tests {
         );
     }
 
+    /// v3.15 failure sentence (Leo's exact wording, 2026-11-08):
+    /// both refresh buttons write this sentence verbatim — the
+    /// line starts with it, and the way + reason follow in
+    /// parentheses. Never reword it, never split it.
+    #[test]
+    fn refresh_failure_line_keeps_leos_sentence_verbatim() {
+        let api = refresh_failure_line(
+            "官方 API",
+            "官方 API 拉取超时（30 秒内无响应）",
+        );
+        assert!(
+            api.starts_with("当前方式刷新节点失败，请用另一种方式刷新"),
+            "the line must start with Leo's exact sentence, got: {}",
+            api
+        );
+        assert!(api.contains("官方 API"));
+        assert!(api.contains("官方 API 拉取超时（30 秒内无响应）"));
+        let fallback = refresh_failure_line(
+            "官方 API 与网页抓取",
+            "官方 API 拉取超时（30 秒内无响应）；网页抓取超时（15 秒内无响应）",
+        );
+        assert!(
+            fallback.starts_with("当前方式刷新节点失败，请用另一种方式刷新"),
+            "the fallback line must start with the same sentence, got: {}",
+            fallback
+        );
+        assert!(fallback.contains("网页抓取超时（15 秒内无响应）"));
+    }
+
+    /// v3.15 "从API刷新节点" failure: the list and the blocklist
+    /// stay exactly as they were, the busy flag clears, and the
+    /// status bar + log carry Leo's exact sentence with the way
+    /// and the reason.
+    #[test]
+    fn api_refresh_failed_leaves_list_and_blocklist_untouched() {
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let mut app = GuiApp::for_tests();
+        app.config.blocked_hosts = vec!["b.opengw.net".to_string()];
+        app.blocked_hosts = app.config.blocked_hosts.iter().cloned().collect();
+        app.nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("c.opengw.net", "德国"),
+        ];
+        app.busy = Some(Busy::Fetching);
+        app.apply_event(GuiEvent::ApiRefreshFailed {
+            reason: "官方 API 拉取超时（30 秒内无响应）".to_string(),
+        });
+        assert_eq!(app.nodes.len(), 2);
+        assert_eq!(app.nodes[0].host, "a.opengw.net");
+        assert_eq!(app.blocked_hosts.len(), 1);
+        assert!(app.blocked_hosts.contains("b.opengw.net"));
+        assert!(app.busy.is_none());
+        assert!(
+            app.status
+                .starts_with("当前方式刷新节点失败，请用另一种方式刷新"),
+            "status must carry Leo's exact sentence, got: {}",
+            app.status
+        );
+        assert!(app.status.contains("官方 API 拉取超时（30 秒内无响应）"));
+        assert!(
+            app.log.iter().any(|l| l
+                .starts_with("当前方式刷新节点失败，请用另一种方式刷新")),
+            "log must carry Leo's exact sentence, got: {:?}",
+            app.log
+        );
+    }
+
+    /// v3.15: the normal "刷新节点" button whose whole fallback
+    /// chain fails (API + web both down, cache shown) writes the
+    /// same sentence to the status bar and the log — the list still
+    /// shows the cache, as before; only the notice is new.
+    #[test]
+    fn fallback_refresh_to_cache_writes_failure_sentence() {
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![node_in("old.opengw.net", "日本")];
+        app.busy = Some(Busy::Fetching);
+        app.apply_event(GuiEvent::Nodes(vpngate::NodeListUpdate {
+            nodes: vec![node_in("a.opengw.net", "日本")],
+            source: vpngate::NodeListSource::Cache,
+            cache_age_secs: Some(3600),
+            api_error: Some("官方 API 拉取超时（30 秒内无响应）".to_string()),
+            web_error: Some("网页抓取超时（15 秒内无响应）".to_string()),
+        }));
+        assert_eq!(app.nodes.len(), 1);
+        assert_eq!(app.nodes[0].host, "a.opengw.net");
+        assert!(app.busy.is_none());
+        assert!(
+            app.status
+                .starts_with("当前方式刷新节点失败，请用另一种方式刷新"),
+            "status must carry Leo's exact sentence, got: {}",
+            app.status
+        );
+        assert!(app.status.contains("网页抓取超时（15 秒内无响应）"));
+        assert!(
+            app.log.iter().any(|l| l
+                .starts_with("当前方式刷新节点失败，请用另一种方式刷新")),
+            "log must carry Leo's exact sentence, got: {:?}",
+            app.log
+        );
+    }
+
+    /// v3.15: same as the Cache case, but the fallback fell all the
+    /// way to the bundled curated list (no cache file).
+    #[test]
+    fn fallback_refresh_to_curated_writes_failure_sentence() {
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let mut app = GuiApp::for_tests();
+        app.busy = Some(Busy::Fetching);
+        app.apply_event(GuiEvent::Nodes(vpngate::NodeListUpdate {
+            nodes: vec![node_in("a.opengw.net", "日本")],
+            source: vpngate::NodeListSource::Curated,
+            cache_age_secs: None,
+            api_error: Some("官方 API 返回了空列表".to_string()),
+            web_error: Some("网页抓取解析到 0 个节点".to_string()),
+        }));
+        assert!(app.busy.is_none());
+        assert!(
+            app.status
+                .starts_with("当前方式刷新节点失败，请用另一种方式刷新"),
+            "status must carry Leo's exact sentence, got: {}",
+            app.status
+        );
+        assert!(
+            app.log.iter().any(|l| l
+                .starts_with("当前方式刷新节点失败，请用另一种方式刷新")),
+            "log must carry Leo's exact sentence, got: {:?}",
+            app.log
+        );
+    }
+
+    /// v3.15 "从API刷新节点" success: the list updates, the merged
+    /// list is written to the cache, and the blocklist still
+    /// filters as usual (the deleted host stays hidden — this
+    /// button never clears the blocklist, unlike "刷新节点").
+    #[test]
+    fn api_refresh_success_updates_list_and_cache() {
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let mut app = GuiApp::for_tests();
+        app.config.blocked_hosts = vec!["b.opengw.net".to_string()];
+        app.blocked_hosts = app.config.blocked_hosts.iter().cloned().collect();
+        app.nodes = vec![node_in("old.opengw.net", "日本")];
+        app.busy = Some(Busy::Fetching);
+        app.apply_event(GuiEvent::Nodes(vpngate::NodeListUpdate {
+            nodes: vec![
+                node_in("a.opengw.net", "日本"),
+                node_in("b.opengw.net", "美国"),
+                node_in("c.opengw.net", "德国"),
+            ],
+            source: vpngate::NodeListSource::Api,
+            cache_age_secs: None,
+            api_error: None,
+            web_error: None,
+        }));
+        assert_eq!(app.nodes.len(), 2);
+        assert_eq!(app.nodes[0].host, "a.opengw.net");
+        assert_eq!(app.nodes[1].host, "c.opengw.net");
+        assert!(app.blocked_hosts.contains("b.opengw.net"));
+        assert!(app.busy.is_none());
+        assert_eq!(app.status, "节点列表已更新：2 个节点。");
+        // The cache stores the full merged list (b included — the
+        // blocklist filters at load, like the normal refresh).
+        let cached = vpngate::load_cached_nodes();
+        assert!(cached.is_some(), "API success must write the cache");
+        let (cached_nodes, _) = cached.unwrap();
+        assert_eq!(cached_nodes.len(), 3);
+        if let Some(cache) = vpngate::cache_path() {
+            let _ = std::fs::remove_file(&cache);
+        }
+    }
+
     /// v3.11 refresh flow (Leo's call): a refresh clears the
     /// blocklist first — in memory and in config.toml — then the
     /// incoming list is shown in full, including hosts deleted
@@ -6093,7 +6605,10 @@ mod tests {
         // status while the list only showed the filtered count.
         // (A non-empty blocklist at Nodes time now only happens for
         // a node deleted mid-fetch — the refresh itself clears it
-        // first — but the status must still show the shown count.)
+        // first — but the shown count must still be the filtered
+        // one.) v3.15: the status bar now carries the refresh
+        // failure sentence instead (the fallback chain failed), so
+        // the filtered count is asserted in the log's summary line.
         let mut app = GuiApp::for_tests();
         app.blocked_hosts.insert("a.opengw.net".to_string());
         app.blocked_hosts.insert("b.opengw.net".to_string());
@@ -6110,11 +6625,22 @@ mod tests {
         }));
         assert_eq!(app.nodes.len(), 1);
         assert!(
-            app.status.contains("（1 个）"),
-            "curated status must show the filtered count, got: {}",
+            app.log.iter().any(|l| l
+                == "刷新完成（内嵌列表）：已清空屏蔽 0 个，获取到 1 个。"),
+            "log summary must show the filtered count, got: {:?}",
+            app.log
+        );
+        assert!(
+            !app.log.iter().any(|l| l.contains("28 个")),
+            "no hardcoded 28 anywhere in the log, got: {:?}",
+            app.log
+        );
+        assert!(
+            app.status
+                .starts_with("当前方式刷新节点失败，请用另一种方式刷新"),
+            "status now carries the v3.15 failure sentence, got: {}",
             app.status
         );
-        assert!(!app.status.contains("28 个"));
     }
 
     /// The blocklist filters every list load: an incoming list that
@@ -7557,6 +8083,152 @@ mod tests {
         app.perform_quit();
         assert!(!path.exists(), "manual quit must delete the marker");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// v3.15 restart, case 5: `prepare_restart` on a connected
+    /// app disconnects FIRST (log order: 已断开 before 正在重启),
+    /// writes the resume marker, and hands back a successor
+    /// command carrying `--restart-wait-pid <this pid>` — the
+    /// successor waits for this process to exit before it binds
+    /// 10818 or connects. Mock-backed (same skip as the other
+    /// mock tests when python3/openssl are missing).
+    #[test]
+    fn prepare_restart_disconnects_first_writes_marker_and_wait_pid() {
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let _lock = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let path = tray::resume_file_path().expect("exe path known in tests");
+        let _ = std::fs::remove_file(&path);
+        let mut app = connected_test_app(tunnel);
+        assert!(app.conn.is_some(), "the fixture must start connected");
+        let (exe, args) = app.prepare_restart().expect("prepare_restart");
+        assert!(exe.is_file(), "the successor exe must be a real file");
+        assert!(
+            app.conn.is_none(),
+            "prepare_restart must disconnect before the successor is spawned"
+        );
+        assert!(path.exists(), "the resume marker must be written");
+        let text = std::fs::read_to_string(&path).expect("read the marker");
+        assert!(
+            text.contains("a.opengw.net:992"),
+            "the marker must name the resumed node, got: {}",
+            text
+        );
+        let pid = std::process::id().to_string();
+        let pos = args
+            .iter()
+            .position(|a| a == "--restart-wait-pid")
+            .expect("the successor args must carry --restart-wait-pid");
+        assert_eq!(
+            args.get(pos + 1).map(|s| s.as_str()),
+            Some(pid.as_str()),
+            "the wait pid must be this process, args: {:?}",
+            args
+        );
+        let dis = app
+            .log
+            .iter()
+            .position(|l| l.contains("已断开"))
+            .expect("the log must record the disconnect");
+        let rst = app
+            .log
+            .iter()
+            .position(|l| l.contains("正在重启"))
+            .expect("the log must record the restart");
+        assert!(
+            dis < rst,
+            "the log order must be disconnect-then-restart, got: {:?}",
+            app.log
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v3.15 restart, case 6: `prepare_restart` while
+    /// disconnected writes no marker (the successor still starts
+    /// disconnected) but still hands back a wait-pid command —
+    /// the successor must wait for this process to exit before
+    /// it takes the single-instance lock, or the lock would see
+    /// a live old instance and kill the restart.
+    #[test]
+    fn prepare_restart_disconnected_writes_no_marker_but_waits() {
+        let _lock = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let path = tray::resume_file_path().expect("exe path known in tests");
+        let _ = std::fs::remove_file(&path);
+        let mut app = GuiApp::for_tests();
+        let (_exe, args) = app.prepare_restart().expect("prepare_restart");
+        assert!(
+            !path.exists(),
+            "no marker when nothing was connected"
+        );
+        assert!(
+            args.contains(&"--restart-wait-pid".to_string()),
+            "the successor must still wait for this process, args: {:?}",
+            args
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("正在重启客户端")),
+            "the restart must be logged: {:?}",
+            app.log
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v3.15 restart, case 7: a restart quit keeps the resume
+    /// marker (the mirror of `manual_quit_clears_resume_marker`
+    /// — suspect 2 in the v3.14 restart diagnosis: the marker
+    /// must survive the restart's own exit, or the successor
+    /// reads nothing).
+    #[test]
+    fn restart_quit_keeps_resume_marker() {
+        let _lock = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let path = tray::resume_file_path().expect("exe path known in tests");
+        tray::write_resume_target(&path, "a.opengw.net:992", "a.opengw.net:992")
+            .expect("write resume");
+        assert!(path.exists());
+        let mut app = GuiApp::for_tests();
+        app.restarting = true;
+        app.perform_quit();
+        assert!(
+            path.exists(),
+            "a restart quit must keep the marker for the successor"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v3.15 single-instance, UI half: a raised `show_requested`
+    /// flag brings the hidden window back — the same effect as a
+    /// tray double-click. The watcher thread + named event that
+    /// raise the flag are Windows-only and cannot run headless,
+    /// so this test drives the flag consumption directly; the
+    /// event delivery itself is left to Leo's real-machine check.
+    /// Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn second_instance_signal_shows_hidden_window() {
+        use egui_kittest::Harness;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| GuiApp::for_render_tests(cc));
+        harness.run_steps(10);
+        harness.state_mut().hidden_to_tray = true;
+        harness
+            .state_mut()
+            .show_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        harness.run_steps(5);
+        assert!(
+            !harness.state().hidden_to_tray,
+            "the show request must bring the hidden window back"
+        );
+        assert!(
+            !harness
+                .state()
+                .show_requested
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the flag must be consumed"
+        );
     }
 
     /// v3.13 switch through the real UI (kittest): connected to A,
@@ -9610,6 +10282,123 @@ mod tests {
         assert_eq!(harness.state().status, "未连接");
     }
 
+    /// v3.15: Ctrl+A selects every currently displayed node (in
+    /// display order), and the selection is the same set the export
+    /// path uses — so Ctrl+A then Ctrl+C exports the whole list.
+    /// The list is pre-sorted by country here (display order ≠
+    /// insertion order: 德国/日本/美国), so the anchor assertion
+    /// also proves the anchor lands on the FIRST displayed row,
+    /// not the first inserted one. Needs a graphics adapter, like
+    /// the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn ctrl_a_selects_all_visible_nodes() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                ];
+                // Display order: 德国 (c) / 日本 (a) / 美国 (b).
+                app.sort = Some((SortCol::Country, SortDir::Asc));
+                app
+            });
+        harness.run_steps(10);
+        click_row_label(&mut harness, "日本");
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0]),
+            "one row must be selected before Ctrl+A"
+        );
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run_steps(5);
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0, 1, 2]),
+            "Ctrl+A must select every displayed node, got: {:?}",
+            harness.state().selected_set
+        );
+        assert_eq!(
+            harness.state().selected,
+            Some(2),
+            "the anchor must be the first DISPLAYED row (德国, node 2)"
+        );
+        // The selection is the export set: Ctrl+C now copies all
+        // three rows, in display order.
+        harness.event(egui::Event::Copy);
+        harness.step();
+        assert_eq!(
+            copied_text(&harness).as_deref(),
+            Some("c.opengw.net:992\t德国\tNTT\t1\t50\na.opengw.net:992\t日本\tNTT\t1\t50\nb.opengw.net:992\t美国\tNTT\t1\t50"),
+            "Ctrl+A then Ctrl+C must export the whole list in display order"
+        );
+    }
+
+    /// v3.15: with a text field focused, Ctrl+A stays the field's
+    /// own select-all-text — the node selection must not move.
+    /// Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn ctrl_a_ignored_when_text_field_focused() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 500.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![node_in("a.opengw.net", "日本")];
+                app
+            });
+        harness.run_steps(10);
+        click_row_label(&mut harness, "日本");
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0]),
+            "the row must be selected before the field takes focus"
+        );
+        // Same scroll-into-view dance as
+        // `ctrl_c_ignored_when_text_field_focused`: the manual-add
+        // field starts below the fold; scroll the outer area down,
+        // then click the first text input in tree order.
+        harness.event(egui::Event::PointerMoved(egui::pos2(400.0, 300.0)));
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -5.0),
+            modifiers: egui::Modifiers::default(),
+            phase: egui::TouchPhase::Move,
+        });
+        harness.run_steps(5);
+        let field = harness
+            .query_all_by_role(egui::accesskit::Role::TextInput)
+            .next()
+            .expect("a text input must exist");
+        let center = field.rect().center();
+        assert!(
+            center.y < 500.0,
+            "the field must have scrolled into view, rect={:?}",
+            field.rect()
+        );
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert!(
+            harness.ctx.text_edit_focused(),
+            "clicking the text field must focus it"
+        );
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run_steps(5);
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0]),
+            "Ctrl+A with a focused text field must not touch the node selection"
+        );
+        assert_eq!(harness.state().status, "未连接");
+    }
+
     /// v3.11 refresh flow end to end: delete two nodes (the
     /// blocklist grows), click 刷新节点, and the deleted nodes come
     /// back with the fresh list — the blocklist is cleared when the
@@ -9704,6 +10493,178 @@ mod tests {
         click_button_label(&mut harness, "文件");
         // The delete + the hand-driven Api result wrote config.toml
         // and nodes_cache.json next to the test exe; clean up.
+        if let Some(path) = Config::portable_config_path() {
+            let _ = std::fs::remove_file(&path);
+        }
+        if let Some(cache) = vpngate::cache_path() {
+            let _ = std::fs::remove_file(&cache);
+        }
+    }
+
+    /// v3.15 "从API刷新节点": the button sits immediately left of
+    /// "刷新节点" on the same row, and clicking it sets the
+    /// fetching flag WITHOUT clearing the blocklist (unlike
+    /// "刷新节点", which clears first — the API button only filters
+    /// by the blocklist, so deleted nodes stay hidden).
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn api_refresh_button_left_of_refresh_and_keeps_blocklist() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        // Position: same row, API button immediately left of
+        // "刷新节点" (right edge a few px left of its left edge).
+        let api_btn = harness.get_by_label("从API刷新节点");
+        let refresh_btn = harness.get_by_label("刷新节点");
+        let api_rect = api_btn.rect();
+        let refresh_rect = refresh_btn.rect();
+        assert!(
+            (api_rect.center().y - refresh_rect.center().y).abs() < 4.0,
+            "both buttons must be on the same row, api center y {}, refresh center y {}",
+            api_rect.center().y,
+            refresh_rect.center().y
+        );
+        assert!(
+            api_rect.right() <= refresh_rect.left() + 1.0,
+            "API button must be left of 刷新节点, api right {}, refresh left {}",
+            api_rect.right(),
+            refresh_rect.left()
+        );
+        assert!(
+            refresh_rect.left() - api_rect.right() < 20.0,
+            "the two buttons must be adjacent, gap {}",
+            refresh_rect.left() - api_rect.right()
+        );
+        // Delete a and b: only c is left, the blocklist holds 2.
+        click_row_label(&mut harness, "日本");
+        ctrl_click_row_label(&mut harness, "美国");
+        click_button_label(&mut harness, "删除选中 (2)");
+        assert_eq!(harness.state().nodes.len(), 1);
+        assert_eq!(harness.state().blocked_hosts.len(), 2);
+        // Click the API button (drag/drop + run_steps: the fetch
+        // spinner requests a repaint every frame, so run() never
+        // settles — same as the 刷新节点 test above). Re-fetch the
+        // button: the row deletes above may have reflowed layout.
+        let api_btn = harness.get_by_label("从API刷新节点");
+        let center = api_btn.rect().center();
+        harness.drag_at(center);
+        harness.run_steps(3);
+        harness.drop_at(center);
+        harness.run_steps(3);
+        assert!(
+            harness.state().blocked_hosts.len() == 2,
+            "API refresh must NOT clear the blocklist, got: {:?}",
+            harness.state().blocked_hosts
+        );
+        assert!(
+            matches!(harness.state().busy, Some(Busy::Fetching)),
+            "API refresh must set the fetching flag, busy={:?}",
+            harness.state().busy
+        );
+        assert_eq!(harness.state().status, "正在从官方 API 拉取节点列表…");
+    }
+
+    /// v3.15 failure sentence, end to end in the harness: the API
+    /// button fails, the log + status carry Leo's exact sentence
+    /// with the way and the reason, and the list stays exactly as
+    /// it was. A later success through the same button then updates
+    /// the list (the blocklist still filters the deleted hosts).
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn api_refresh_failed_shows_sentence_and_keeps_list() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        // Delete a and b first, so "list stays as it was" is a
+        // visible claim (only c shows, blocklist holds 2).
+        click_row_label(&mut harness, "日本");
+        ctrl_click_row_label(&mut harness, "美国");
+        click_button_label(&mut harness, "删除选中 (2)");
+        assert_eq!(harness.state().nodes.len(), 1);
+        let api_btn = harness.get_by_label("从API刷新节点");
+        let center = api_btn.rect().center();
+        harness.drag_at(center);
+        harness.run_steps(3);
+        harness.drop_at(center);
+        harness.run_steps(3);
+        assert!(matches!(harness.state().busy, Some(Busy::Fetching)));
+        // Drive the failure through by hand (no runtime in the
+        // harness): the list must not move, the sentence must show.
+        harness.state_mut().apply_event(GuiEvent::ApiRefreshFailed {
+            reason: "官方 API 拉取超时（30 秒内无响应）".to_string(),
+        });
+        harness.run_steps(3);
+        assert_eq!(harness.state().nodes.len(), 1);
+        assert_eq!(harness.state().nodes[0].host, "c.opengw.net");
+        assert_eq!(harness.state().blocked_hosts.len(), 2);
+        assert!(harness.state().busy.is_none());
+        assert!(
+            harness
+                .state()
+                .status
+                .starts_with("当前方式刷新节点失败，请用另一种方式刷新"),
+            "status must carry Leo's exact sentence, got: {}",
+            harness.state().status
+        );
+        assert!(harness.state().status.contains("官方 API 拉取超时"));
+        assert!(
+            harness.state().log.iter().any(|l| l
+                .starts_with("当前方式刷新节点失败，请用另一种方式刷新")),
+            "log must carry Leo's exact sentence, got: {:?}",
+            harness.state().log
+        );
+        // The button works again after the failure: drive a success
+        // through by hand — the full list comes back, a and b still
+        // filtered by the blocklist.
+        let api_btn = harness.get_by_label("从API刷新节点");
+        let center = api_btn.rect().center();
+        harness.drag_at(center);
+        harness.run_steps(3);
+        harness.drop_at(center);
+        harness.run_steps(3);
+        assert!(matches!(harness.state().busy, Some(Busy::Fetching)));
+        harness.state_mut().apply_event(GuiEvent::Nodes(
+            vpngate::NodeListUpdate {
+                nodes: vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                ],
+                source: vpngate::NodeListSource::Api,
+                cache_age_secs: None,
+                api_error: None,
+                web_error: None,
+            },
+        ));
+        harness.run_steps(3);
+        assert_eq!(harness.state().nodes.len(), 1);
+        assert_eq!(harness.state().nodes[0].host, "c.opengw.net");
+        assert_eq!(harness.state().blocked_hosts.len(), 2);
+        // The hand-driven Api result wrote nodes_cache.json next
+        // to the test exe; clean up (config.toml was written by
+        // the delete above).
         if let Some(path) = Config::portable_config_path() {
             let _ = std::fs::remove_file(&path);
         }

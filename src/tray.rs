@@ -176,9 +176,9 @@ pub fn png_in_ico(ico: &[u8], size: u32) -> Option<&[u8]> {
 
 /// Decode one .ico entry of exactly `size` px into RGBA pixels:
 /// `(rgba bytes, width, height)`. The caller feeds this to
-/// `tray_icon::Icon::from_rgba` (tray, 16 px) or to
-/// `egui::IconData` (window icon, 32 px). Plain PNG work, so it is
-/// tested on Linux too.
+/// `tray_icon::Icon::from_rgba` (tray, 16 px); the GUI wraps the
+/// 32 px result in `egui::IconData` itself (window icon). Plain
+/// PNG work, so it is tested on Linux too.
 pub fn decode_icon_rgba(ico: &[u8], size: u32) -> Option<(Vec<u8>, u32, u32)> {
     let png = png_in_ico(ico, size)?;
     let img = image::load_from_memory(png).ok()?;
@@ -213,25 +213,14 @@ pub fn decode_tray_icon_rgba(ico: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
 
 /// Decode the window/taskbar icon's RGBA pixels: the 32 px entry
 /// of the same .ico (v3.14 — the window icon used to be unset and
-/// fell back to the exe default).
+/// fell back to the exe default). v3.15: this returns a plain
+/// `(rgba, width, height)` tuple and the GUI wraps it in
+/// `egui::IconData` at the call site — the old `window_icon_data`
+/// returned `eframe::egui::IconData` from this shared module and
+/// dragged eframe/wgpu/winit into the CLI binary (which grew from
+/// ~16 MB to ~34 MB for one icon conversion).
 pub fn decode_window_icon_rgba(ico: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     decode_icon_rgba(ico, 32)
-}
-
-/// The window icon as `egui::IconData` for
-/// `ViewportBuilder::with_icon`, decoded from the 32 px entry of
-/// the .ico (never from a loose PNG file: `assets/icon-256.png`
-/// is gitignored, so a checkout without a generated icon would
-/// otherwise break the build). `None` when the .ico has no usable
-/// 32 px entry — the caller then builds the viewport without an
-/// icon, exactly as before v3.14.
-pub fn window_icon_data(ico: &[u8]) -> Option<eframe::egui::IconData> {
-    let (rgba, width, height) = decode_window_icon_rgba(ico)?;
-    Some(eframe::egui::IconData {
-        rgba,
-        width,
-        height,
-    })
 }
 
 /// What happened on the tray icon itself, in platform-neutral terms
@@ -501,7 +490,7 @@ mod tests {
         let ico = include_bytes!("../assets/icon.ico");
         let png = largest_png_in_ico(ico).expect("icon.ico must hold a PNG");
         assert_eq!(&png[..8], PNG_MAGIC);
-        // The 256 px entry is the largest of the five (v3.14 shield
+        // The 256 px entry is the largest of the five (v3.15 ring
         // icon; was 2266 bytes for the v3.13 bold-V). Assert the
         // decoded size, not a byte count — the byte count changes
         // with every redraw.
@@ -542,6 +531,85 @@ mod tests {
     }
 
     #[test]
+    fn decode_tray_icon_rgba_matches_ico_16px_entry() {
+        // v3.15: the tray icon is the .ico's 16 px entry, byte
+        // for byte — not a rescale of any other entry. If the
+        // 16 px entry ever changes without the tray following,
+        // this fails.
+        let ico = include_bytes!("../assets/icon.ico");
+        let (rgba, w, h) =
+            decode_tray_icon_rgba(ico).expect("icon.ico must decode");
+        assert_eq!((w, h), (16, 16));
+        let png = png_in_ico(ico, 16).expect("16 px entry must exist");
+        let expected = image::load_from_memory(png)
+            .expect("16 px entry decodes")
+            .to_rgba8()
+            .into_raw();
+        assert_eq!(
+            rgba, expected,
+            "tray RGBA must equal the 16 px entry decoded directly"
+        );
+    }
+
+    #[test]
+    fn icon_sizes_share_one_ring_shape() {
+        // v3.15: all five .ico entries are the same ring — a
+        // square pure-white bbox (outer diameter 0.58–0.65S;
+        // Leo's band is 62–68%, the AA edge pixels move the
+        // pure-white bbox a little) with an indigo hole in the
+        // middle, never a white centre. The v3.14 shield fails
+        // this at every size: its bbox is taller than wide
+        // (0.625S wide but 0.71–0.75S tall), so a shield .ico
+        // would fail the height band — this is the regression
+        // test for "five sizes, one ring".
+        let ico = include_bytes!("../assets/icon.ico");
+        for size in [16u32, 24, 32, 48, 256] {
+            let png = png_in_ico(ico, size).unwrap_or_else(|| {
+                panic!("icon.ico must hold a {} px entry", size)
+            });
+            let img = image::load_from_memory(png).expect("entry decodes");
+            let rgba = img.to_rgba8();
+            assert_eq!(rgba.dimensions(), (size, size));
+            let (mut min_x, mut max_x) = (size, 0u32);
+            let (mut min_y, mut max_y) = (size, 0u32);
+            for (x, y, p) in rgba.enumerate_pixels() {
+                if *p == image::Rgba([255, 255, 255, 255]) {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            }
+            let bw = max_x - min_x + 1;
+            let bh = max_y - min_y + 1;
+            let wf = bw as f32 / size as f32;
+            let hf = bh as f32 / size as f32;
+            assert!(
+                (0.55..=0.70).contains(&wf),
+                "{} px entry: white width fraction {} is outside 0.55-0.70",
+                size, wf
+            );
+            assert!(
+                (0.55..=0.70).contains(&hf),
+                "{} px entry: white height fraction {} is outside 0.55-0.70",
+                size, hf
+            );
+            assert!(
+                (bw as i32 - bh as i32).abs() <= 1,
+                "{} px entry: the ring bbox must be square, got {}x{}",
+                size, bw, bh
+            );
+            let centre = rgba.get_pixel(size / 2, size / 2);
+            assert_ne!(
+                *centre,
+                image::Rgba([255, 255, 255, 255]),
+                "{} px entry: the centre must be the indigo hole, not white",
+                size
+            );
+        }
+    }
+
+    #[test]
     fn decode_window_icon_rgba_is_32x32() {
         // v3.14: the window/taskbar icon is the 32 px entry from
         // the same .ico (ViewportBuilder.with_icon).
@@ -550,16 +618,10 @@ mod tests {
             decode_window_icon_rgba(ico).expect("icon.ico must decode");
         assert_eq!((w, h), (32, 32));
         assert_eq!(rgba.len(), 32 * 32 * 4);
-    }
-
-    #[test]
-    fn window_icon_data_is_32x32_rgba() {
-        let ico = include_bytes!("../assets/icon.ico");
-        let icon = window_icon_data(ico).expect("window icon must decode");
-        assert_eq!((icon.width, icon.height), (32, 32));
-        assert_eq!(icon.rgba.len(), 32 * 32 * 4);
-        assert_eq!(window_icon_data(&[]), None);
-        assert_eq!(window_icon_data(b"not an icon"), None);
+        // v3.15: the tuple is what the GUI wraps in IconData —
+        // garbage in means no icon, not a crash.
+        assert_eq!(decode_window_icon_rgba(&[]), None);
+        assert_eq!(decode_window_icon_rgba(b"not an icon"), None);
     }
 
     #[test]

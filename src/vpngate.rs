@@ -174,6 +174,33 @@ pub async fn fetch_api_nodes(connector: &Connector) -> Result<Vec<Node>, String>
     Ok(nodes)
 }
 
+/// API-only refresh (v3.15 "从API刷新节点"): the official API
+/// (CSV) and nothing else — no web scrape, no cache, no curated
+/// list. Success returns the nodes; any failure is an `Err` with
+/// the reason, so the caller reports it plainly instead of silently
+/// falling back to the scrape. Same 30 s ceiling and same error
+/// wording as the API tier of the fallback chain.
+pub async fn fetch_api_only(connector: &Connector) -> Result<Vec<Node>, String> {
+    fetch_api_only_timeout(connector, API_FETCH_TIMEOUT).await
+}
+
+/// Testable core: the timeout is a parameter so tests can use a
+/// short one against a black-holed proxy instead of waiting 30 s.
+async fn fetch_api_only_timeout(
+    connector: &Connector,
+    api_timeout: Duration,
+) -> Result<Vec<Node>, String> {
+    match tokio::time::timeout(api_timeout, fetch_api_nodes(connector)).await {
+        Ok(Ok(nodes)) if !nodes.is_empty() => Ok(nodes),
+        Ok(Ok(_)) => Err("官方 API 返回了空列表".to_string()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(format!(
+            "官方 API 拉取超时（{} 秒内无响应）",
+            api_timeout.as_secs()
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Web scrape fallback: https://www.vpngate.net/cn/
 //
@@ -1254,6 +1281,54 @@ mod tests {
             upd.web_error.as_deref().unwrap_or("").contains("超时"),
             "web tier must report a timeout, got {:?}",
             upd.web_error
+        );
+    }
+
+    /// v3.15 API-only refresh ("从API刷新节点"): the same black
+    /// hole must fail as an `Err` — never as a silently substituted
+    /// list. One tier, one timeout: it returns in ~2 s (not ~4 s,
+    /// which would mean the web tier ran too) with the timeout
+    /// wording, so the GUI can report the failure plainly and leave
+    /// the list untouched.
+    #[tokio::test]
+    async fn fetch_api_only_times_out_on_black_holed_proxy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    drop(s);
+                });
+            }
+        });
+        let mut fp = crate::config::FrontProxy::default();
+        fp.enabled = true;
+        fp.addr = format!("127.0.0.1:{}", port);
+        let connector = Connector::new(Some(fp));
+        let start = std::time::Instant::now();
+        let res = fetch_api_only_timeout(&connector, Duration::from_secs(2)).await;
+        let elapsed = start.elapsed();
+        let err = res.expect_err("a black-holed API must fail, not return a list");
+        assert!(
+            err.contains("超时"),
+            "API-only failure must carry the timeout wording, got {:?}",
+            err
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "one 2 s tier must finish well inside 5 s — a second tier (web scrape) would take ~4 s, took {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "the API tier must actually run its timeout, took {:?}",
+            elapsed
         );
     }
 }

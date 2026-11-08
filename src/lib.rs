@@ -7,6 +7,7 @@ pub mod config;
 pub mod doh;
 pub mod filelog;
 pub mod net;
+pub mod single_instance;
 pub mod socks5;
 pub mod sstp;
 pub mod sysproxy;

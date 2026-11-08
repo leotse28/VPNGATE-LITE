@@ -1,0 +1,20 @@
+v3.15 ring icon: generated (assets/make_icon.py) vs vector master
+master: centre (128,128), outer R=84 (dia 168 = 0.656S, Leo's band 62-68%),
+        inner r=38 (dia 76 = 0.297S hole), stroke 46 px = 0.180S.
+method: per-pixel white-coverage (distance to white vs indigo) + raw RGBA diff
+ 16px: hand map vs 16x-supersampled vector render: MAE 0.043, 0 hard disagreements
+       (threshold-0.5 map == hand map on every tile pixel); white bbox 10x10
+       (0.625S), stroke 3 px (0.188S), hole 4 px, ring top/bottom rows 3/12.
+       old v3.14 shield 16px for comparison: MAE 0.133, 21 hard disagreements.
+ 24px: white bbox 16x16 (0.667S), stroke 4 px (0.167S), centre hole (not white)
+ 32px: white bbox 22x21 (0.688S x 0.656S — edge-pixel threshold noise, master 0.656S),
+       stroke 6 px (0.188S), centre hole
+ 48px: white bbox 32x32 (0.667S), stroke 9 px (0.188S), centre hole
+ 256px: white bbox 168x168 (0.656S), stroke 46 px (0.180S), centre hole
+.ico: 5 native PNG entries 16/24/32/48/256 (16 px entry 178 bytes, 256 px entry 14647 bytes);
+      candidate icon-candidates/ring/icon-*.png match the .ico entries byte-for-byte, 5/5.
+      (v3.14 only the 16 px entry matched byte-for-byte — the others differed by PNG
+      encoder bytes only, geometry identical; v3.15 candidates are rendered by the
+      same make_icon.py functions, so all five match.)
+tray: 16 px entry (3 px stroke, 4 px hole) — a real ring at tray size.
+window/taskbar: 32 px entry. Explorer file icon: full .ico (256/48 px).

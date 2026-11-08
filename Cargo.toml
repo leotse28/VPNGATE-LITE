@@ -1,6 +1,6 @@
 [package]
 name = "vpngate-client"
-version = "0.3.14"
+version = "0.3.15"
 edition = "2021"
 description = "Minimal Rust client for VPNGate volunteer nodes over MS-SSTP + PPP, exposing a local SOCKS5 port (no TUN, no GUI)"
 license = "MIT"
