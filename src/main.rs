@@ -130,7 +130,10 @@ async fn cmd_list(cli: &Cli, cfg: &Config, country: Option<String>, limit: usize
     let connector = effective_connector(cfg, cli);
     // Fallback chain: official API -> relay list page scrape -> local
     // cache -> bundled curated list. The last two never fail.
-    let upd = vpngate::fetch_nodes_with_fallback(&connector).await;
+    // v3.17: the API tier retries internally (CLI reports nothing
+    // per attempt — the no-op callback); `list` just shows the
+    // final result, as before.
+    let upd = vpngate::fetch_nodes_with_fallback(&connector, |_, _| {}).await;
     let nodes = &upd.nodes;
     match upd.source {
         vpngate::NodeListSource::Api => {

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use vpngate_client::config::Config;
 use vpngate_client::filelog::{self, FileLogger, LogLevel};
 use vpngate_client::net::{self, Connector};
-use vpngate_client::sstp::SstpTunnel;
+use vpngate_client::sstp::{SstpTunnel, TunnelCheckOutcome};
 use vpngate_client::sysproxy::SystemProxyGuard;
 use vpngate_client::tray;
 use vpngate_client::vpngate::{self, Node};
@@ -241,6 +241,18 @@ enum GuiEvent {
     /// the blocklist stay exactly as they were — this event carries
     /// no nodes, so there is nothing to fall back to.
     ApiRefreshFailed { reason: String },
+    /// v3.17: one attempt of the API fetch finished (regular
+    /// refresh's API tier, or the "从API刷新节点" button). `error`
+    /// is `None` when the attempt succeeded, otherwise the failure
+    /// reason (timeout, TCP/TLS failure, HTTP status, empty list).
+    /// The handler reports each attempt live in the status bar and
+    /// the log; the final failure is still reported by
+    /// `ApiRefreshFailed` / the `Nodes` summary, so this event
+    /// never writes the final failure sentence itself.
+    ApiFetchAttempt {
+        attempt: usize,
+        error: Option<String>,
+    },
     Probe {
         host: String,
         result: Result<(Ipv4Addr, Duration), ProbeFailure>,
@@ -274,6 +286,16 @@ enum GuiEvent {
     },
     Connected(Box<ActiveConnection>),
     ConnectFailed(String),
+    /// v3.17: result of the automatic tunnel check that runs right
+    /// after a successful connect (generate_204 + Google HTTPS
+    /// through the tunnel, see `SstpTunnel::check_tunnel`).
+    /// `node_label` is the node the check ran for — a result for a
+    /// node that is no longer connected (user disconnected or
+    /// switched meanwhile) is ignored by the handler.
+    TunnelCheckResult {
+        node_label: String,
+        outcome: TunnelCheckOutcome,
+    },
     /// One line from the mixed proxy about an accepted connection
     /// (source address, protocol, target host — see `ConnLog` in
     /// `socks5.rs`). The UI writes it to the log panel + file log,
@@ -318,15 +340,21 @@ fn connector_for(front_enabled: bool, front_addr: &str, user: &str, pass: &str) 
     }
 }
 
-async fn fetch_flow(connector: &Connector) -> vpngate::NodeListUpdate {
-    vpngate::fetch_nodes_with_fallback(connector).await
+async fn fetch_flow(
+    connector: &Connector,
+    on_attempt: impl FnMut(usize, Option<&str>) + Send,
+) -> vpngate::NodeListUpdate {
+    vpngate::fetch_nodes_with_fallback(connector, on_attempt).await
 }
 
 /// v3.15: API-only refresh — the official API (CSV) and nothing
 /// else. Any failure is an `Err`; the caller reports it plainly
 /// instead of falling back to the scrape.
-async fn fetch_api_flow(connector: &Connector) -> Result<Vec<vpngate::Node>, String> {
-    vpngate::fetch_api_only(connector).await
+async fn fetch_api_flow(
+    connector: &Connector,
+    on_attempt: impl FnMut(usize, Option<&str>) + Send,
+) -> Result<Vec<vpngate::Node>, String> {
+    vpngate::fetch_api_only(connector, on_attempt).await
 }
 
 async fn probe_flow(
@@ -1053,6 +1081,12 @@ struct GuiApp {
     probe_all_done: usize,
     probe_all_ok: usize,
     probe_all_failed: usize,
+    /// v3.17: how many nodes the running sweep skipped because
+    /// they are the connected node (0 or 1 — at most one node is
+    /// connected). Set by `start_probe_all`, read by the
+    /// `ProbeAllDone` handler for the summary line; 0 means the
+    /// sweep behaved exactly like before (no skip, no extra words).
+    probe_all_skipped: usize,
     status: String,
     error: String,
     log: Vec<String>,
@@ -1279,6 +1313,7 @@ impl Default for GuiApp {
             probe_all_done: 0,
             probe_all_ok: 0,
             probe_all_failed: 0,
+            probe_all_skipped: 0,
             status: "未连接".to_string(),
             error: String::new(),
             log: vec!["就绪。".to_string()],
@@ -1994,7 +2029,16 @@ impl GuiApp {
         // observe the busy flag + the cleared blocklist, then drive
         // the Nodes event by hand.
         Self::spawn_task(async move {
-            let res = fetch_flow(&connector).await;
+            let tx2 = tx.clone();
+            let ctx2 = ctx.clone();
+            let res = fetch_flow(&connector, move |attempt, error| {
+                let _ = tx2.send(GuiEvent::ApiFetchAttempt {
+                    attempt,
+                    error: error.map(|s| s.to_string()),
+                });
+                ctx2.request_repaint();
+            })
+            .await;
             let _ = tx.send(GuiEvent::Nodes(res));
             ctx.request_repaint();
         });
@@ -2022,7 +2066,17 @@ impl GuiApp {
         // flag stays set and the caller drives the result by hand,
         // same as `start_fetch`.
         Self::spawn_task(async move {
-            match fetch_api_flow(&connector).await {
+            let tx2 = tx.clone();
+            let ctx2 = ctx.clone();
+            match fetch_api_flow(&connector, move |attempt, error| {
+                let _ = tx2.send(GuiEvent::ApiFetchAttempt {
+                    attempt,
+                    error: error.map(|s| s.to_string()),
+                });
+                ctx2.request_repaint();
+            })
+            .await
+            {
                 Ok(nodes) => {
                     let _ = tx.send(GuiEvent::Nodes(vpngate::NodeListUpdate {
                         nodes,
@@ -2111,18 +2165,34 @@ impl GuiApp {
     /// `start_probe` builds it). A snapshot, not indices: the list
     /// can gain a manually-added node mid-sweep, which would shift
     /// indices under a stored queue.
-    fn probe_all_targets(&mut self) -> Vec<(String, String)> {
-        self.display_indices()
+    ///
+    /// v3.17: the connected node is NOT a target — probing it would
+    /// open a second SSTP handshake to the node already carrying
+    /// the tunnel, and would overwrite its live latency cell. The
+    /// second return value is how many nodes were skipped this way
+    /// (0 or 1); the caller stores it for the summary line.
+    fn probe_all_targets(&mut self) -> (Vec<(String, String)>, usize) {
+        let connected = self.connected_node_host();
+        let mut skipped = 0usize;
+        let targets = self
+            .display_indices()
             .into_iter()
             .filter_map(|i| {
                 let n = self.nodes.get(i)?;
+                if connected.as_deref().is_some_and(|h| {
+                    vpngate::complete_ddns_host(&n.host) == h
+                }) {
+                    skipped += 1;
+                    return None;
+                }
                 let target = match n.port {
                     Some(p) => format!("{}:{}", vpngate::complete_ddns_host(&n.host), p),
                     None => vpngate::complete_ddns_host(&n.host),
                 };
                 Some((n.host.clone(), target))
             })
-            .collect()
+            .collect();
+        (targets, skipped)
     }
 
     /// Start a probe-all sweep: every node in the list, in display
@@ -2132,8 +2202,15 @@ impl GuiApp {
         if self.busy.is_some() || self.nodes.is_empty() {
             return;
         }
-        let targets = self.probe_all_targets();
+        let (targets, skipped) = self.probe_all_targets();
         if targets.is_empty() {
+            // The list holds only the connected node: nothing to
+            // probe (v3.17 skips it), and starting a sweep over an
+            // empty queue would leave a busy flag with no Done
+            // event to clear it. Say so and stay idle.
+            if skipped > 0 {
+                self.log_line("探测全部：列表中只有已连接节点，已跳过，无需探测。".to_string());
+            }
             return;
         }
         let total = targets.len();
@@ -2142,12 +2219,20 @@ impl GuiApp {
         self.probe_all_done = 0;
         self.probe_all_ok = 0;
         self.probe_all_failed = 0;
+        self.probe_all_skipped = skipped;
         self.busy = Some(Busy::ProbingAll);
         self.status = format!("正在探测全部：0/{}…", total);
-        self.log_line(format!(
-            "开始探测全部：{} 个节点（按当前显示顺序，一个一个探测）。",
-            total
-        ));
+        if skipped > 0 {
+            self.log_line(format!(
+                "开始探测全部：{} 个节点（按当前显示顺序，一个一个探测；已连接节点跳过，不探测）。",
+                total
+            ));
+        } else {
+            self.log_line(format!(
+                "开始探测全部：{} 个节点（按当前显示顺序，一个一个探测）。",
+                total
+            ));
+        }
         // The first row shows "探测中…" right away; later rows get
         // it from the ProbeAllProgress event before their probe.
         if let Some((first, _)) = targets.first() {
@@ -2272,7 +2357,28 @@ impl GuiApp {
                             let _ = tx2.send(GuiEvent::ConnLog(line));
                         }
                     }));
+                    // v3.17: connection succeeded — automatically
+                    // verify the tunnel actually carries traffic
+                    // (generate_204 + Google HTTPS, the same two
+                    // steps as the CLI `test` subcommand; the GUI's
+                    // own "测试隧道" button was removed in v3.13, so
+                    // this is now the GUI's only in-app tunnel
+                    // verification). It runs here in the connect
+                    // task — the UI is never blocked — and a failure
+                    // never disconnects: the result only reports
+                    // (see `GuiEvent::TunnelCheckResult`).
+                    let tunnel = c.tunnel.clone();
+                    let check_label = c.node_label.clone();
                     let _ = tx.send(GuiEvent::Connected(Box::new(c)));
+                    let _ = tx.send(GuiEvent::ConnLog(
+                        "正在自动检查隧道（generate_204 + Google HTTPS）…".to_string(),
+                    ));
+                    ctx.request_repaint();
+                    let outcome = tunnel.check_tunnel(timeout).await;
+                    let _ = tx.send(GuiEvent::TunnelCheckResult {
+                        node_label: check_label,
+                        outcome,
+                    });
                 }
                 Err(e) => {
                     let _ = tx.send(GuiEvent::ConnectFailed(e));
@@ -2586,7 +2692,11 @@ impl GuiApp {
                 // fresh list lacks are kept, appended at the end, so
                 // a refresh no longer drops them. The cache stores
                 // the merged list, so they survive a restart too.
-                let (merged, retained) = self.merge_refresh_nodes(upd.nodes);
+                // v3.17: the connected node is pinned the same way
+                // (see `merge_refresh_nodes`) — it must not vanish
+                // from the list just because the fresh list lacks it.
+                let (merged, retained, connected_pinned) =
+                    self.merge_refresh_nodes(upd.nodes);
                 // A fresh list from the API or the web scrape is worth
                 // caching, so the next failed refresh still has a recent
                 // list to show.
@@ -2612,8 +2722,39 @@ impl GuiApp {
                 // many manual/imported nodes it kept, and the final
                 // count — so a small list is diagnosable at a glance.
                 self.log_line(refresh_summary_line(upd.source, cleared, n, retained));
+                // v3.17: say why the connected node is still here
+                // when the fresh list lacked it — the tunnel never
+                // dropped, only the list did.
+                if connected_pinned {
+                    if let Some(host) = self.connected_node_host() {
+                        self.log_line(format!(
+                            "刷新后已连接节点 {} 不在新列表中，已保留在列表中（连接不受影响）。",
+                            host
+                        ));
+                    }
+                }
                 self.nodes_source = upd.source.label(n, upd.cache_age_secs);
-                self.clear_selection();
+                // v3.17: after a refresh the connected node stays
+                // selected and scrolls into view — whether it was
+                // pinned above or the fresh list already had it
+                // (the ∞ mark comes from the host match either
+                // way). With no connection the selection clears as
+                // before — indices from the old list are meaningless.
+                match self.connected_node_host() {
+                    Some(host) => {
+                        match self.nodes.iter().position(|nd| {
+                            vpngate::complete_ddns_host(&nd.host) == host
+                        }) {
+                            Some(idx) => {
+                                self.selected = Some(idx);
+                                self.selected_set = std::iter::once(idx).collect();
+                                self.scroll_to_selected = true;
+                            }
+                            None => self.clear_selection(),
+                        }
+                    }
+                    None => self.clear_selection(),
+                }
                 match upd.source {
                     vpngate::NodeListSource::Api => {
                         self.status = format!("节点列表已更新：{} 个节点。", n);
@@ -2681,6 +2822,53 @@ impl GuiApp {
                 // reported plainly, in Leo's exact words, instead
                 // of silently falling back to the scrape.
                 self.report_refresh_failure("官方 API", &reason);
+            }
+            GuiEvent::ApiFetchAttempt { attempt, error } => {
+                // v3.17: live retry progress for the API fetch.
+                // Each failed attempt names its number, its reason
+                // and the wait before the next one; the last
+                // attempt only logs (the caller — `Nodes` or
+                // `ApiRefreshFailed` — reports the final failure
+                // in Leo's exact words). A success after retries
+                // gets one log line; a first-attempt success is
+                // the normal path and stays silent.
+                match error {
+                    Some(e) => {
+                        if attempt < vpngate::API_FETCH_ATTEMPTS {
+                            let wait = vpngate::api_fetch_backoff(attempt).as_secs();
+                            self.status = format!(
+                                "官方 API 拉取第 {} 次尝试失败（{}），{} 秒后重试…",
+                                attempt, e, wait
+                            );
+                            self.log_line(format!(
+                                "官方 API 拉取第 {} 次尝试失败（{}），{} 秒后重试。",
+                                attempt, e, wait
+                            ));
+                        } else {
+                            // Last attempt: no retry follows, so say
+                            // so in the status too (leaving the
+                            // "…秒后重试" line would promise a retry
+                            // that never comes). The caller still
+                            // reports the final failure itself.
+                            self.status = format!(
+                                "官方 API 拉取第 {} 次尝试失败（{}）。",
+                                attempt, e
+                            );
+                            self.log_line(format!(
+                                "官方 API 拉取第 {} 次尝试失败（{}）。",
+                                attempt, e
+                            ));
+                        }
+                    }
+                    None => {
+                        if attempt > 1 {
+                            self.log_line(format!(
+                                "官方 API 第 {} 次尝试成功。",
+                                attempt
+                            ));
+                        }
+                    }
+                }
             }
             GuiEvent::Probe { host, result } => {
                 self.busy = None;
@@ -2823,36 +3011,47 @@ impl GuiApp {
                 self.probe_all_done = ok + failed;
                 self.probe_all_total = total;
                 let skipped = total.saturating_sub(ok + failed);
+                // v3.17: the connected node was never a target, so
+                // it is in neither count. Name the skip in every
+                // summary line — the counts alone would look short
+                // by one against the list size. (This is a different
+                // `skipped` from the unprobed remainder above: that
+                // one counts targets the sweep never reached.)
+                let skip_note = if self.probe_all_skipped > 0 {
+                    format!("，已跳过已连接节点 {} 个", self.probe_all_skipped)
+                } else {
+                    String::new()
+                };
                 if proxy_down {
                     self.status = format!(
-                        "探测全部已停止：前置代理不通，已测 {}/{}，{} 个可用，{} 个失败。",
-                        ok + failed, total, ok, failed
+                        "探测全部已停止：前置代理不通，已测 {}/{}，{} 个可用，{} 个失败{}。",
+                        ok + failed, total, ok, failed, skip_note
                     );
                     self.set_error(format!(
                         "探测全部已停止：前置代理 {} 不通，剩下的 {} 个节点没测（已测 {}/{}，{} 个可用）。先点高级设置里的“测试前置代理”确认。",
                         self.front_addr, skipped, ok + failed, total, ok
                     ));
                     self.log_line(format!(
-                        "探测全部已停止：前置代理不通。已测 {}/{}，{} 个可用，{} 个失败，{} 个未测。",
-                        ok + failed, total, ok, failed, skipped
+                        "探测全部已停止：前置代理不通。已测 {}/{}，{} 个可用，{} 个失败，{} 个未测{}。",
+                        ok + failed, total, ok, failed, skipped, skip_note
                     ));
                 } else if stopped {
                     self.status = format!(
-                        "探测全部已停止：已测 {}/{}，{} 个可用，{} 个失败。",
-                        ok + failed, total, ok, failed
+                        "探测全部已停止：已测 {}/{}，{} 个可用，{} 个失败{}。",
+                        ok + failed, total, ok, failed, skip_note
                     );
                     self.log_line(format!(
-                        "探测全部已停止：已测 {}/{}，{} 个可用，{} 个失败，{} 个未测。",
-                        ok + failed, total, ok, failed, skipped
+                        "探测全部已停止：已测 {}/{}，{} 个可用，{} 个失败，{} 个未测{}。",
+                        ok + failed, total, ok, failed, skipped, skip_note
                     ));
                 } else {
                     self.status = format!(
-                        "探测全部完成：{} 个节点，{} 个可用，{} 个失败。",
-                        total, ok, failed
+                        "探测全部完成：{} 个节点，{} 个可用，{} 个失败{}。",
+                        total, ok, failed, skip_note
                     );
                     self.log_line(format!(
-                        "探测全部完成：{} 个节点，{} 个可用，{} 个失败。",
-                        total, ok, failed
+                        "探测全部完成：{} 个节点，{} 个可用，{} 个失败{}。",
+                        total, ok, failed, skip_note
                     ));
                 }
                 // v3.14 RSS: probe-all-done sample (Tier C).
@@ -2878,6 +3077,61 @@ impl GuiApp {
                 self.rss_connected_since = Some(Instant::now());
                 self.rss_conn30_done = false;
                 self.sample_rss("connected");
+            }
+            GuiEvent::TunnelCheckResult {
+                node_label,
+                outcome,
+            } => {
+                // v3.17: only the check for the node still connected
+                // counts. If the user disconnected or switched to
+                // another node while the check ran, the result
+                // belongs to a dead tunnel — ignore it silently
+                // instead of overwriting the new state.
+                let Some((label, vip)) = self
+                    .conn
+                    .as_ref()
+                    .map(|c| (c.node_label.clone(), c.vip))
+                else {
+                    return;
+                };
+                if label != node_label {
+                    return;
+                }
+                match outcome {
+                    TunnelCheckOutcome::Ok {
+                        generate_204_ms,
+                        google_ms,
+                    } => {
+                        self.status = format!(
+                            "已连接 {}，虚拟 IP {}，隧道通。",
+                            label, vip
+                        );
+                        self.log_line(format!(
+                            "隧道检查通过：generate_204 {} ms，Google HTTPS {} ms，隧道通。",
+                            generate_204_ms, google_ms
+                        ));
+                    }
+                    TunnelCheckOutcome::Generate204Failed(detail) => {
+                        self.status = format!(
+                            "已连接 {}，虚拟 IP {}，但隧道不通（generate_204 失败），建议换节点。",
+                            label, vip
+                        );
+                        self.log_line(format!(
+                            "隧道检查：generate_204 失败（{}），隧道不通；连接保持不断，建议换节点。",
+                            detail
+                        ));
+                    }
+                    TunnelCheckOutcome::GoogleFailed(detail) => {
+                        self.status = format!(
+                            "已连接 {}，虚拟 IP {}，但隧道不通（Google HTTPS 失败），建议换节点。",
+                            label, vip
+                        );
+                        self.log_line(format!(
+                            "隧道检查：Google HTTPS 失败（{}），隧道不通；连接保持不断，建议换节点。",
+                            detail
+                        ));
+                    }
+                }
             }
             GuiEvent::ConnectFailed(e) => {
                 self.busy = None;
@@ -3459,7 +3713,21 @@ impl GuiApp {
     /// quality) and the manual copy is dropped — except its port:
     /// the API never carries an SSTP port, so a manual port survives
     /// when the incoming row has none.
-    fn merge_refresh_nodes(&self, incoming: Vec<Node>) -> (Vec<Node>, usize) {
+    ///
+    /// v3.17: the connected node is pinned the same way, and for
+    /// the same reason — a refresh replaces the list, and a
+    /// connected node the fresh list lacks (nodes come and go, the
+    /// API list is a subset) used to vanish from the UI even though
+    /// the tunnel stayed up. The third return value says whether
+    /// the connected node was pinned (absent from the fresh list);
+    /// it is kept at its old position (clamped to the merged
+    /// length, so a position past the end lands at the end). A
+    /// connected node already present in the fresh list needs no
+    /// pinning — the fresh row is the same host, so the ∞ mark and
+    /// the connection itself are untouched. A connected manual /
+    /// imported node is kept once, by the loop below, and is not
+    /// pinned a second time.
+    fn merge_refresh_nodes(&self, incoming: Vec<Node>) -> (Vec<Node>, usize, bool) {
         let mut merged = incoming;
         let mut index_by_host: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
@@ -3490,7 +3758,23 @@ impl GuiApp {
                 }
             }
         }
-        (merged, retained)
+        let mut connected_pinned = false;
+        if let Some(host) = self.connected_node_host() {
+            if !index_by_host.contains_key(&Self::blocked_key(&host)) {
+                if let Some((pos, node)) = self
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .find(|(_, n)| Self::blocked_key(&n.host) == Self::blocked_key(&host))
+                    .map(|(pos, n)| (pos, n.clone()))
+                {
+                    let at = pos.min(merged.len());
+                    merged.insert(at, node);
+                    connected_pinned = true;
+                }
+            }
+        }
+        (merged, retained, connected_pinned)
     }
 
     /// The selected nodes in display order (see `display_indices`,
@@ -6546,11 +6830,12 @@ mod tests {
         imported.source = "import".to_string();
         imported.isp = "DT".to_string();
         app.nodes = vec![node_in("a.opengw.net", "日本"), manual, imported];
-        let (merged, retained) = app.merge_refresh_nodes(vec![
+        let (merged, retained, connected_pinned) = app.merge_refresh_nodes(vec![
             node_in("a.opengw.net", "日本"),
             node_in("b.opengw.net", "美国"),
         ]);
         assert_eq!(retained, 2);
+        assert!(!connected_pinned, "nothing is connected here");
         assert_eq!(merged.len(), 4);
         assert_eq!(merged[2].host, "m.opengw.net");
         assert_eq!(merged[2].source, "manual");
@@ -6577,8 +6862,9 @@ mod tests {
         api.isp = "NTT".to_string();
         api.sessions = 47;
         api.speed_mbps = 572;
-        let (merged, retained) = app.merge_refresh_nodes(vec![api]);
+        let (merged, retained, connected_pinned) = app.merge_refresh_nodes(vec![api]);
         assert_eq!(retained, 0);
+        assert!(!connected_pinned, "nothing is connected here");
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].country, "日本");
         assert_eq!(merged[0].isp, "NTT");
@@ -6587,6 +6873,337 @@ mod tests {
         assert_eq!(merged[0].port, Some(995));
         assert_eq!(merged[0].port_source, "manual");
         assert_eq!(merged[0].source, "api");
+    }
+
+    /// v3.17: the connected node is pinned when the fresh list
+    /// lacks it — kept at its old position (0 here), no duplicate,
+    /// and the pin is reported.
+    #[test]
+    fn refresh_merge_pins_connected_node_when_missing() {
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut app = connected_test_app(tunnel);
+        app.nodes.push(node_in("c.opengw.net", "德国"));
+        let (merged, retained, connected_pinned) = app.merge_refresh_nodes(vec![
+            node_in("b.opengw.net", "美国"),
+            node_in("c.opengw.net", "德国"),
+        ]);
+        assert!(connected_pinned, "A is connected and missing from fresh");
+        assert_eq!(retained, 0, "nothing manual/imported here");
+        assert_eq!(merged.len(), 3);
+        assert_eq!(
+            merged[0].host, "a.opengw.net",
+            "pinned at its old position (0)"
+        );
+        assert_eq!(
+            merged.iter().filter(|n| n.host == "a.opengw.net").count(),
+            1,
+            "the pinned node appears exactly once"
+        );
+    }
+
+    /// v3.17: when the fresh list HAS the connected node, its new
+    /// metadata wins — no pin, no duplicate, the connection state
+    /// itself is untouched (it lives in `conn`, not the row).
+    #[test]
+    fn refresh_merge_connected_node_present_uses_fresh_metadata() {
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut app = connected_test_app(tunnel);
+        let mut fresh_a = node_in("a.opengw.net", "日本");
+        fresh_a.sessions = 99;
+        fresh_a.speed_mbps = 800;
+        let (merged, retained, connected_pinned) = app.merge_refresh_nodes(vec![
+            fresh_a,
+            node_in("b.opengw.net", "美国"),
+        ]);
+        assert!(!connected_pinned, "A is in the fresh list");
+        assert_eq!(retained, 0);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].sessions, 99);
+        assert_eq!(merged[0].speed_mbps, 800);
+        assert_eq!(
+            merged.iter().filter(|n| n.host == "a.opengw.net").count(),
+            1
+        );
+    }
+
+    /// v3.17: a connected MANUAL node is kept once by the existing
+    /// manual/import loop — the pin must not add a second copy.
+    #[test]
+    fn refresh_merge_connected_manual_node_kept_once_not_pinned() {
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut app = connected_test_app(tunnel);
+        app.nodes[0].source = "manual".to_string();
+        let (merged, retained, connected_pinned) =
+            app.merge_refresh_nodes(vec![node_in("b.opengw.net", "美国")]);
+        assert!(!connected_pinned, "the manual loop already kept it");
+        assert_eq!(retained, 1);
+        assert_eq!(
+            merged.iter().filter(|n| n.host == "a.opengw.net").count(),
+            1,
+            "kept exactly once"
+        );
+    }
+
+    /// v3.17: a Nodes event whose fresh list lacks the connected
+    /// node keeps it in the list (pinned at its old position),
+    /// keeps it selected and scrolls to it, and logs why; when
+    /// the fresh list has it, the metadata updates and the
+    /// selection follows it. The connection itself is never
+    /// touched by a refresh.
+    #[test]
+    fn refresh_nodes_event_keeps_connected_node_selected() {
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut app = connected_test_app(tunnel);
+        app.nodes.push(node_in("c.opengw.net", "德国"));
+        app.selected = Some(0);
+        app.apply_event(GuiEvent::Nodes(vpngate::NodeListUpdate {
+            nodes: vec![
+                node_in("b.opengw.net", "美国"),
+                node_in("c.opengw.net", "德国"),
+            ],
+            source: vpngate::NodeListSource::Api,
+            cache_age_secs: None,
+            api_error: None,
+            web_error: None,
+        }));
+        assert_eq!(app.nodes.len(), 3);
+        assert_eq!(
+            app.nodes[0].host, "a.opengw.net",
+            "the connected node stays at its old position"
+        );
+        assert_eq!(app.selected, Some(0), "still selected after refresh");
+        assert!(
+            app.scroll_to_selected,
+            "the connected node must scroll into view"
+        );
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.contains("已保留在列表中（连接不受影响）")),
+            "log must name the pin: {:?}",
+            app.log
+        );
+        assert!(app.conn.is_some(), "refresh must never drop the connection");
+        // Fresh list HAS A with new metadata: it updates in place
+        // and stays selected.
+        let mut fresh_a = node_in("a.opengw.net", "日本");
+        fresh_a.sessions = 99;
+        fresh_a.speed_mbps = 800;
+        app.apply_event(GuiEvent::Nodes(vpngate::NodeListUpdate {
+            nodes: vec![fresh_a, node_in("b.opengw.net", "美国")],
+            source: vpngate::NodeListSource::Api,
+            cache_age_secs: None,
+            api_error: None,
+            web_error: None,
+        }));
+        assert_eq!(app.nodes.len(), 2);
+        assert_eq!(app.nodes[0].sessions, 99);
+        assert_eq!(app.nodes[0].speed_mbps, 800);
+        assert_eq!(app.selected, Some(0));
+        assert!(app.scroll_to_selected);
+        assert!(app.conn.is_some());
+    }
+
+    /// v3.17: the automatic post-connect tunnel check — a passing
+    /// result writes 隧道通 in the status bar and the log, and the
+    /// connection is untouched.
+    #[test]
+    fn tunnel_check_result_ok_writes_tunnel_ok() {
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut app = connected_test_app(tunnel);
+        app.apply_event(GuiEvent::TunnelCheckResult {
+            node_label: "a.opengw.net:992".to_string(),
+            outcome: TunnelCheckOutcome::Ok {
+                generate_204_ms: 123,
+                google_ms: 456,
+            },
+        });
+        assert_eq!(
+            app.status,
+            "已连接 a.opengw.net:992，虚拟 IP 10.0.0.2，隧道通。"
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains(
+                "隧道检查通过：generate_204 123 ms，Google HTTPS 456 ms，隧道通。"
+            )),
+            "log must carry the check detail: {:?}",
+            app.log
+        );
+        assert!(app.conn.is_some(), "the check never disconnects");
+        assert!(app.busy.is_none(), "the check runs in the background");
+    }
+
+    /// v3.17: a failed check writes 隧道不通 + which step failed +
+    /// the switch-node suggestion, and the connection STAYS UP —
+    /// the check only reports, it never disconnects.
+    #[test]
+    fn tunnel_check_result_failed_keeps_connection() {
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut app = connected_test_app(tunnel);
+        app.apply_event(GuiEvent::TunnelCheckResult {
+            node_label: "a.opengw.net:992".to_string(),
+            outcome: TunnelCheckOutcome::Generate204Failed(
+                "3 秒内无响应".to_string(),
+            ),
+        });
+        assert!(
+            app.status.contains("隧道不通（generate_204 失败）"),
+            "status must name the failed step: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("建议换节点"),
+            "status must suggest switching: {}",
+            app.status
+        );
+        assert!(
+            app.log.iter().any(|l| l.contains("连接保持不断")),
+            "log must say the connection stays up: {:?}",
+            app.log
+        );
+        assert!(app.conn.is_some(), "a failed check must not disconnect");
+        assert!(app.busy.is_none());
+        // The Google step fails the same way, with its own wording.
+        app.apply_event(GuiEvent::TunnelCheckResult {
+            node_label: "a.opengw.net:992".to_string(),
+            outcome: TunnelCheckOutcome::GoogleFailed("TLS 握手失败".to_string()),
+        });
+        assert!(
+            app.status.contains("隧道不通（Google HTTPS 失败）"),
+            "status must name the Google step: {}",
+            app.status
+        );
+        assert!(app.conn.is_some());
+    }
+
+    /// v3.17: a check result for a node that is no longer
+    /// connected — the user disconnected, or switched to another
+    /// node while the check ran — is ignored silently instead of
+    /// overwriting the current state.
+    #[test]
+    fn tunnel_check_result_for_stale_node_is_ignored() {
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut app = connected_test_app(tunnel);
+        app.status = "已连接 a.opengw.net:992，虚拟 IP 10.0.0.2。".to_string();
+        let log_before = app.log.len();
+        app.apply_event(GuiEvent::TunnelCheckResult {
+            node_label: "b.opengw.net:992".to_string(),
+            outcome: TunnelCheckOutcome::Generate204Failed("x".to_string()),
+        });
+        assert_eq!(
+            app.status,
+            "已连接 a.opengw.net:992，虚拟 IP 10.0.0.2。",
+            "a stale result must not touch the status"
+        );
+        assert_eq!(app.log.len(), log_before, "no log line either");
+        // Disconnected entirely: same silence.
+        app.conn = None;
+        app.apply_event(GuiEvent::TunnelCheckResult {
+            node_label: "a.opengw.net:992".to_string(),
+            outcome: TunnelCheckOutcome::Ok {
+                generate_204_ms: 1,
+                google_ms: 1,
+            },
+        });
+        assert_eq!(
+            app.status,
+            "已连接 a.opengw.net:992，虚拟 IP 10.0.0.2。"
+        );
+        assert_eq!(app.log.len(), log_before);
+    }
+
+    /// v3.17: per-attempt retry progress — each failed attempt names
+    /// its number, its reason and the wait before the next one; the
+    /// last attempt promises no retry; a success after retries gets
+    /// one log line; a first-attempt success stays silent.
+    #[test]
+    fn api_fetch_attempt_reports_retry_progress_live() {
+        let mut app = GuiApp::for_tests();
+        app.apply_event(GuiEvent::ApiFetchAttempt {
+            attempt: 1,
+            error: Some("官方 API 拉取超时（30 秒内无响应）".to_string()),
+        });
+        assert_eq!(
+            app.status,
+            "官方 API 拉取第 1 次尝试失败（官方 API 拉取超时（30 秒内无响应）），1 秒后重试…"
+        );
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.contains("第 1 次尝试失败") && l.contains("1 秒后重试")),
+            "log: {:?}",
+            app.log
+        );
+        app.apply_event(GuiEvent::ApiFetchAttempt {
+            attempt: 2,
+            error: Some("TLS handshake to www.vpngate.net failed: connection reset".to_string()),
+        });
+        assert!(
+            app.status.contains("第 2 次尝试失败"),
+            "status: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("2 秒后重试…"),
+            "status: {}",
+            app.status
+        );
+        app.apply_event(GuiEvent::ApiFetchAttempt {
+            attempt: 3,
+            error: Some("官方 API 拉取超时（30 秒内无响应）".to_string()),
+        });
+        assert_eq!(
+            app.status,
+            "官方 API 拉取第 3 次尝试失败（官方 API 拉取超时（30 秒内无响应））。"
+        );
+        assert!(
+            !app.status.contains("重试…"),
+            "the last attempt must not promise a retry: {}",
+            app.status
+        );
+        // Success after retries: one log line, status untouched.
+        let status_before = app.status.clone();
+        app.apply_event(GuiEvent::ApiFetchAttempt {
+            attempt: 2,
+            error: None,
+        });
+        assert_eq!(app.status, status_before);
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.contains("官方 API 第 2 次尝试成功。")),
+            "log: {:?}",
+            app.log
+        );
+        // First-attempt success: silent (the normal path).
+        let log_len = app.log.len();
+        app.apply_event(GuiEvent::ApiFetchAttempt {
+            attempt: 1,
+            error: None,
+        });
+        assert_eq!(app.log.len(), log_len);
     }
 
     #[test]
@@ -6926,7 +7543,8 @@ mod tests {
             node_in("d.opengw.net", "德国"),
         ];
         // Fetch order by default.
-        let targets = app.probe_all_targets();
+        let (targets, skipped) = app.probe_all_targets();
+        assert_eq!(skipped, 0, "nothing is connected here");
         let hosts: Vec<&str> = targets.iter().map(|(h, _)| h.as_str()).collect();
         assert_eq!(
             hosts,
@@ -6934,7 +7552,8 @@ mod tests {
         );
         // Sorted A-Z: 德国 < 日本 < 美国, hostname breaks ties.
         app.sort = Some((SortCol::Country, SortDir::Asc));
-        let targets = app.probe_all_targets();
+        let (targets, skipped) = app.probe_all_targets();
+        assert_eq!(skipped, 0, "nothing is connected here");
         let hosts: Vec<&str> = targets.iter().map(|(h, _)| h.as_str()).collect();
         assert_eq!(
             hosts,
@@ -6944,7 +7563,125 @@ mod tests {
         assert_eq!(targets[0].1, "d.opengw.net:992");
         // Empty list: nothing to probe.
         app.nodes = vec![];
-        assert!(app.probe_all_targets().is_empty());
+        assert!(app.probe_all_targets().0.is_empty());
+    }
+
+    /// v3.17: the connected node is never a sweep target — no
+    /// SSTP handshake to it, its latency cell untouched, and it
+    /// is counted as skipped, not as available/failed.
+    #[test]
+    fn probe_all_targets_skips_connected_node() {
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut app = connected_test_app(tunnel);
+        app.nodes.push(node_in("c.opengw.net", "德国"));
+        let (targets, skipped) = app.probe_all_targets();
+        assert_eq!(skipped, 1, "the connected node is skipped");
+        let hosts: Vec<&str> = targets.iter().map(|(h, _)| h.as_str()).collect();
+        assert_eq!(hosts, ["b.opengw.net", "c.opengw.net"]);
+        assert_eq!(targets[0].1, "b.opengw.net:992");
+    }
+
+    /// v3.17: when the list holds only the connected node, there
+    /// is nothing to probe at all — but it still counts as one
+    /// skipped node, so the caller can say so instead of going
+    /// silent.
+    #[test]
+    fn probe_all_targets_only_connected_node() {
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut app = connected_test_app(tunnel);
+        app.nodes = vec![node_in("a.opengw.net", "日本")];
+        let (targets, skipped) = app.probe_all_targets();
+        assert!(targets.is_empty());
+        assert_eq!(skipped, 1);
+    }
+
+    /// v3.17: starting a sweep while connected probes only the
+    /// other nodes, the connected row's cell stays untouched, and
+    /// the Done summary names the skip; with only the connected
+    /// node in the list, starting stays idle (no busy flag with
+    /// no Done event to clear it).
+    #[test]
+    fn start_probe_all_skips_connected_node_and_summarizes() {
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut app = connected_test_app(tunnel.clone());
+        app.nodes.push(node_in("c.opengw.net", "德国"));
+        app.start_probe_all(egui::Context::default());
+        assert_eq!(app.busy, Some(Busy::ProbingAll));
+        assert_eq!(app.probe_all_total, 2);
+        assert_eq!(app.probe_all_skipped, 1);
+        assert_eq!(
+            app.probes.get("a.opengw.net"),
+            None,
+            "the connected row is never touched by the sweep"
+        );
+        assert_eq!(
+            app.probes.get("b.opengw.net").map(|s| s.as_str()),
+            Some("探测中…"),
+            "the first target is B, not the connected A"
+        );
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.contains("已连接节点跳过，不探测")),
+            "start line must name the skip: {:?}",
+            app.log
+        );
+        app.apply_event(GuiEvent::ProbeAllResult {
+            host: "b.opengw.net".to_string(),
+            result: Ok((Ipv4Addr::new(10, 0, 0, 2), Duration::from_millis(95))),
+            done: 1,
+            total: 2,
+        });
+        app.apply_event(GuiEvent::ProbeAllResult {
+            host: "c.opengw.net".to_string(),
+            result: Err(ProbeFailure::NodeDown("timeout".to_string())),
+            done: 2,
+            total: 2,
+        });
+        app.apply_event(GuiEvent::ProbeAllDone {
+            total: 2,
+            ok: 1,
+            failed: 1,
+            stopped: false,
+            proxy_down: false,
+        });
+        assert!(app.busy.is_none());
+        assert_eq!(
+            app.status,
+            "探测全部完成：2 个节点，1 个可用，1 个失败，已跳过已连接节点 1 个。"
+        );
+        assert!(
+            app.log.iter().any(|l| l
+                .contains("探测全部完成：2 个节点，1 个可用，1 个失败，已跳过已连接节点 1 个。")),
+            "log must carry the same summary: {:?}",
+            app.log
+        );
+        assert_eq!(
+            app.probes.get("a.opengw.net"),
+            None,
+            "the connected row is still untouched after the sweep"
+        );
+        // Only the connected node: starting stays idle.
+        let mut solo = connected_test_app(tunnel);
+        solo.nodes = vec![node_in("a.opengw.net", "日本")];
+        solo.start_probe_all(egui::Context::default());
+        assert!(solo.busy.is_none());
+        assert!(
+            solo.log
+                .iter()
+                .any(|l| l.contains("列表中只有已连接节点，已跳过，无需探测")),
+            "idle start must say why: {:?}",
+            solo.log
+        );
     }
 
     #[test]
@@ -10244,6 +10981,223 @@ mod tests {
         );
     }
 
+    /// v3.17 kittest: while connected to A, clicking 探测全部
+    /// sweeps only B and C — A's row never shows 探测中…, the
+    /// status counts 2 targets, and the Done summary names the
+    /// one skipped connected node.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn probe_all_button_skips_connected_node() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 420.0))
+            .build_eframe(|cc| GuiApp::for_render_tests(cc));
+        harness.run_steps(10);
+        harness.state_mut().nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "美国"),
+            node_in("c.opengw.net", "德国"),
+        ];
+        let vip = tunnel.vip;
+        harness.state_mut().conn = Some(ActiveConnection {
+            tunnel,
+            serve: Vec::new(),
+            proxy_guard: None,
+            listen_addr: "127.0.0.1:10818".to_string(),
+            node_label: "a.opengw.net:992".to_string(),
+            vip,
+        });
+        harness.run_steps(3);
+        let btn = harness.get_by_label("探测全部");
+        let center = btn.rect().center();
+        harness.drag_at(center);
+        harness.run_steps(3);
+        harness.drop_at(center);
+        harness.run_steps(3);
+        assert!(
+            matches!(harness.state().busy, Some(Busy::ProbingAll)),
+            "busy={:?}",
+            harness.state().busy
+        );
+        assert!(
+            harness.state().status.contains("0/2"),
+            "only B and C are targets: {}",
+            harness.state().status
+        );
+        assert_eq!(
+            harness.state().probes.get("a.opengw.net"),
+            None,
+            "the connected row must never show 探测中…"
+        );
+        assert_eq!(
+            harness.state().probes.get("b.opengw.net").map(|s| s.as_str()),
+            Some("探测中…"),
+            "the first target is B"
+        );
+        assert!(
+            harness.state().log.iter().any(|l| l.contains("已连接节点跳过")),
+            "start line must name the skip: {:?}",
+            harness.state().log
+        );
+        harness.state_mut().apply_event(GuiEvent::ProbeAllDone {
+            total: 2,
+            ok: 1,
+            failed: 1,
+            stopped: false,
+            proxy_down: false,
+        });
+        harness.run_steps(3);
+        assert_eq!(
+            harness.state().status,
+            "探测全部完成：2 个节点，1 个可用，1 个失败，已跳过已连接节点 1 个。"
+        );
+        assert_eq!(
+            harness.state().probes.get("a.opengw.net"),
+            None,
+            "the connected row is still untouched after the sweep"
+        );
+    }
+
+    /// v3.17 kittest: a refresh whose fresh list lacks the
+    /// connected node keeps it in the list, still selected, and
+    /// its row still renders (country label present).
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn refresh_keeps_connected_node_row() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 420.0))
+            .build_eframe(|cc| GuiApp::for_render_tests(cc));
+        harness.run_steps(10);
+        harness.state_mut().nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "美国"),
+        ];
+        let vip = tunnel.vip;
+        harness.state_mut().conn = Some(ActiveConnection {
+            tunnel,
+            serve: Vec::new(),
+            proxy_guard: None,
+            listen_addr: "127.0.0.1:10818".to_string(),
+            node_label: "a.opengw.net:992".to_string(),
+            vip,
+        });
+        harness.state_mut().selected = Some(0);
+        harness.state_mut().apply_event(GuiEvent::Nodes(vpngate::NodeListUpdate {
+            nodes: vec![
+                node_in("b.opengw.net", "美国"),
+                node_in("c.opengw.net", "德国"),
+            ],
+            source: vpngate::NodeListSource::Api,
+            cache_age_secs: None,
+            api_error: None,
+            web_error: None,
+        }));
+        assert_eq!(harness.state().nodes.len(), 3);
+        assert_eq!(harness.state().nodes[0].host, "a.opengw.net");
+        assert_eq!(harness.state().selected, Some(0));
+        assert!(harness.state().scroll_to_selected);
+        assert!(
+            harness.state().log.iter().any(|l| l.contains("已保留在列表中")),
+            "log must name the pin: {:?}",
+            harness.state().log
+        );
+        harness.run_steps(3);
+        let row = harness.get_by_label("日本");
+        assert!(
+            row.rect().width() > 0.0,
+            "the connected node's row must still render"
+        );
+    }
+
+    /// v3.17 kittest: a failed automatic tunnel check shows
+    /// 隧道不通 + the failed step + the switch suggestion in the
+    /// status bar, logs the detail, and the connection stays up
+    /// (the row still renders); a later passing result flips the
+    /// status to 隧道通.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn tunnel_check_result_shows_in_status_bar() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 420.0))
+            .build_eframe(|cc| GuiApp::for_render_tests(cc));
+        harness.run_steps(10);
+        harness.state_mut().nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "美国"),
+        ];
+        let vip = tunnel.vip;
+        harness.state_mut().conn = Some(ActiveConnection {
+            tunnel,
+            serve: Vec::new(),
+            proxy_guard: None,
+            listen_addr: "127.0.0.1:10818".to_string(),
+            node_label: "a.opengw.net:992".to_string(),
+            vip,
+        });
+        harness.state_mut().apply_event(GuiEvent::TunnelCheckResult {
+            node_label: "a.opengw.net:992".to_string(),
+            outcome: TunnelCheckOutcome::Generate204Failed("3 秒内无响应".to_string()),
+        });
+        harness.run_steps(3);
+        assert!(
+            harness.state().status.contains("隧道不通（generate_204 失败）"),
+            "status: {}",
+            harness.state().status
+        );
+        assert!(
+            harness.state().status.contains("建议换节点"),
+            "status: {}",
+            harness.state().status
+        );
+        assert!(
+            harness.state().conn.is_some(),
+            "a failed check must not disconnect"
+        );
+        assert!(
+            harness.state().log.iter().any(|l| l.contains("连接保持不断")),
+            "log: {:?}",
+            harness.state().log
+        );
+        let row = harness.get_by_label("日本");
+        assert!(
+            row.rect().width() > 0.0,
+            "the connected node's row must still render"
+        );
+        harness.state_mut().apply_event(GuiEvent::TunnelCheckResult {
+            node_label: "a.opengw.net:992".to_string(),
+            outcome: TunnelCheckOutcome::Ok {
+                generate_204_ms: 120,
+                google_ms: 430,
+            },
+        });
+        harness.run_steps(3);
+        assert!(
+            harness.state().status.contains("隧道通"),
+            "status: {}",
+            harness.state().status
+        );
+        assert!(
+            !harness.state().status.contains("隧道不通"),
+            "status: {}",
+            harness.state().status
+        );
+    }
+
     /// Click a button by label and return the text it copied (if
     /// any). The press runs via run(); the release is queued as a
     /// single event and stepped once, so `harness.output()` is
@@ -10913,6 +11867,125 @@ mod tests {
         if let Some(cache) = vpngate::cache_path() {
             let _ = std::fs::remove_file(&cache);
         }
+    }
+
+    /// v3.17 kittest: the API button fails three times — each
+    /// attempt is reported live in the status bar and the log —
+    /// and the final failure still carries Leo's exact sentence,
+    /// with the list untouched.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn api_refresh_retries_three_times_then_shows_sentence() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        let api_btn = harness.get_by_label("从API刷新节点");
+        let center = api_btn.rect().center();
+        harness.drag_at(center);
+        harness.run_steps(3);
+        harness.drop_at(center);
+        harness.run_steps(3);
+        assert!(matches!(harness.state().busy, Some(Busy::Fetching)));
+        // Drive the three attempts through by hand (no runtime in
+        // the harness): attempts 1 and 2 name the retry wait,
+        // attempt 3 does not promise one.
+        harness.state_mut().apply_event(GuiEvent::ApiFetchAttempt {
+            attempt: 1,
+            error: Some("官方 API 拉取超时（30 秒内无响应）".to_string()),
+        });
+        harness.run_steps(3);
+        assert!(
+            harness.state().status.contains("第 1 次尝试失败"),
+            "status: {}",
+            harness.state().status
+        );
+        assert!(
+            harness.state().status.contains("1 秒后重试"),
+            "status: {}",
+            harness.state().status
+        );
+        harness.state_mut().apply_event(GuiEvent::ApiFetchAttempt {
+            attempt: 2,
+            error: Some("官方 API 拉取超时（30 秒内无响应）".to_string()),
+        });
+        harness.run_steps(3);
+        assert!(
+            harness.state().status.contains("第 2 次尝试失败"),
+            "status: {}",
+            harness.state().status
+        );
+        assert!(
+            harness.state().status.contains("2 秒后重试"),
+            "status: {}",
+            harness.state().status
+        );
+        harness.state_mut().apply_event(GuiEvent::ApiFetchAttempt {
+            attempt: 3,
+            error: Some("官方 API 拉取超时（30 秒内无响应）".to_string()),
+        });
+        harness.run_steps(3);
+        assert!(
+            harness.state().status.contains("第 3 次尝试失败"),
+            "status: {}",
+            harness.state().status
+        );
+        assert!(
+            !harness.state().status.contains("后重试"),
+            "the last attempt must not promise a retry: {}",
+            harness.state().status
+        );
+        // Final failure: Leo's exact sentence, list untouched.
+        harness.state_mut().apply_event(GuiEvent::ApiRefreshFailed {
+            reason: "官方 API 拉取超时（30 秒内无响应）".to_string(),
+        });
+        harness.run_steps(3);
+        assert!(harness.state().busy.is_none());
+        assert!(
+            harness
+                .state()
+                .status
+                .starts_with("当前方式刷新节点失败，请用另一种方式刷新"),
+            "status: {}",
+            harness.state().status
+        );
+        assert_eq!(harness.state().nodes.len(), 2);
+        assert!(
+            harness
+                .state()
+                .log
+                .iter()
+                .any(|l| l.contains("第 1 次尝试失败")),
+            "log: {:?}",
+            harness.state().log
+        );
+        assert!(
+            harness
+                .state()
+                .log
+                .iter()
+                .any(|l| l.contains("第 2 次尝试失败")),
+            "log: {:?}",
+            harness.state().log
+        );
+        assert!(
+            harness
+                .state()
+                .log
+                .iter()
+                .any(|l| l.contains("第 3 次尝试失败")),
+            "log: {:?}",
+            harness.state().log
+        );
     }
 
     /// v3.12: export → delete → import restores the four metadata

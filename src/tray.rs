@@ -10,6 +10,11 @@
 //! this module and runs on Linux too, so `cargo test` covers it.
 //! On Linux the GUI compiles a stub: no tray handle, X quits as
 //! before.
+//!
+//! The whole module is behind the `gui` Cargo feature (see
+//! `src/lib.rs`): its icon decoding needs the `image` crate, so a
+//! `--no-default-features` (Android .so) build excludes it entirely,
+//! tests included. Only the GUI binary uses this module.
 
 use std::path::PathBuf;
 

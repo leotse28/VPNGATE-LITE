@@ -180,25 +180,22 @@ pub async fn fetch_api_nodes(connector: &Connector) -> Result<Vec<Node>, String>
 /// the reason, so the caller reports it plainly instead of silently
 /// falling back to the scrape. Same 30 s ceiling and same error
 /// wording as the API tier of the fallback chain.
-pub async fn fetch_api_only(connector: &Connector) -> Result<Vec<Node>, String> {
-    fetch_api_only_timeout(connector, API_FETCH_TIMEOUT).await
+pub async fn fetch_api_only(
+    connector: &Connector,
+    on_attempt: impl FnMut(usize, Option<&str>) + Send,
+) -> Result<Vec<Node>, String> {
+    fetch_api_only_timeout(connector, API_FETCH_TIMEOUT, on_attempt).await
 }
 
 /// Testable core: the timeout is a parameter so tests can use a
 /// short one against a black-holed proxy instead of waiting 30 s.
+/// v3.17: retries the API fetch (see `fetch_api_with_retry`).
 async fn fetch_api_only_timeout(
     connector: &Connector,
     api_timeout: Duration,
+    on_attempt: impl FnMut(usize, Option<&str>) + Send,
 ) -> Result<Vec<Node>, String> {
-    match tokio::time::timeout(api_timeout, fetch_api_nodes(connector)).await {
-        Ok(Ok(nodes)) if !nodes.is_empty() => Ok(nodes),
-        Ok(Ok(_)) => Err("官方 API 返回了空列表".to_string()),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(format!(
-            "官方 API 拉取超时（{} 秒内无响应）",
-            api_timeout.as_secs()
-        )),
-    }
+    fetch_api_with_retry(connector, api_timeout, on_attempt).await
 }
 
 // ---------------------------------------------------------------------------
@@ -636,8 +633,111 @@ pub fn pick_node_list(
 pub const API_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 pub const WEB_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub async fn fetch_nodes_with_fallback(connector: &Connector) -> NodeListUpdate {
-    fetch_nodes_with_fallback_timeout(connector, API_FETCH_TIMEOUT, WEB_FETCH_TIMEOUT).await
+/// v3.17: how many times one API fetch is attempted before it counts
+/// as failed. Leo's browser fetches the same URL through the same
+/// front proxy every time, while the program tried once and gave up
+/// — a single attempt collides with any jitter on the Cloady free
+/// leg (the front-proxy test alone takes ~7 s for one site). The
+/// retry is on the API fetch only, never on the web tier, and it
+/// changes nothing about the route (still the front proxy, still
+/// one HTTPS GET per attempt, still the 30 s ceiling per attempt).
+pub const API_FETCH_ATTEMPTS: usize = 3;
+
+/// Backoff before the next attempt after attempt `n` (1-based)
+/// fails: 1 s, then 2 s, then 4 s — exponential. With 3 attempts
+/// only the first two waits are used (1 s + 2 s); the 4 s value is
+/// the next step of the same sequence, documented so a future
+/// attempt-count change does not silently re-pick the waits.
+pub fn api_fetch_backoff(attempt: usize) -> Duration {
+    Duration::from_secs(1u64 << attempt.saturating_sub(1).min(2))
+}
+
+/// Run `op` up to `attempts` times, waiting `backoff(n)` after the
+/// n-th failure (no wait after the last attempt). `on_attempt` is
+/// called after each attempt with the attempt number (1-based) and
+/// the failure reason, or `None` on success, so the caller can
+/// report progress live. Returns the first success, or the last
+/// failure when every attempt failed. Generic over the operation so
+/// the retry loop itself is unit-testable with a fake `op` (no
+/// network); the production caller passes the real API fetch.
+pub async fn retry_with_backoff<T, F, Fut>(
+    mut op: F,
+    attempts: usize,
+    backoff: impl Fn(usize) -> Duration,
+    mut on_attempt: impl FnMut(usize, Option<&str>) + Send,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>> + Send,
+{
+    let attempts = attempts.max(1);
+    let mut last_err = String::new();
+    for attempt in 1..=attempts {
+        match op().await {
+            Ok(v) => {
+                on_attempt(attempt, None);
+                return Ok(v);
+            }
+            Err(e) => {
+                on_attempt(attempt, Some(&e));
+                last_err = e;
+                if attempt < attempts {
+                    tokio::time::sleep(backoff(attempt)).await;
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// One API attempt: a single HTTPS GET + CSV parse, capped by
+/// `api_timeout`. The unit the v3.17 retry loop repeats.
+async fn fetch_api_attempt(
+    connector: &Connector,
+    api_timeout: Duration,
+) -> Result<Vec<Node>, String> {
+    match tokio::time::timeout(api_timeout, fetch_api_nodes(connector)).await {
+        Ok(Ok(nodes)) if !nodes.is_empty() => Ok(nodes),
+        Ok(Ok(_)) => Err("官方 API 返回了空列表".to_string()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(format!(
+            "官方 API 拉取超时（{} 秒内无响应）",
+            api_timeout.as_secs()
+        )),
+    }
+}
+
+/// API fetch with retries (v3.17): up to `API_FETCH_ATTEMPTS`
+/// attempts of `fetch_api_attempt`, waiting `api_fetch_backoff(n)`
+/// after the n-th failure. `on_attempt` reports each attempt live
+/// (see `retry_with_backoff`); the final error is the last
+/// attempt's error, worded exactly as the old single-attempt
+/// error, so every existing failure message still applies.
+pub async fn fetch_api_with_retry(
+    connector: &Connector,
+    api_timeout: Duration,
+    on_attempt: impl FnMut(usize, Option<&str>) + Send,
+) -> Result<Vec<Node>, String> {
+    retry_with_backoff(
+        || fetch_api_attempt(connector, api_timeout),
+        API_FETCH_ATTEMPTS,
+        api_fetch_backoff,
+        on_attempt,
+    )
+    .await
+}
+
+pub async fn fetch_nodes_with_fallback(
+    connector: &Connector,
+    on_attempt: impl FnMut(usize, Option<&str>) + Send,
+) -> NodeListUpdate {
+    fetch_nodes_with_fallback_timeout(
+        connector,
+        API_FETCH_TIMEOUT,
+        WEB_FETCH_TIMEOUT,
+        on_attempt,
+    )
+    .await
 }
 
 /// Testable core: the per-tier timeouts are parameters so tests can use
@@ -646,23 +746,20 @@ async fn fetch_nodes_with_fallback_timeout(
     connector: &Connector,
     api_timeout: Duration,
     web_timeout: Duration,
+    on_attempt: impl FnMut(usize, Option<&str>) + Send,
 ) -> NodeListUpdate {
     let mut api_error = None;
-    let api = match tokio::time::timeout(api_timeout, fetch_api_nodes(connector)).await {
-        Ok(Ok(nodes)) if !nodes.is_empty() => Some(nodes),
-        Ok(Ok(_)) => {
-            api_error = Some("官方 API 返回了空列表".to_string());
-            None
-        }
-        Ok(Err(e)) => {
+    // v3.17: the API tier retries (up to API_FETCH_ATTEMPTS, with
+    // backoff — see `fetch_api_with_retry`); only after the last
+    // attempt fails does the chain fall through to the web tier.
+    // The web tier itself is NOT retried: one attempt, as before.
+    // The final API error keeps the old single-attempt wording
+    // (it is the last attempt's error), so every existing failure
+    // message still applies.
+    let api = match fetch_api_with_retry(connector, api_timeout, on_attempt).await {
+        Ok(nodes) => Some(nodes),
+        Err(e) => {
             api_error = Some(e);
-            None
-        }
-        Err(_) => {
-            api_error = Some(format!(
-                "官方 API 拉取超时（{} 秒内无响应）",
-                api_timeout.as_secs()
-            ));
             None
         }
     };
@@ -1221,10 +1318,125 @@ mod tests {
         assert_eq!(nodes.len(), 28);
     }
 
+    /// v3.17: the retry loop itself — no network. Fail once, then
+    /// succeed: the result is the success, the callback saw a
+    /// failure on attempt 1 and success on attempt 2, and at least
+    /// one backoff was waited in between.
+    #[tokio::test]
+    async fn retry_with_backoff_succeeds_on_second_attempt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let seen: std::sync::Mutex<Vec<(usize, Option<String>)>> =
+            std::sync::Mutex::new(Vec::new());
+        let start = std::time::Instant::now();
+        let res = retry_with_backoff(
+            || {
+                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    if n < 2 {
+                        Err("boom".to_string())
+                    } else {
+                        Ok(42)
+                    }
+                }
+            },
+            3,
+            |_| Duration::from_millis(50),
+            |n, e| {
+                seen.lock().unwrap().push((n, e.map(|s| s.to_string())));
+            },
+        )
+        .await;
+        assert_eq!(res, Ok(42));
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly two attempts");
+        assert!(
+            start.elapsed() >= Duration::from_millis(50),
+            "the backoff after attempt 1 must actually be waited"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(1, Some("boom".to_string())), (2, None)],
+            "callback must report attempt 1 failed, attempt 2 succeeded"
+        );
+    }
+
+    /// v3.17: always failing — the last error is returned after
+    /// exactly 3 attempts, with both backoffs waited (50 ms +
+    /// 100 ms here, standing in for the production 1 s + 2 s).
+    #[tokio::test]
+    async fn retry_with_backoff_fails_after_three_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let seen: std::sync::Mutex<Vec<(usize, Option<String>)>> =
+            std::sync::Mutex::new(Vec::new());
+        let start = std::time::Instant::now();
+        let res: Result<i32, String> = retry_with_backoff(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Err("boom".to_string()) }
+            },
+            3,
+            |attempt| Duration::from_millis(50 * attempt as u64),
+            |n, e| {
+                seen.lock().unwrap().push((n, e.map(|s| s.to_string())));
+            },
+        )
+        .await;
+        assert_eq!(res, Err("boom".to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "exactly three attempts");
+        assert!(
+            start.elapsed() >= Duration::from_millis(150),
+            "backoffs 50 ms + 100 ms must actually be waited, took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (1, Some("boom".to_string())),
+                (2, Some("boom".to_string())),
+                (3, Some("boom".to_string())),
+            ],
+            "callback must report all three failures in order"
+        );
+    }
+
+    /// v3.17: a first-attempt success costs exactly one attempt —
+    /// no backoff, no extra calls.
+    #[tokio::test]
+    async fn retry_with_backoff_succeeds_first_try() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let res = retry_with_backoff(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<i32, String>(7) }
+            },
+            3,
+            |_| Duration::from_secs(60),
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(res, Ok(7));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// v3.17: the production backoff sequence is exponential
+    /// 1 s, 2 s, 4 s; with 3 attempts only the first two waits are
+    /// used (1 s after attempt 1, 2 s after attempt 2).
+    #[test]
+    fn api_fetch_backoff_is_exponential_1_2_4() {
+        assert_eq!(API_FETCH_ATTEMPTS, 3);
+        assert_eq!(api_fetch_backoff(1), Duration::from_secs(1));
+        assert_eq!(api_fetch_backoff(2), Duration::from_secs(2));
+        assert_eq!(api_fetch_backoff(3), Duration::from_secs(4));
+    }
+
     /// A black-holed front proxy (accepts TCP, never answers) must not
     /// hang a refresh: each tier is capped, so the whole fallback
-    /// returns in about two tier timeouts with the timeout wording.
-    /// Regression test for Leo's v3.2 startup hang (85 s, no proxy).
+    /// returns with the timeout wording. Regression test for Leo's
+    /// v3.2 startup hang (85 s, no proxy). v3.17: the API tier now
+    /// retries (3 × 2 s + 1 s + 2 s backoff = 9 s) before the web
+    /// tier runs (2 s), so the total is ~11 s, not ~4 s.
     #[tokio::test]
     async fn fetch_fallback_bounds_black_holed_proxy() {
         // Black hole: accept and hold, never send a byte.
@@ -1249,23 +1461,46 @@ mod tests {
         fp.enabled = true;
         fp.addr = format!("127.0.0.1:{}", port);
         let connector = Connector::new(Some(fp));
+        let attempts: std::sync::Mutex<Vec<(usize, Option<String>)>> =
+            std::sync::Mutex::new(Vec::new());
         let start = std::time::Instant::now();
         let upd = fetch_nodes_with_fallback_timeout(
             &connector,
             Duration::from_secs(2),
             Duration::from_secs(2),
+            |n, e| {
+                attempts
+                    .lock()
+                    .unwrap()
+                    .push((n, e.map(|s| s.to_string())));
+            },
         )
         .await;
         let elapsed = start.elapsed();
         assert!(
-            elapsed < Duration::from_secs(8),
-            "two 2 s tiers must finish well inside 8 s, took {:?}",
+            elapsed < Duration::from_secs(15),
+            "3 API attempts (3×2 s + 3 s backoff) + one 2 s web tier must finish well inside 15 s, took {:?}",
             elapsed
         );
         assert!(
-            elapsed >= Duration::from_secs(3),
-            "both tiers must actually run their timeouts, took {:?}",
+            elapsed >= Duration::from_secs(10),
+            "all tiers must actually run their timeouts + backoffs, took {:?}",
             elapsed
+        );
+        let attempts = attempts.lock().unwrap();
+        assert_eq!(
+            attempts.len(),
+            3,
+            "the API tier must attempt 3 times, saw {:?}",
+            *attempts
+        );
+        assert!(
+            attempts.iter().all(|(_, e)| e
+                .as_deref()
+                .unwrap_or("")
+                .contains("超时")),
+            "every API attempt must fail with a timeout, saw {:?}",
+            *attempts
         );
         assert!(
             matches!(upd.source, NodeListSource::Curated | NodeListSource::Cache),
@@ -1286,9 +1521,9 @@ mod tests {
 
     /// v3.15 API-only refresh ("从API刷新节点"): the same black
     /// hole must fail as an `Err` — never as a silently substituted
-    /// list. One tier, one timeout: it returns in ~2 s (not ~4 s,
-    /// which would mean the web tier ran too) with the timeout
-    /// wording, so the GUI can report the failure plainly and leave
+    /// list. v3.17: it now takes 3 attempts (3 × 2 s + 1 s + 2 s
+    /// backoff ≈ 9 s), not ~2 s — and still never runs the web
+    /// tier, so the GUI can report the failure plainly and leave
     /// the list untouched.
     #[tokio::test]
     async fn fetch_api_only_times_out_on_black_holed_proxy() {
@@ -1311,8 +1546,16 @@ mod tests {
         fp.enabled = true;
         fp.addr = format!("127.0.0.1:{}", port);
         let connector = Connector::new(Some(fp));
+        let attempts: std::sync::Mutex<Vec<(usize, Option<String>)>> =
+            std::sync::Mutex::new(Vec::new());
         let start = std::time::Instant::now();
-        let res = fetch_api_only_timeout(&connector, Duration::from_secs(2)).await;
+        let res = fetch_api_only_timeout(&connector, Duration::from_secs(2), |n, e| {
+            attempts
+                .lock()
+                .unwrap()
+                .push((n, e.map(|s| s.to_string())));
+        })
+        .await;
         let elapsed = start.elapsed();
         let err = res.expect_err("a black-holed API must fail, not return a list");
         assert!(
@@ -1321,14 +1564,26 @@ mod tests {
             err
         );
         assert!(
-            elapsed < Duration::from_secs(5),
-            "one 2 s tier must finish well inside 5 s — a second tier (web scrape) would take ~4 s, took {:?}",
+            elapsed < Duration::from_secs(12),
+            "3 attempts (3×2 s + 3 s backoff) must finish well inside 12 s — a web tier on top would take ~14 s, took {:?}",
             elapsed
         );
         assert!(
-            elapsed >= Duration::from_secs(1),
-            "the API tier must actually run its timeout, took {:?}",
+            elapsed >= Duration::from_secs(8),
+            "all 3 attempts + backoffs must actually run, took {:?}",
             elapsed
+        );
+        let attempts = attempts.lock().unwrap();
+        assert_eq!(
+            attempts.len(),
+            3,
+            "the API fetch must attempt 3 times, saw {:?}",
+            *attempts
+        );
+        assert_eq!(
+            attempts.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "attempts must be numbered 1, 2, 3 in order"
         );
     }
 }

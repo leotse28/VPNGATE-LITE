@@ -776,6 +776,27 @@ pub struct SstpTunnel {
     dead: AtomicBool,
 }
 
+/// Outcome of the post-connect tunnel check (v3.17): does the
+/// tunnel actually carry traffic, and if not, which step failed?
+/// The same two steps as the CLI `test` subcommand
+/// (`src/main.rs::cmd_test`): plain-HTTP generate_204, then HTTPS
+/// to Google — both through the tunnel. The GUI runs this
+/// automatically after every successful connect; a failure never
+/// disconnects, it only reports (see `GuiEvent::TunnelCheckResult`
+/// in the GUI).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TunnelCheckOutcome {
+    /// Both steps passed, with per-step times in milliseconds.
+    Ok {
+        generate_204_ms: u128,
+        google_ms: u128,
+    },
+    /// The generate_204 step failed (open/write/read/timeout).
+    Generate204Failed(String),
+    /// generate_204 passed, the Google HTTPS step failed.
+    GoogleFailed(String),
+}
+
 impl SstpTunnel {
     /// TCP + TLS handshake only, no tasks spawned. The returned stream
     /// is closed when dropped, so a losing candidate in a race leaves
@@ -1248,6 +1269,120 @@ impl SstpTunnel {
             if waited.is_err() {
                 continue; // retransmit SYN
             }
+        }
+    }
+
+    /// Verify the tunnel carries traffic (v3.17): plain-HTTP
+    /// generate_204 to www.gstatic.com:80, then HTTPS to
+    /// www.google.com:443 (TLS inside the tunnel). Stops at the
+    /// first failure so the report names exactly which step
+    /// failed. Each step is capped by `timeout`. This is the same
+    /// check the CLI `test` subcommand runs, factored out so the
+    /// GUI's automatic post-connect check and the tests share it.
+    pub async fn check_tunnel(self: &Arc<Self>, timeout: Duration) -> TunnelCheckOutcome {
+        let t0 = std::time::Instant::now();
+        match self.open_stream("www.gstatic.com", 80, timeout).await {
+            Ok(mut s) => {
+                let req = b"GET http://www.gstatic.com/generate_204 HTTP/1.1\r\nHost: www.gstatic.com\r\nConnection: close\r\n\r\n";
+                if let Err(e) = s.write_all(req).await {
+                    return TunnelCheckOutcome::Generate204Failed(format!(
+                        "写入请求失败：{}",
+                        e
+                    ));
+                }
+                let mut buf = vec![0u8; 4096];
+                match tokio::time::timeout(timeout, s.read(&mut buf)).await {
+                    Ok(Ok(n)) => {
+                        let head = String::from_utf8_lossy(&buf[..n]);
+                        if !head.contains("204") {
+                            return TunnelCheckOutcome::Generate204Failed(format!(
+                                "响应不是 204：{}",
+                                head.lines().next().unwrap_or("(空响应)")
+                            ));
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        return TunnelCheckOutcome::Generate204Failed(format!(
+                            "读取响应失败：{}",
+                            e
+                        ));
+                    }
+                    Err(_) => {
+                        return TunnelCheckOutcome::Generate204Failed(format!(
+                            "{} 秒内无响应",
+                            timeout.as_secs()
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                return TunnelCheckOutcome::Generate204Failed(format!(
+                    "打不开到 www.gstatic.com:80 的隧道流：{}",
+                    e
+                ));
+            }
+        }
+        let generate_204_ms = t0.elapsed().as_millis();
+        match self.open_stream("www.google.com", 443, timeout).await {
+            Ok(stream) => {
+                match tokio::time::timeout(
+                    timeout,
+                    crate::net::verified_tls_connect(stream, "www.google.com"),
+                )
+                .await
+                {
+                    Ok(Ok(mut tls)) => {
+                        let req = format!(
+                            "GET / HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\nUser-Agent: vpngate-client/{}\r\n\r\n",
+                            env!("CARGO_PKG_VERSION")
+                        );
+                        if let Err(e) = tls.write_all(req.as_bytes()).await {
+                            return TunnelCheckOutcome::GoogleFailed(format!(
+                                "TLS 写入失败：{}",
+                                e
+                            ));
+                        }
+                        let mut buf = vec![0u8; 4096];
+                        match tokio::time::timeout(timeout, tls.read(&mut buf)).await {
+                            Ok(Ok(_n)) => {}
+                            Ok(Err(e)) => {
+                                return TunnelCheckOutcome::GoogleFailed(format!(
+                                    "TLS 读取失败：{}",
+                                    e
+                                ));
+                            }
+                            Err(_) => {
+                                return TunnelCheckOutcome::GoogleFailed(format!(
+                                    "TLS 读取 {} 秒内无响应",
+                                    timeout.as_secs()
+                                ));
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        return TunnelCheckOutcome::GoogleFailed(format!(
+                            "TLS 握手失败：{}",
+                            e
+                        ));
+                    }
+                    Err(_) => {
+                        return TunnelCheckOutcome::GoogleFailed(format!(
+                            "TLS 握手 {} 秒内无响应",
+                            timeout.as_secs()
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                return TunnelCheckOutcome::GoogleFailed(format!(
+                    "打不开到 www.google.com:443 的隧道流：{}",
+                    e
+                ));
+            }
+        }
+        TunnelCheckOutcome::Ok {
+            generate_204_ms,
+            google_ms: t0.elapsed().as_millis() - generate_204_ms,
         }
     }
 

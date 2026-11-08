@@ -1,6 +1,6 @@
 [package]
 name = "vpngate-client"
-version = "0.3.16"
+version = "0.3.17"
 edition = "2021"
 description = "Minimal Rust client for VPNGate volunteer nodes over MS-SSTP + PPP, exposing a local SOCKS5 port (no TUN, no GUI)"
 license = "MIT"
@@ -12,10 +12,30 @@ path = "src/main.rs"
 [[bin]]
 name = "vpngate-gui"
 path = "src/bin/vpngate-gui.rs"
+# The GUI binary needs the `gui` feature; without it cargo skips this
+# target instead of failing on the missing eframe/rfd/arboard deps
+# (so `cargo check --no-default-features` stays usable for the
+# Android .so build, which only needs the lib + CLI).
+required-features = ["gui"]
 
 [lib]
 name = "vpngate_client"
 path = "src/lib.rs"
+
+[features]
+default = ["gui"]
+# Desktop GUI only: eframe/egui (GUI binary), rfd (file dialogs),
+# arboard (clipboard), image (tray/window icon PNG decoding in
+# src/tray.rs). The library core — SSTP/PPP tunnel, SOCKS5 server,
+# node list, DoH — needs none of these; Android builds the lib with
+# --no-default-features and links it as a .so.
+# egui_kittest stays an unconditional dev-dependency: cargo forbids
+# optional dev-dependencies. It is only used by the GUI binary's
+# #[cfg(test)] module, so a non-test --no-default-features build
+# (the Android .so case) never compiles it; `cargo test
+# --no-default-features --lib` still builds it as a dev-dep, which
+# is harmless — the lib itself no longer depends on any GUI crate.
+gui = ["dep:eframe", "dep:rfd", "dep:arboard", "dep:image"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -33,14 +53,15 @@ toml = "0.8"
 rand = "0.8"
 # Local timestamps for the GUI file log (src/filelog.rs).
 chrono = "0.4"
-eframe = "0.36"
-rfd = "0.18.0"
-arboard = "3"
+eframe = { version = "0.36", optional = true }
+rfd = { version = "0.18.0", optional = true }
+arboard = { version = "3", optional = true }
 # Decode assets/icon.ico's PNG entry into RGBA for the tray icon
 # (src/tray.rs, v3.12); already in the tree via arboard/eframe.
 # PNG only — default features would pull every decoder into both
 # binaries (measured +10 MB on the GUI); eframe uses png-only too.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# GUI-only: only src/tray.rs (gated behind the `gui` feature) uses it.
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
 # Windows only: verified HTTPS (vpngate.net API / web scrape, DoH,
 # front-proxy test) and node SSTP both go through the OS TLS stack

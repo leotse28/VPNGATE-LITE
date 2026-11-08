@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vpngate_client::net::Connector;
-use vpngate_client::sstp::SstpTunnel;
+use vpngate_client::sstp::{SstpTunnel, TunnelCheckOutcome};
 
 struct MockServer(Option<Child>);
 
@@ -200,6 +200,35 @@ async fn gui_connect_flow_against_mock() {
 
     serve.abort();
     drop(tunnel); // last tunnel ref: writer task shuts TLS down
+}
+
+/// v3.17: the automatic post-connect tunnel check
+/// (`SstpTunnel::check_tunnel`) runs generate_204 + Google HTTPS
+/// through the tunnel and reports which step failed. Against the
+/// mock, generate_204 passes (the mock answers every tunnel stream
+/// with a canned 204) but the Google TLS handshake cannot complete
+/// (the mock is not a TLS server), so the outcome must be
+/// `GoogleFailed` — proving the check got past step 1 and blamed
+/// step 2, not step 1.
+#[tokio::test]
+async fn tunnel_check_against_mock_blames_google_step() {
+    let Some((_guard, _mock, tunnel)) = setup_mock_tunnel().await else {
+        return;
+    };
+    let outcome = tunnel.check_tunnel(Duration::from_secs(10)).await;
+    match outcome {
+        TunnelCheckOutcome::GoogleFailed(detail) => {
+            assert!(
+                detail.contains("TLS"),
+                "the Google step must fail at TLS, got: {}",
+                detail
+            );
+        }
+        other => panic!(
+            "expected GoogleFailed (generate_204 passes against the mock), got {:?}",
+            other
+        ),
+    }
 }
 
 /// Shared mock setup for the mixed-proxy tests: lock the mock for

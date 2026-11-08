@@ -11,6 +11,12 @@ pub mod single_instance;
 pub mod socks5;
 pub mod sstp;
 pub mod sysproxy;
+/// Desktop GUI only (behind the `gui` feature): the tray icon decode
+/// uses the `image` crate and the live handle uses Windows-only
+/// `tray-icon`, so the whole module — including its tests — is
+/// excluded from `--no-default-features` (Android .so) builds.
+/// Only the GUI binary uses it; the CLI never did.
+#[cfg(feature = "gui")]
 pub mod tray;
 pub mod util;
 pub mod vpngate;
