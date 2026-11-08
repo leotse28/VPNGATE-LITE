@@ -10,7 +10,7 @@ Linux 版只用来在本机验证编译和逻辑，不作为交付物。
 
 ```
 vpngate-gui.exe      （约 38 MB，图形界面）
-vpngate-client.exe   （约 10 MB，命令行版）
+vpngate-client.exe   （约 15 MB，命令行版）
 ```
 
 双击 `vpngate-gui.exe` 就能打开，不用装 Rust。注意两点：

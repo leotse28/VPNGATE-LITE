@@ -2,11 +2,36 @@
 
 一个最小的 Rust 客户端：连 VPNGate 的志愿者节点（MS-SSTP + PPP），
 在本地开一个混合代理端口（SOCKS5 + HTTP，默认 `127.0.0.1:10818`），浏览器/应用连这个端口就能走隧道上网。
-没有图形界面、没有 TUN 虚拟网卡、没有 OpenVPN，只有下面这几个功能。
+有图形界面版（`vpngate-gui`）和命令行版（`vpngate-client`），共用同一套隧道代码；
+没有 TUN 虚拟网卡、没有 OpenVPN。
 
 > 背景：之前用 Cloudflare Worker + VPNGate 的方案（Worker 里用 JS 跑 SSTP/PPP），
 > 在 NekoBox 里显示“已连接”却打不开网页。这个客户端把同一套协议搬到本机 Rust 实现，
 > 直接连节点，少一跳，也方便排错。
+
+## 快速上手（Windows，图形界面）
+
+日常使用走图形界面，七步：
+
+1. 去仓库 **Releases** 下载最新版（`VPNGATE LITE vX.Y 便携版`）的
+   `VPNGATE-LITE-windows-vX.Y.zip`，解压到一个文件夹（例如桌面上的 `vpn` 文件夹）。
+2. 从旧版升级时：把旧文件夹里的 `config.toml` 和 `nodes_cache.json` 复制到新版 exe 旁边，
+   设置和节点列表就都在了；不拷就是全新默认设置。
+3. 双击 `vpngate-gui.exe` 打开（不用装 Rust；第一次可能被 SmartScreen 拦，
+   点“更多信息”→“仍要运行”）。
+4. 先确认前置代理：如果你的网络直连打不开 vpngate.net，先在 NekoBox 里连上你的前置节点，
+   再在客户端“高级设置”里打开前置 SOCKS5、填好地址（默认 `127.0.0.1:2080`），
+   点“测试前置代理”确认能通 Google 和 vpngate.net。直连能打开 vpngate.net 时这一步可以跳过。
+5. 点右上角“刷新节点”拉列表（启动时不自动刷新）；选一行点“探测”，延迟出来后点“连接”
+   （或按回车）。状态栏出现虚拟 IP 就是连上了。
+6. 浏览器代理设为 SOCKS5 `127.0.0.1:10818`（勾选远程 DNS），或 HTTP `127.0.0.1:10818`，
+   打开 Google 试试；也可以打开“设置系统代理”开关，让程序自动设系统代理（退出时自动还原）。
+7. 用完点“断开连接”。点右上角 X 是藏到托盘（任务栏图标消失，右键托盘图标可显示主界面、
+   重启客户端或退出），不是退出程序。
+
+手机上网：打开“允许局域网分享”，手机（v2rayNG 等）把代理指到这台电脑的 IP:10818，
+DNS 与 QUIC 会经隧道的 UDP 中继走，不用再关 QUIC。报问题时把 exe 旁边的
+`vpngate-gui.log` 一起发来。命令行版的用法见下面“用法”一节；自己编译见 WINDOWS.md。
 
 ## 功能
 
@@ -149,10 +174,9 @@ cargo run --release --bin vpngate-gui
 # 或者直接跑编好的：./target/release/vpngate-gui
 ```
 
-**Windows 10 用户**：源码在 GitHub 仓库的 main 分支，编好的 Windows 程序
-（`vpngate-gui.exe`、`vpngate-client.exe`）在仓库的 **Releases** 里下载，
-双击就能打开，不用装 Rust。只验证了编出来，没在 Windows 上跑过，
-第一次打开如果报缺 DLL，把报错发回来。自己编的步骤见 WINDOWS.md。
+**Windows 10 用户**：编好的 Windows 程序（`vpngate-gui.exe`、`vpngate-client.exe`）
+在仓库的 **Releases** 里下载，双击就能打开，不用装 Rust。日常使用步骤见上面
+“快速上手”，自己编译的步骤见 WINDOWS.md。
 
 窗口是 800×600（最小 560×420），中文界面，主题跟随系统。用法：
 
