@@ -468,11 +468,11 @@ pub fn parse_web_page(html: &str) -> Vec<Node> {
             out.push(Node {
                 host,
                 port: Some(port.unwrap_or(443)),
-                country: if country.is_empty() {
-                    "未知".to_string()
-                } else {
-                    country.clone()
-                },
+                // An empty country stays empty — the table shows
+                // "—" for it. No literal placeholder ("未知" etc.)
+                // in a data field: v3.12 removes every such
+                // placeholder (import "导入", manual "手动", here).
+                country: country.clone(),
                 country_code: String::new(),
                 isp: isp.clone(),
                 name: String::new(),

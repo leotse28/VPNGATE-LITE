@@ -20,6 +20,7 @@ use vpngate_client::filelog::{self, FileLogger, LogLevel};
 use vpngate_client::net::{self, Connector};
 use vpngate_client::sstp::SstpTunnel;
 use vpngate_client::sysproxy::SystemProxyGuard;
+use vpngate_client::tray;
 use vpngate_client::vpngate::{self, Node};
 
 // ---------------------------------------------------------------------------
@@ -589,19 +590,74 @@ fn parse_manual_target(text: &str, curated_len: usize) -> Result<String, String>
     Err("格式不对：主机名:端口，例如 kanratown.opengw.net:992".to_string())
 }
 
-/// One `host:port` line per node, in the given (display) order.
+/// Build the node a manual add creates. No literal placeholder
+/// values: country/operator stay empty (the table shows "—") and
+/// `name` stays empty so the operator cell cannot fall back to a
+/// "host:port" string. v3.11 wrote "手动" / "手动添加" here — the
+/// same class of bug as the import path's "导入" (v3.12 removes
+/// every such placeholder; see also the scrape path in vpngate.rs).
+fn manual_node(host: String, port: Option<u16>) -> Node {
+    Node {
+        host,
+        port,
+        country: String::new(),
+        country_code: String::new(),
+        isp: String::new(),
+        name: String::new(),
+        score: 0,
+        ping_ms: 0,
+        speed_mbps: 0,
+        sessions: 0,
+        ip: String::new(),
+        backups: Vec::new(),
+        port_source: "manual".to_string(),
+        source: "manual".to_string(),
+    }
+}
+
+/// One line per node, in the given (display) order: `host:port`
+/// first, then the four metadata columns tab-separated — country,
+/// operator, user count, line quality in Mbps:
+/// `vpn547433109.opengw.net:995\t日本\tIIJ\t47\t572`.
 /// The host is the completed DDNS hostname — the same target a
 /// connect dials (a bare API label like "public-vpn-192" becomes
 /// "public-vpn-192.opengw.net"). A node with no known port exports
 /// as a bare host: the app never invents a port (API nodes arrive
 /// port-less and connect tries 443/992/995 in parallel, so no
-/// single port is "the" port for them).
+/// single port is "the" port for them). Latency is NOT exported —
+/// it is measured live and re-probed after an import. Empty fields
+/// mean unknown (sessions/speed are 0 when the node carries no
+/// stats); country/operator are sanitized so a stray tab or newline
+/// in the data can never break the line format. The first field
+/// stays a plain `host:port`, so the text is still usable as a bare
+/// host list by anything that only reads the first field.
 fn export_nodes_text(nodes: &[Node]) -> String {
     nodes
         .iter()
-        .map(|n| match n.port {
-            Some(p) => format!("{}:{}", vpngate::complete_ddns_host(&n.host), p),
-            None => vpngate::complete_ddns_host(&n.host),
+        .map(|n| {
+            let hostport = match n.port {
+                Some(p) => format!("{}:{}", vpngate::complete_ddns_host(&n.host), p),
+                None => vpngate::complete_ddns_host(&n.host),
+            };
+            let field = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+            let sessions = if n.sessions == 0 {
+                String::new()
+            } else {
+                n.sessions.to_string()
+            };
+            let speed = if n.speed_mbps == 0 {
+                String::new()
+            } else {
+                n.speed_mbps.to_string()
+            };
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                hostport,
+                field(&n.country),
+                field(&n.isp),
+                sessions,
+                speed
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -614,27 +670,49 @@ enum ImportLine {
     /// Not a `host[:port]` line: counted, never fails the import.
     Malformed,
     /// A node to add (`port` is `None` for a bare hostname — the
-    /// connect path then tries the candidate ports).
-    Node { host: String, port: Option<u16> },
+    /// connect path then tries the candidate ports). `host` is
+    /// already completed (a bare label gains `.opengw.net`).
+    /// `country` / `isp` are empty when the line carries no metadata
+    /// (old plain `host:port` lines); `sessions` and `speed_mbps`
+    /// are 0 then — unknown, shown as "—". Never a literal
+    /// placeholder value: v3.11 stamped "导入" here, v3.12 removes it.
+    Node {
+        host: String,
+        port: Option<u16>,
+        country: String,
+        isp: String,
+        sessions: u64,
+        speed_mbps: u64,
+    },
 }
 
-/// Parse one import line. A hostname is ASCII letters/digits, `.`
-/// and `-` (the same alphabet `parse_manual_target` accepts for a
-/// bare host); a port, when present, must be 1–65535. A bare
-/// VPNGate label without a dot ("public-vpn-192") is accepted — it
-/// completes to `.opengw.net` when dialled, unlike the manual-add
-/// field, which insists on a dot to keep out stray numbers.
+/// Parse one import line. Two formats, both accepted:
+/// * new (v3.12 export): `host:port\tcountry\tisp\tsessions\tspeed`
+///   — the four metadata columns are restored; empty fields mean
+///   unknown;
+/// * old (v3.11 and earlier): a plain `host:port` or bare hostname
+///   — metadata stays empty.
+/// A hostname is ASCII letters/digits, `.` and `-` (the same
+/// alphabet `parse_manual_target` accepts for a bare host); a port,
+/// when present, must be 1–65535; sessions/speed, when present,
+/// must be numbers. A bare VPNGate label without a dot
+/// ("public-vpn-192") is accepted and completed to `.opengw.net`
+/// here, so the stored host is always the full FQDN.
 fn parse_import_line(line: &str) -> ImportLine {
     let t = line.trim();
     if t.is_empty() || t.starts_with('#') {
         return ImportLine::Skip;
+    }
+    let parts: Vec<&str> = t.split('\t').collect();
+    if parts.len() > 5 {
+        return ImportLine::Malformed;
     }
     let valid_host = |h: &str| {
         !h.is_empty()
             && h.chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
     };
-    match t.rsplit_once(':') {
+    let (host, port) = match parts[0].rsplit_once(':') {
         Some((h, p)) if !p.is_empty() => {
             let Ok(port) = p.parse::<u16>() else {
                 return ImportLine::Malformed;
@@ -642,22 +720,39 @@ fn parse_import_line(line: &str) -> ImportLine {
             if port == 0 || !valid_host(h) {
                 return ImportLine::Malformed;
             }
-            ImportLine::Node {
-                host: h.to_string(),
-                port: Some(port),
-            }
+            (h.to_string(), Some(port))
         }
-        Some(_) => ImportLine::Malformed,
+        Some(_) => return ImportLine::Malformed,
         None => {
-            if valid_host(t) {
-                ImportLine::Node {
-                    host: t.to_string(),
-                    port: None,
-                }
+            if valid_host(parts[0]) {
+                (parts[0].to_string(), None)
             } else {
-                ImportLine::Malformed
+                return ImportLine::Malformed;
             }
         }
+    };
+    let field = |i: usize| parts.get(i).map(|s| s.trim()).unwrap_or("");
+    let number = |i: usize| -> Option<u64> {
+        let s = field(i);
+        if s.is_empty() {
+            Some(0)
+        } else {
+            s.parse::<u64>().ok()
+        }
+    };
+    let Some(sessions) = number(3) else {
+        return ImportLine::Malformed;
+    };
+    let Some(speed_mbps) = number(4) else {
+        return ImportLine::Malformed;
+    };
+    ImportLine::Node {
+        host: vpngate::complete_ddns_host(&host),
+        port,
+        country: field(1).to_string(),
+        isp: field(2).to_string(),
+        sessions,
+        speed_mbps,
     }
 }
 
@@ -673,8 +768,9 @@ struct ImportReport {
 
 /// One-line refresh summary, logged for every refresh so a small
 /// list is diagnosable at a glance: which source served the list,
-/// how many hosts the refresh cleared from the blocklist first,
-/// and how many nodes the list finally holds.
+/// how many hosts the refresh cleared from the blocklist first, how
+/// many manual/imported nodes the merge kept (v3.12), and how many
+/// nodes the list finally holds.
 ///
 /// v3.11 semantics (Leo's call, 2026-11-08): delete is session-only
 /// hiding — a refresh clears the blocklist before fetching, so the
@@ -688,6 +784,7 @@ fn refresh_summary_line(
     source: vpngate::NodeListSource,
     cleared: usize,
     final_count: usize,
+    retained: usize,
 ) -> String {
     let name = match source {
         vpngate::NodeListSource::Api => "官方 API",
@@ -695,10 +792,17 @@ fn refresh_summary_line(
         vpngate::NodeListSource::Cache => "缓存",
         vpngate::NodeListSource::Curated => "内嵌列表",
     };
-    format!(
-        "刷新完成（{}）：已清空屏蔽 {} 个，获取到 {} 个。",
-        name, cleared, final_count
-    )
+    if retained == 0 {
+        format!(
+            "刷新完成（{}）：已清空屏蔽 {} 个，获取到 {} 个。",
+            name, cleared, final_count
+        )
+    } else {
+        format!(
+            "刷新完成（{}）：已清空屏蔽 {} 个，获取到 {} 个（含手动/导入保留 {} 个）。",
+            name, cleared, final_count, retained
+        )
+    }
 }
 
 /// Read the system clipboard as text (`arboard`). Used by the
@@ -907,6 +1011,20 @@ struct GuiApp {
     manual_host: String,
     manual_error: String,
     show_about: bool,
+    /// System tray (v3.12, Windows only): the live tray icon.
+    /// `None` on Linux and when tray creation failed on Windows —
+    /// then X quits as before. Dropping the handle removes the icon,
+    /// so the quit path `take()`s it.
+    #[cfg(windows)]
+    tray: Option<vpngate_client::tray::TrayHandle>,
+    /// An explicit quit was requested (File menu 退出 / tray menu
+    /// 退出): the next close request really quits instead of hiding
+    /// to the tray. Set just before sending `ViewportCommand::Close`.
+    quit_requested: bool,
+    /// The main window is currently hidden in the tray.
+    hidden_to_tray: bool,
+    /// The one-time "已最小化到托盘…" hint has been shown.
+    tray_hint_shown: bool,
     font_ok: bool,
     /// Last auto-save failure message (to show a repeated failure once).
     last_save_error: String,
@@ -966,6 +1084,11 @@ impl Default for GuiApp {
             manual_host: String::new(),
             manual_error: String::new(),
             show_about: false,
+            #[cfg(windows)]
+            tray: None,
+            quit_requested: false,
+            hidden_to_tray: false,
+            tray_hint_shown: false,
             font_ok: false,
             last_save_error: String::new(),
             file_logger: None,
@@ -1112,6 +1235,14 @@ impl GuiApp {
         // File log: from here on every log_line / log_warn / log_error
         // (and every set_error) is also appended to vpngate-gui.log.
         app.init_file_log();
+        // System tray (v3.12, Windows only): X hides to the tray.
+        // A failure here is not fatal — log it and run without a
+        // tray, so X quits as before.
+        #[cfg(windows)]
+        match vpngate_client::tray::TrayHandle::new() {
+            Ok(t) => app.tray = Some(t),
+            Err(e) => app.log_warn(format!("托盘创建失败：{e}，点 X 会直接退出。")),
+        }
         if !app.font_ok {
             app.log_warn("未找到系统里的中文字体，中文可能显示为方框。".to_string());
         }
@@ -1680,12 +1811,115 @@ impl GuiApp {
         self.error.clear();
     }
 
+    /// Whether a live tray icon exists (Windows only; always false
+    /// on Linux, where there is no tray).
+    fn tray_active(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.tray.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// Apply the state half of a close decision: hiding sets the
+    /// flag and, the first time, the status/log hint. The caller
+    /// sends the matching viewport commands (CancelClose +
+    /// Visible(false) for HideToTray); Quit needs no state here —
+    /// `perform_quit` does the work.
+    fn apply_close(&mut self, decision: tray::CloseDecision) {
+        if decision == tray::CloseDecision::HideToTray {
+            self.hidden_to_tray = true;
+            if !self.tray_hint_shown {
+                self.tray_hint_shown = true;
+                self.status = tray::TRAY_HINT.to_string();
+                self.log_line(tray::TRAY_HINT.to_string());
+            }
+        }
+    }
+
+    /// The real-quit path, shared by the File-menu 退出, the tray
+    /// 退出, and (via close_requested) the X button when there is no
+    /// tray: disconnect first, persist settings, drop the tray icon
+    /// (dropping the handle removes it from the tray).
+    fn perform_quit(&mut self) {
+        self.disconnect();
+        self.auto_save_if_dirty();
+        #[cfg(windows)]
+        {
+            self.tray.take();
+        }
+    }
+
+    /// Show the main window again after hiding to the tray
+    /// (Windows only — only the tray calls it).
+    #[cfg(windows)]
+    fn show_main_window(&mut self, ctx: &egui::Context) {
+        self.hidden_to_tray = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// Restart the client: launch a fresh instance of this exe
+    /// (same arguments) and quit this one. The new instance starts
+    /// disconnected; the tunnel is never restored automatically.
+    /// (Windows only — only the tray calls it.)
+    #[cfg(windows)]
+    fn restart_client(&mut self, ctx: &egui::Context) {
+        match tray::restart_command() {
+            Ok((exe, args)) => {
+                match std::process::Command::new(&exe).args(&args).spawn() {
+                    Ok(_) => {
+                        self.log_line("正在重启客户端……".to_string());
+                        self.quit_requested = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Err(e) => {
+                        self.error = format!("重启失败：{e}");
+                        self.log_line(format!("重启客户端失败：{e}。"));
+                    }
+                }
+            }
+            Err(e) => {
+                self.error = format!("重启失败：{e}");
+                self.log_line(format!("重启客户端失败：找不到当前程序路径：{e}。"));
+            }
+        }
+    }
+
+    /// Drain tray-icon and menu events (Windows only) and act on
+    /// them. Runs every frame from `update`.
+    #[cfg(windows)]
+    fn poll_tray_events(&mut self, ctx: &egui::Context) {
+        let requests = match &self.tray {
+            Some(t) => t.drain_requests(),
+            None => return,
+        };
+        for req in requests {
+            match req {
+                tray::TrayRequest::Show => self.show_main_window(ctx),
+                tray::TrayRequest::Restart => self.restart_client(ctx),
+                tray::TrayRequest::Quit => {
+                    self.quit_requested = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
     /// Apply one background-task result. Pure state update, no egui calls,
     /// so headless tests can drive it.
     fn apply_event(&mut self, ev: GuiEvent) {
         match ev {
             GuiEvent::Nodes(upd) => {
                 self.busy = None;
+                // Merge first (v3.12): manual/imported nodes the
+                // fresh list lacks are kept, appended at the end, so
+                // a refresh no longer drops them. The cache stores
+                // the merged list, so they survive a restart too.
+                let (merged, retained) = self.merge_refresh_nodes(upd.nodes);
                 // A fresh list from the API or the web scrape is worth
                 // caching, so the next failed refresh still has a recent
                 // list to show.
@@ -1693,7 +1927,7 @@ impl GuiApp {
                     upd.source,
                     vpngate::NodeListSource::Api | vpngate::NodeListSource::WebScrape
                 ) {
-                    let _ = vpngate::save_cached_nodes(&upd.nodes);
+                    let _ = vpngate::save_cached_nodes(&merged);
                 }
                 // The blocklist was cleared when this refresh started
                 // (see `start_fetch`), so the incoming list is shown
@@ -1704,13 +1938,13 @@ impl GuiApp {
                 // filters (only an explicit refresh clears).
                 // (The cache above still stores the full list.)
                 let cleared = std::mem::take(&mut self.refresh_cleared_blocked);
-                self.nodes = self.apply_blocklist(upd.nodes);
+                self.nodes = self.apply_blocklist(merged);
                 let n = self.nodes.len();
                 // One explicit line for every refresh — source, how
-                // many blocked hosts the refresh cleared first, and
-                // the final count — so a small list is diagnosable
-                // at a glance.
-                self.log_line(refresh_summary_line(upd.source, cleared, n));
+                // many blocked hosts the refresh cleared first, how
+                // many manual/imported nodes it kept, and the final
+                // count — so a small list is diagnosable at a glance.
+                self.log_line(refresh_summary_line(upd.source, cleared, n, retained));
                 self.nodes_source = upd.source.label(n, upd.cache_age_secs);
                 self.clear_selection();
                 match upd.source {
@@ -2332,6 +2566,52 @@ impl GuiApp {
             .collect()
     }
 
+    /// Merge a fresh list with the manual/imported nodes a refresh
+    /// must not drop (v3.12 — before this, a refresh replaced the
+    /// whole list, so a manually added or imported node vanished at
+    /// the next refresh). Nodes whose `source` is "manual" or
+    /// "import" and whose completed host is absent from the incoming
+    /// list are appended at the end, in their current order; the
+    /// count of kept nodes is returned alongside the merged list.
+    /// When the incoming list has the same completed host, the
+    /// incoming row wins for metadata (country/operator/users/
+    /// quality) and the manual copy is dropped — except its port:
+    /// the API never carries an SSTP port, so a manual port survives
+    /// when the incoming row has none.
+    fn merge_refresh_nodes(&self, incoming: Vec<Node>) -> (Vec<Node>, usize) {
+        let mut merged = incoming;
+        let mut index_by_host: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (i, n) in merged.iter().enumerate() {
+            index_by_host
+                .entry(Self::blocked_key(&n.host))
+                .or_insert(i);
+        }
+        let mut retained = 0usize;
+        for n in &self.nodes {
+            if n.source != "manual" && n.source != "import" {
+                continue;
+            }
+            let key = Self::blocked_key(&n.host);
+            match index_by_host.get(&key) {
+                Some(&i) => {
+                    if merged[i].port.is_none() {
+                        if let Some(p) = n.port {
+                            merged[i].port = Some(p);
+                            merged[i].port_source = n.port_source.clone();
+                        }
+                    }
+                }
+                None => {
+                    index_by_host.insert(key, merged.len());
+                    merged.push(n.clone());
+                    retained += 1;
+                }
+            }
+        }
+        (merged, retained)
+    }
+
     /// The selected nodes in display order (see `display_indices`,
     /// so a sorted list exports in the shown order). Cloned: the
     /// export text is built from this snapshot.
@@ -2464,7 +2744,14 @@ impl GuiApp {
             match parse_import_line(line) {
                 ImportLine::Skip => {}
                 ImportLine::Malformed => report.malformed += 1,
-                ImportLine::Node { host, port } => {
+                ImportLine::Node {
+                    host,
+                    port,
+                    country,
+                    isp,
+                    sessions,
+                    speed_mbps,
+                } => {
                     let key = Self::blocked_key(&host);
                     if self
                         .nodes
@@ -2477,21 +2764,24 @@ impl GuiApp {
                     if self.blocked_hosts.remove(&key) {
                         report.unblocked.push(key);
                     }
-                    let target = match port {
-                        Some(p) => format!("{}:{}", host, p),
-                        None => host.clone(),
-                    };
+                    // No literal placeholder values: country/isp
+                    // stay empty when the line carries no metadata
+                    // (the table shows "—" for them), and `name`
+                    // stays empty so the operator cell cannot fall
+                    // back to a "host:port" string. v3.11 stamped
+                    // "导入" into both fields here — that is the
+                    // bug Leo's screenshot shows.
                     self.nodes.push(Node {
                         host,
                         port,
-                        country: "导入".to_string(),
+                        country,
                         country_code: String::new(),
-                        isp: "导入".to_string(),
-                        name: target,
+                        isp,
+                        name: String::new(),
                         score: 0,
                         ping_ms: 0,
-                        speed_mbps: 0,
-                        sessions: 0,
+                        speed_mbps,
+                        sessions,
                         ip: String::new(),
                         backups: Vec::new(),
                         port_source: "import".to_string(),
@@ -2716,6 +3006,18 @@ impl eframe::App for GuiApp {
                 self.move_selection(1);
             }
         }
+        // Del deletes the selected nodes — the same path (and the
+        // same guards) as the 删除选中 button: nothing selected or
+        // a job running means nothing happens, a connected node is
+        // skipped and logged. Same focus guard as the shortcuts
+        // above: in a text field Del deletes a character, never a
+        // node; with the About window open it does nothing.
+        if !text_focused
+            && !self.show_about
+            && ctx.input(|i| i.key_pressed(egui::Key::Delete))
+        {
+            self.delete_selected();
+        }
         // Ctrl+C exports the selection, Ctrl+V imports from the
         // clipboard (see `handle_clipboard_events`): same focus
         // guard as the shortcuts above — a focused text field owns
@@ -2724,11 +3026,35 @@ impl eframe::App for GuiApp {
         if !text_focused && !self.show_about {
             self.handle_clipboard_events(&ctx);
         }
-        // Quitting while connected disconnects first (no confirm needed).
+        // Tray (Windows): drain tray-icon + menu events first, so a
+        // tray click can show the window on this very frame.
+        #[cfg(windows)]
+        self.poll_tray_events(&ctx);
+        // While hidden in the tray the window gets no input, so keep
+        // the event loop ticking — otherwise the tray poll above
+        // would never run and a tray click could not bring the
+        // window back.
+        if self.hidden_to_tray {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        // Quitting while connected disconnects first (no confirm
+        // needed). With a live tray (Windows) an X click hides the
+        // window to the tray instead of quitting — only an explicit
+        // quit (File menu 退出 / tray menu 退出, which set
+        // `quit_requested` first) really exits. The close-requested
+        // check is the eframe 0.36 mechanism (see epi.rs:
+        // `close_requested()` + `ViewportCommand::CancelClose`).
         if ui.ctx().input(|i| i.viewport().close_requested()) {
-            self.disconnect();
-            // Persist any unsaved setting change before the window goes.
-            self.auto_save_if_dirty();
+            match tray::decide_close(self.tray_active(), self.quit_requested) {
+                tray::CloseDecision::HideToTray => {
+                    self.apply_close(tray::CloseDecision::HideToTray);
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
+                tray::CloseDecision::Quit => self.perform_quit(),
+            }
         }
 
         egui::Panel::top("menu_bar").show(ui, |ui| {
@@ -2789,6 +3115,10 @@ impl eframe::App for GuiApp {
                     }
                     ui.separator();
                     if ui.button("退出").clicked() {
+                        // An explicit quit, not an X click: mark it
+                        // so the close-requested handler really quits
+                        // instead of hiding to the tray.
+                        self.quit_requested = true;
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
@@ -2926,9 +3256,22 @@ impl eframe::App for GuiApp {
                             // Full text here: the cells truncate with "…"
                             // to the current column width (see below), so
                             // widening a column shows more instead of a
-                            // fixed 12/14-character cut.
-                            n.country.clone(),
-                            if n.isp.is_empty() { n.name.clone() } else { n.isp.clone() },
+                            // fixed 12/14-character cut. Empty
+                            // country/operator shows "—": no literal
+                            // placeholder value ("导入", "手动", "未知")
+                            // is ever stored in these fields (v3.12).
+                            if n.country.is_empty() {
+                                "—".to_string()
+                            } else {
+                                n.country.clone()
+                            },
+                            if !n.isp.is_empty() {
+                                n.isp.clone()
+                            } else if !n.name.is_empty() {
+                                n.name.clone()
+                            } else {
+                                "—".to_string()
+                            },
                             sessions_cell(n),
                             quality_cell(n),
                             // All curated hosts end in .opengw.net; drop
@@ -3510,7 +3853,7 @@ impl eframe::App for GuiApp {
                         self.can_delete(),
                         egui::Button::new(delete_label).min_size(btn_size),
                     )
-                    .on_hover_text("删除选中的节点，并记入屏蔽列表（本次会话里隐藏，刷新后会带回来）")
+                    .on_hover_text("删除选中的节点，并记入屏蔽列表（本次会话里隐藏，刷新后会带回来；或按 Del 键）")
                     .on_disabled_hover_text(if n_sel == 0 {
                         "请先选择要删除的节点（单击选一行，Ctrl+单击多选）"
                     } else {
@@ -3596,22 +3939,9 @@ impl eframe::App for GuiApp {
                                         Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()),
                                         None => (target.clone(), None),
                                     };
-                                    let node = Node {
-                                        host,
-                                        port,
-                                        country: "手动".to_string(),
-                                        country_code: String::new(),
-                                        isp: "手动添加".to_string(),
-                                        name: target.clone(),
-                                        score: 0,
-                                        ping_ms: 0,
-                                        speed_mbps: 0,
-                                        sessions: 0,
-                                        ip: String::new(),
-                                        backups: Vec::new(),
-                                        port_source: "manual".to_string(),
-                                        source: "manual".to_string(),
-                                    };
+                                    // The node itself is built by
+                                    // `manual_node` (no placeholders).
+                                    let node = manual_node(host, port);
                                     self.nodes.insert(0, node);
                                     // The insert shifts every old index
                                     // by one, so the old multi-select
@@ -4542,6 +4872,9 @@ mod tests {
     #[test]
     fn export_nodes_text_joins_display_order_with_ports() {
         // Order is the caller's (display) order, not sorted here.
+        // v3.12 format: host:port, then country / operator / users
+        // / speed-Mbps tab-separated (the node() fixture carries
+        // isp "NTT", 1 session, 50 Mbps).
         let mut a = node_in("b.opengw.net", "美国");
         a.port = Some(443);
         let mut b = node_in("a.opengw.net", "日本");
@@ -4550,7 +4883,7 @@ mod tests {
         c.port = Some(995);
         assert_eq!(
             export_nodes_text(&[a, b, c]),
-            "b.opengw.net:443\na.opengw.net:992\nc.opengw.net:995"
+            "b.opengw.net:443\t美国\tNTT\t1\t50\na.opengw.net:992\t日本\tNTT\t1\t50\nc.opengw.net:995\t德国\tNTT\t1\t50"
         );
     }
 
@@ -4559,13 +4892,16 @@ mod tests {
         // A port-less node (API nodes arrive without one) exports
         // as a bare host — never an invented port — and a bare API
         // label is completed, the same target a connect dials.
+        // Metadata columns are still appended (empty when unknown).
         let mut a = node_in("public-vpn-192", "日本");
         a.port = None;
+        a.sessions = 0;
+        a.speed_mbps = 0;
         let mut b = node_in("x.opengw.net", "美国");
         b.port = None;
         assert_eq!(
             export_nodes_text(&[a, b]),
-            "public-vpn-192.opengw.net\nx.opengw.net"
+            "public-vpn-192.opengw.net\t日本\tNTT\t\t\nx.opengw.net\t美国\tNTT\t1\t50"
         );
         assert_eq!(export_nodes_text(&[]), "");
     }
@@ -4584,19 +4920,79 @@ mod tests {
 
     #[test]
     fn parse_import_line_cases() {
+        // Plain old-format line: metadata stays empty.
         assert_eq!(
             match parse_import_line("a.opengw.net:443") {
-                ImportLine::Node { host, port } => (host, port),
+                ImportLine::Node {
+                    host,
+                    port,
+                    country,
+                    isp,
+                    sessions,
+                    speed_mbps,
+                } => (host, port, country, isp, sessions, speed_mbps),
                 _ => panic!("expected a node"),
             },
-            ("a.opengw.net".to_string(), Some(443))
+            (
+                "a.opengw.net".to_string(),
+                Some(443),
+                String::new(),
+                String::new(),
+                0,
+                0
+            )
         );
+        // A bare label is completed to the full FQDN on import.
         assert_eq!(
             match parse_import_line("  public-vpn-192  ") {
-                ImportLine::Node { host, port } => (host, port),
+                ImportLine::Node { host, port, .. } => (host, port),
                 _ => panic!("expected a node"),
             },
-            ("public-vpn-192".to_string(), None)
+            ("public-vpn-192.opengw.net".to_string(), None)
+        );
+        // New v3.12 format: metadata columns are restored.
+        assert_eq!(
+            match parse_import_line("vpn547433109:995\t日本\tIIJ\t47\t572") {
+                ImportLine::Node {
+                    host,
+                    port,
+                    country,
+                    isp,
+                    sessions,
+                    speed_mbps,
+                } => (host, port, country, isp, sessions, speed_mbps),
+                _ => panic!("expected a node"),
+            },
+            (
+                "vpn547433109.opengw.net".to_string(),
+                Some(995),
+                "日本".to_string(),
+                "IIJ".to_string(),
+                47,
+                572
+            )
+        );
+        // Trailing empty metadata fields are fine (unknown).
+        assert_eq!(
+            match parse_import_line("b.opengw.net:992\t\t\t\t") {
+                ImportLine::Node {
+                    host,
+                    port,
+                    country,
+                    isp,
+                    sessions,
+                    speed_mbps,
+                } => (host, port, country, isp, sessions, speed_mbps),
+                _ => panic!("expected a node"),
+            },
+            (
+                "b.opengw.net".to_string(),
+                Some(992),
+                String::new(),
+                String::new(),
+                0,
+                0
+            )
         );
         assert!(matches!(parse_import_line(""), ImportLine::Skip));
         assert!(matches!(parse_import_line("   "), ImportLine::Skip));
@@ -4608,7 +5004,7 @@ mod tests {
             parse_import_line("  # indented comment"),
             ImportLine::Skip
         ));
-        for bad in [":443", "a.opengw.net:", "a.opengw.net:0", "a.opengw.net:70000", "a.opengw.net:notaport", "ho st:443", "a:b:443", "a_b.opengw.net:443"] {
+        for bad in [":443", "a.opengw.net:", "a.opengw.net:0", "a.opengw.net:70000", "a.opengw.net:notaport", "ho st:443", "a:b:443", "a_b.opengw.net:443", "a.opengw.net:443\t日本\tIIJ\tx\t572", "a.opengw.net:443\t日本\tIIJ\t47\tfast", "a.opengw.net:443\t日本\tIIJ\t47\t572\textra"] {
             assert!(
                 matches!(parse_import_line(bad), ImportLine::Malformed),
                 "{bad} must be malformed"
@@ -4644,7 +5040,11 @@ mod tests {
         assert_eq!(app.nodes.len(), 4);
         assert_eq!(app.nodes[1].host, "b.opengw.net");
         assert_eq!(app.nodes[1].port, Some(992));
-        assert_eq!(app.nodes[1].country, "导入");
+        // v3.12: no literal placeholder — country/operator stay
+        // empty (the table shows "—") when the line carries no
+        // metadata. v3.11 asserted "导入" here.
+        assert_eq!(app.nodes[1].country, "");
+        assert_eq!(app.nodes[1].isp, "");
         assert_eq!(app.nodes[1].source, "import");
         assert_eq!(app.nodes[2].host, "blocked.opengw.net");
         assert_eq!(app.nodes[3].host, "c.opengw.net");
@@ -4663,23 +5063,165 @@ mod tests {
         assert_eq!(app.nodes.len(), 1);
     }
 
+    /// v3.12: export then import restores all four metadata
+    /// columns plus host:port — the round trip Leo's screenshot
+    /// showed losing (v3.11 exported host:port only).
+    #[test]
+    fn export_import_round_trip_restores_metadata() {
+        let mut a = node_in("vpn547433109.opengw.net", "日本");
+        a.port = Some(995);
+        a.isp = "IIJ".to_string();
+        a.sessions = 47;
+        a.speed_mbps = 572;
+        let mut b = node_in("a.opengw.net", "美国");
+        b.port = Some(443);
+        b.isp = "NTT".to_string();
+        b.sessions = 3;
+        b.speed_mbps = 120;
+        let text = export_nodes_text(&[a.clone(), b.clone()]);
+        let mut app = GuiApp::for_tests();
+        // Start from an empty list: for_tests() carries the 28
+        // curated nodes, and one of the fixture hosts is among them.
+        app.nodes = vec![];
+        let report = app.import_nodes_text(&text);
+        assert_eq!(report.added, 2);
+        assert_eq!(report.malformed, 0);
+        assert_eq!(app.nodes[0].host, "vpn547433109.opengw.net");
+        assert_eq!(app.nodes[0].port, Some(995));
+        assert_eq!(app.nodes[0].country, "日本");
+        assert_eq!(app.nodes[0].isp, "IIJ");
+        assert_eq!(app.nodes[0].sessions, 47);
+        assert_eq!(app.nodes[0].speed_mbps, 572);
+        assert_eq!(app.nodes[1].host, "a.opengw.net");
+        assert_eq!(app.nodes[1].country, "美国");
+        assert_eq!(app.nodes[1].sessions, 3);
+        assert_eq!(app.nodes[1].speed_mbps, 120);
+    }
+
+    /// Old plain `host:port` lines still import, with the four
+    /// columns empty (shown as "—") — and the bare host completed.
+    #[test]
+    fn import_old_plain_format_leaves_metadata_empty() {
+        let mut app = GuiApp::for_tests();
+        // Start from an empty list: for_tests() carries the 28
+        // curated nodes, and one of the fixture hosts is among them.
+        app.nodes = vec![];
+        let report = app.import_nodes_text("vpn547433109:995\nx.opengw.net");
+        assert_eq!(report.added, 2);
+        let n = &app.nodes[0];
+        assert_eq!(n.host, "vpn547433109.opengw.net");
+        assert_eq!(n.port, Some(995));
+        assert_eq!(n.country, "");
+        assert_eq!(n.isp, "");
+        assert_eq!(n.sessions, 0);
+        assert_eq!(n.speed_mbps, 0);
+        assert_eq!(app.nodes[1].host, "x.opengw.net");
+        assert_eq!(app.nodes[1].port, None);
+    }
+
+    /// No literal placeholder value in any imported field — the
+    /// v3.11 "导入" stamp, and the manual-add "手动" / "手动添加"
+    /// pair it shared the pattern with, are all gone.
+    #[test]
+    fn no_placeholder_values_in_imported_or_manual_nodes() {
+        let mut app = GuiApp::for_tests();
+        // Start from an empty list: for_tests() carries the 28
+        // curated nodes, and one of the fixture hosts is among them.
+        app.nodes = vec![];
+        app.import_nodes_text(
+            "vpn547433109:995\t日本\tIIJ\t47\t572\nplain.opengw.net:443\n",
+        );
+        for n in &app.nodes {
+            assert_ne!(n.country, "导入");
+            assert_ne!(n.isp, "导入");
+            assert_ne!(n.country, "手动");
+            assert_ne!(n.isp, "手动添加");
+            assert_ne!(n.country, "未知");
+        }
+        let m = manual_node("m.opengw.net".to_string(), Some(992));
+        assert_eq!(m.country, "");
+        assert_eq!(m.isp, "");
+        assert_eq!(m.name, "");
+        assert_eq!(m.source, "manual");
+    }
+
+    /// v3.12: a refresh keeps manual/imported nodes the fresh list
+    /// lacks, appended at the end in their current order.
+    #[test]
+    fn refresh_merge_keeps_manual_and_imported_nodes() {
+        let mut app = GuiApp::for_tests();
+        let mut manual = node_in("m.opengw.net", "");
+        manual.source = "manual".to_string();
+        manual.port = Some(995);
+        let mut imported = node_in("i.opengw.net", "德国");
+        imported.source = "import".to_string();
+        imported.isp = "DT".to_string();
+        app.nodes = vec![node_in("a.opengw.net", "日本"), manual, imported];
+        let (merged, retained) = app.merge_refresh_nodes(vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "美国"),
+        ]);
+        assert_eq!(retained, 2);
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[2].host, "m.opengw.net");
+        assert_eq!(merged[2].source, "manual");
+        assert_eq!(merged[3].host, "i.opengw.net");
+        assert_eq!(merged[3].source, "import");
+        assert_eq!(merged[3].isp, "DT");
+    }
+
+    /// When the fresh list has the same host, its row wins for
+    /// metadata — but the manual port survives when the fresh row
+    /// has none (the API never carries an SSTP port).
+    #[test]
+    fn refresh_merge_api_row_wins_but_manual_port_survives() {
+        let mut app = GuiApp::for_tests();
+        let mut manual = node_in("m.opengw.net", "");
+        manual.source = "manual".to_string();
+        manual.port = Some(995);
+        manual.port_source = "manual".to_string();
+        manual.isp = "OLD".to_string();
+        app.nodes = vec![manual];
+        let mut api = node_in("m.opengw.net", "日本");
+        api.source = "api".to_string();
+        api.port = None;
+        api.isp = "NTT".to_string();
+        api.sessions = 47;
+        api.speed_mbps = 572;
+        let (merged, retained) = app.merge_refresh_nodes(vec![api]);
+        assert_eq!(retained, 0);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].country, "日本");
+        assert_eq!(merged[0].isp, "NTT");
+        assert_eq!(merged[0].sessions, 47);
+        assert_eq!(merged[0].speed_mbps, 572);
+        assert_eq!(merged[0].port, Some(995));
+        assert_eq!(merged[0].port_source, "manual");
+        assert_eq!(merged[0].source, "api");
+    }
+
     #[test]
     fn refresh_summary_line_states_source_and_counts() {
         assert_eq!(
-            refresh_summary_line(vpngate::NodeListSource::Api, 116, 125),
+            refresh_summary_line(vpngate::NodeListSource::Api, 116, 125, 0),
             "刷新完成（官方 API）：已清空屏蔽 116 个，获取到 125 个。"
         );
         assert_eq!(
-            refresh_summary_line(vpngate::NodeListSource::WebScrape, 96, 100),
+            refresh_summary_line(vpngate::NodeListSource::WebScrape, 96, 100, 0),
             "刷新完成（网页抓取）：已清空屏蔽 96 个，获取到 100 个。"
         );
         assert_eq!(
-            refresh_summary_line(vpngate::NodeListSource::Cache, 0, 96),
+            refresh_summary_line(vpngate::NodeListSource::Cache, 0, 96, 0),
             "刷新完成（缓存）：已清空屏蔽 0 个，获取到 96 个。"
         );
         assert_eq!(
-            refresh_summary_line(vpngate::NodeListSource::Curated, 20, 28),
+            refresh_summary_line(vpngate::NodeListSource::Curated, 20, 28, 0),
             "刷新完成（内嵌列表）：已清空屏蔽 20 个，获取到 28 个。"
+        );
+        // v3.12: kept manual/imported nodes are named in the line.
+        assert_eq!(
+            refresh_summary_line(vpngate::NodeListSource::Api, 116, 125, 5),
+            "刷新完成（官方 API）：已清空屏蔽 116 个，获取到 125 个（含手动/导入保留 5 个）。"
         );
     }
 
@@ -5618,6 +6160,43 @@ mod tests {
         let mut app = GuiApp::for_tests();
         app.disconnect();
         assert_eq!(app.status, "未连接");
+    }
+
+    /// v3.12: hiding to the tray sets the flag and writes the
+    /// one-time hint (status + log); a second hide does not repeat
+    /// it. A Quit decision changes nothing here.
+    #[test]
+    fn apply_close_hide_sets_flag_and_hint_once() {
+        let mut app = GuiApp::for_tests();
+        app.apply_close(tray::CloseDecision::HideToTray);
+        assert!(app.hidden_to_tray);
+        assert_eq!(app.status, tray::TRAY_HINT);
+        assert!(app.log.iter().any(|l| l == tray::TRAY_HINT));
+        let log_len = app.log.len();
+        app.apply_close(tray::CloseDecision::HideToTray);
+        assert_eq!(app.log.len(), log_len, "the hint is written once");
+        let mut app2 = GuiApp::for_tests();
+        app2.apply_close(tray::CloseDecision::Quit);
+        assert!(!app2.hidden_to_tray);
+        assert_eq!(app2.status, "未连接");
+    }
+
+    /// v3.12: the real-quit path disconnects (status back to 未连接)
+    /// and persists a changed setting — the same path the File-menu
+    /// 退出 and the tray-menu 退出 share.
+    #[test]
+    fn perform_quit_disconnects_and_saves() {
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let mut app = GuiApp::for_tests();
+        app.front_enabled = true;
+        app.front_addr = "127.0.0.1:1081".to_string();
+        app.perform_quit();
+        assert_eq!(app.status, "未连接");
+        let path = Config::portable_config_path().expect("exe dir known");
+        let back = Config::load(Some(&path)).expect("saved config loads");
+        assert!(back.front_proxy.enabled);
+        assert_eq!(back.front_proxy.addr, "127.0.0.1:1081");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Render the smallest window (560x420) in both themes for visual
@@ -7140,8 +7719,8 @@ mod tests {
             click_button_label_copied_text(&mut harness, "导出选中 (2)");
         assert_eq!(
             copied.as_deref(),
-            Some("a.opengw.net:443\nc.opengw.net:995"),
-            "export must list the selection in display order, each with its own port"
+            Some("a.opengw.net:443\t日本\tNTT\t1\t50\nc.opengw.net:995\t德国\tNTT\t1\t50"),
+            "export must list the selection in display order, each with its own port and metadata columns"
         );
         assert_eq!(
             harness.state().status,
@@ -7202,8 +7781,8 @@ mod tests {
         harness.step();
         assert_eq!(
             copied_text(&harness).as_deref(),
-            Some("a.opengw.net:992\nb.opengw.net:992"),
-            "Ctrl+C must copy the selection in display order"
+            Some("a.opengw.net:992\t日本\tNTT\t1\t50\nb.opengw.net:992\t美国\tNTT\t1\t50"),
+            "Ctrl+C must copy the selection in display order, with metadata columns"
         );
         assert_eq!(harness.state().status, "已导出 2 个节点到剪贴板。");
     }
@@ -7419,6 +7998,298 @@ mod tests {
         if let Some(cache) = vpngate::cache_path() {
             let _ = std::fs::remove_file(&cache);
         }
+    }
+
+    /// v3.12: export → delete → import restores the four metadata
+    /// columns (country, operator, users, quality) — the round
+    /// trip Leo's screenshot showed losing (v3.11 exported
+    /// host:port only, and stamped "导入" into the two text
+    /// columns). Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn export_import_round_trip_keeps_four_columns() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let mut a = node_in("vpn547433109.opengw.net", "日本");
+        a.port = Some(995);
+        a.isp = "IIJ".to_string();
+        a.sessions = 47;
+        a.speed_mbps = 572;
+        let mut b = node_in("a.opengw.net", "美国");
+        b.port = Some(443);
+        b.isp = "NTT".to_string();
+        b.sessions = 3;
+        b.speed_mbps = 120;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![a, b];
+                app
+            });
+        harness.run_steps(10);
+        click_row_label(&mut harness, "日本");
+        shift_click_row_label(&mut harness, "美国");
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0, 1]),
+            "Shift+click must select the range"
+        );
+        // Export, then delete the two rows, then paste the exported
+        // text back: the four columns must come back with them.
+        let copied =
+            click_button_label_copied_text(&mut harness, "导出选中 (2)");
+        assert_eq!(
+            copied.as_deref(),
+            Some("vpn547433109.opengw.net:995\t日本\tIIJ\t47\t572\na.opengw.net:443\t美国\tNTT\t3\t120"),
+            "export must carry the four metadata columns"
+        );
+        click_button_label(&mut harness, "删除选中 (2)");
+        assert_eq!(harness.state().nodes.len(), 0);
+        harness.event(egui::Event::Paste(
+            copied.expect("export must have copied text"),
+        ));
+        harness.step();
+        assert_eq!(harness.state().nodes.len(), 2);
+        let first = &harness.state().nodes[0];
+        assert_eq!(first.host, "vpn547433109.opengw.net");
+        assert_eq!(first.port, Some(995));
+        assert_eq!(first.country, "日本");
+        assert_eq!(first.isp, "IIJ");
+        assert_eq!(first.sessions, 47);
+        assert_eq!(first.speed_mbps, 572);
+        let second = &harness.state().nodes[1];
+        assert_eq!(second.host, "a.opengw.net");
+        assert_eq!(second.country, "美国");
+        assert_eq!(second.sessions, 3);
+        assert_eq!(second.speed_mbps, 120);
+        assert_eq!(
+            harness.state().status,
+            "已导入 2 个节点（跳过重复 0 个，格式不对 0 个）。"
+        );
+        // The delete + the import wrote config.toml and
+        // nodes_cache.json next to the test exe; clean up.
+        if let Some(path) = Config::portable_config_path() {
+            let _ = std::fs::remove_file(&path);
+        }
+        if let Some(cache) = vpngate::cache_path() {
+            let _ = std::fs::remove_file(&cache);
+        }
+    }
+
+    /// v3.12: an imported node the fresh API list lacks survives a
+    /// refresh, appended at the end with its metadata intact.
+    /// Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn refresh_keeps_imported_nodes() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let mut imported = node_in("m.opengw.net", "德国");
+        imported.source = "import".to_string();
+        imported.port = Some(995);
+        imported.isp = "DT".to_string();
+        imported.sessions = 9;
+        imported.speed_mbps = 300;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![node_in("a.opengw.net", "日本"), imported];
+                app
+            });
+        harness.run_steps(10);
+        let btn = harness.get_by_label("刷新节点");
+        let center = btn.rect().center();
+        harness.drag_at(center);
+        harness.run_steps(3);
+        harness.drop_at(center);
+        harness.run_steps(3);
+        assert!(
+            matches!(harness.state().busy, Some(Busy::Fetching)),
+            "refresh must set the fetching flag, busy={:?}",
+            harness.state().busy
+        );
+        // Drive the fetch result through by hand (no runtime in the
+        // harness): the fresh list lacks the imported node.
+        harness.state_mut().apply_event(GuiEvent::Nodes(
+            vpngate::NodeListUpdate {
+                nodes: vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                ],
+                source: vpngate::NodeListSource::Api,
+                cache_age_secs: None,
+                api_error: None,
+                web_error: None,
+            },
+        ));
+        harness.run_steps(3);
+        assert_eq!(harness.state().nodes.len(), 3);
+        assert_eq!(harness.state().nodes[2].host, "m.opengw.net");
+        assert_eq!(harness.state().nodes[2].source, "import");
+        assert_eq!(harness.state().nodes[2].country, "德国");
+        assert_eq!(harness.state().nodes[2].isp, "DT");
+        assert_eq!(harness.state().nodes[2].sessions, 9);
+        assert_eq!(harness.state().nodes[2].speed_mbps, 300);
+        assert!(
+            harness
+                .state()
+                .log
+                .iter()
+                .any(|l| l
+                    == "刷新完成（官方 API）：已清空屏蔽 0 个，获取到 3 个（含手动/导入保留 1 个）。"),
+            "log must name the retained manual/imported node, got: {:?}",
+            harness.state().log
+        );
+        if let Some(path) = Config::portable_config_path() {
+            let _ = std::fs::remove_file(&path);
+        }
+        if let Some(cache) = vpngate::cache_path() {
+            let _ = std::fs::remove_file(&cache);
+        }
+    }
+
+    /// v3.12: pressing Del with a row selected deletes it through
+    /// the same path as the 删除选中 button — the row goes, the
+    /// blocklist grows, and the status wording matches the button.
+    /// Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn del_key_deletes_selected_row() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let _guard = PORTABLE_CONFIG_LOCK.lock().unwrap();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                    node_in("c.opengw.net", "德国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        click_row_label(&mut harness, "日本");
+        harness.key_press(egui::Key::Delete);
+        harness.run_steps(3);
+        assert_eq!(harness.state().nodes.len(), 2);
+        assert_eq!(harness.state().nodes[0].host, "b.opengw.net");
+        assert_eq!(harness.state().blocked_hosts.len(), 1);
+        assert!(harness
+            .state()
+            .blocked_hosts
+            .contains("a.opengw.net"));
+        assert_eq!(
+            harness.state().status,
+            "已删除 1 个节点（本次会话里隐藏，刷新后会带回来）。"
+        );
+        if let Some(path) = Config::portable_config_path() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// v3.12: with a text field focused, Del belongs to the field
+    /// (deletes a character) and must not delete the selected row
+    /// — same focus guard as Ctrl+C / Enter / Ctrl+R.
+    /// Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn del_key_ignored_when_text_field_focused() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 500.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![node_in("a.opengw.net", "日本")];
+                app
+            });
+        harness.run_steps(10);
+        // Select a row first, then focus the manual-add field (first
+        // text input in tree order). The order matters: clicking a
+        // row steals the text field's focus, so the field is
+        // focused last. Same scroll-into-view dance as the Ctrl+C
+        // focus test.
+        click_row_label(&mut harness, "日本");
+        assert_eq!(
+            harness.state().selected_set,
+            BTreeSet::from([0]),
+            "the row must be selected before the field takes focus"
+        );
+        harness.event(egui::Event::PointerMoved(egui::pos2(400.0, 300.0)));
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -5.0),
+            modifiers: egui::Modifiers::default(),
+            phase: egui::TouchPhase::Move,
+        });
+        harness.run_steps(5);
+        let field = harness
+            .query_all_by_role(egui::accesskit::Role::TextInput)
+            .next()
+            .expect("a text input must exist");
+        let center = field.rect().center();
+        assert!(
+            center.y < 500.0,
+            "the field must have scrolled into view, rect={:?}",
+            field.rect()
+        );
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert!(
+            harness.ctx.text_edit_focused(),
+            "clicking the text field must focus it"
+        );
+        harness.key_press(egui::Key::Delete);
+        harness.run_steps(3);
+        assert_eq!(
+            harness.state().nodes.len(),
+            1,
+            "Del with a focused text field must not delete the row"
+        );
+        assert!(
+            harness.state().blocked_hosts.is_empty(),
+            "the blocklist must stay empty"
+        );
+    }
+
+    /// v3.12: Del while a job is running (probe/connect/refresh/
+    /// probe-all) deletes nothing — same busy guard as the button.
+    /// Needs a graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn del_key_ignored_while_busy() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    node_in("a.opengw.net", "日本"),
+                    node_in("b.opengw.net", "美国"),
+                ];
+                app
+            });
+        harness.run_steps(10);
+        click_row_label(&mut harness, "日本");
+        harness.state_mut().busy = Some(Busy::Probing);
+        harness.key_press(egui::Key::Delete);
+        harness.run_steps(3);
+        assert_eq!(
+            harness.state().nodes.len(),
+            2,
+            "Del while busy must not delete anything"
+        );
+        assert!(harness.state().blocked_hosts.is_empty());
+        harness.state_mut().busy = None;
+        // The same keypress now works, once the job is over.
+        harness.key_press(egui::Key::Delete);
+        harness.run_steps(3);
+        assert_eq!(harness.state().nodes.len(), 1);
+        assert_eq!(harness.state().blocked_hosts.len(), 1);
     }
 
     /// The ∞ mark (U+221E) must render as a glyph, not a missing-glyph

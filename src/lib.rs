@@ -10,5 +10,6 @@ pub mod net;
 pub mod socks5;
 pub mod sstp;
 pub mod sysproxy;
+pub mod tray;
 pub mod util;
 pub mod vpngate;

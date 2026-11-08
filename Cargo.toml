@@ -1,6 +1,6 @@
 [package]
 name = "vpngate-client"
-version = "0.3.11"
+version = "0.3.12"
 edition = "2021"
 description = "Minimal Rust client for VPNGate volunteer nodes over MS-SSTP + PPP, exposing a local SOCKS5 port (no TUN, no GUI)"
 license = "MIT"
@@ -36,6 +36,11 @@ chrono = "0.4"
 eframe = "0.36"
 rfd = "0.18.0"
 arboard = "3"
+# Decode assets/icon.ico's PNG entry into RGBA for the tray icon
+# (src/tray.rs, v3.12); already in the tree via arboard/eframe.
+# PNG only — default features would pull every decoder into both
+# binaries (measured +10 MB on the GUI); eframe uses png-only too.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Windows only: verified HTTPS (vpngate.net API / web scrape, DoH,
 # front-proxy test) and node SSTP both go through the OS TLS stack
@@ -52,6 +57,9 @@ arboard = "3"
 [target.'cfg(windows)'.dependencies]
 native-tls = "0.2"
 tokio-native-tls = "0.3"
+# System tray icon (v3.12, Windows only): minimize-to-tray like
+# v2rayN/NekoBox. 0.19 pairs with eframe 0.36's winit 0.30.
+tray-icon = "0.19"
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["eframe", "snapshot", "wgpu"] }
