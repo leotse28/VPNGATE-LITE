@@ -1,7 +1,7 @@
 //! vpngate-gui — desktop GUI for the VPNGate Rust client (egui/eframe 0.36).
 //!
 //! Same tunnel code as the CLI (`vpngate_client` lib); this binary only
-//! adds a window around it. Long work (fetch / probe / connect / test)
+//! adds a window around it. Long work (fetch / probe / connect)
 //! runs on tokio tasks; the UI polls them through a channel and never
 //! blocks.
 
@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vpngate_client::config::Config;
 use vpngate_client::filelog::{self, FileLogger, LogLevel};
 use vpngate_client::net::{self, Connector};
@@ -35,35 +34,38 @@ enum Busy {
     Probing,
     ProbingAll,
     Connecting,
-    Testing,
     TestingFrontProxy,
 }
 
 /// Which node-list column the list is sorted by. Only the country,
-/// sessions (当前人数）, line-quality （线路质量） and latency/status
-/// （延迟/状态） columns are sortable; the status (∞), ISP and
-/// host:port columns are not. One column at a time: clicking a
-/// header sorts by that column and clears the previous column's
-/// arrow; clicking the same column again reverses the direction.
+/// sessions (当前人数）, line-quality （线路质量）, per-capita
+/// bandwidth （人均带宽） and latency/status （延迟/状态） columns are
+/// sortable; the status (∞), ISP and host:port columns are not. One
+/// column at a time: clicking a header sorts by that column and
+/// clears the previous column's arrow; clicking the same column
+/// again reverses the direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortCol {
     Country,
     Sessions,
     Quality,
+    PerCapita,
     Latency,
 }
 
 impl SortCol {
     /// First-click direction for the column — the most useful order:
     /// countries A-Z, fewest sessions first (lightest load), fastest
-    /// line first (speed primary, ping secondary), and for latency
-    /// the available nodes by ms ascending, unprobed in the middle,
-    /// failed last (see `latency_key`).
+    /// line first (speed primary, ping secondary), highest
+    /// per-capita bandwidth first (most headroom per user), and for
+    /// latency the available nodes by ms ascending, unprobed in the
+    /// middle, failed last (see `latency_key`).
     fn default_dir(self) -> SortDir {
         match self {
             SortCol::Country => SortDir::Asc,
             SortCol::Sessions => SortDir::Asc,
             SortCol::Quality => SortDir::Desc,
+            SortCol::PerCapita => SortDir::Desc,
             SortCol::Latency => SortDir::Asc,
         }
     }
@@ -134,6 +136,39 @@ fn quality_cell(n: &vpngate::Node) -> String {
     }
 }
 
+/// Sort key for the 人均带宽 column: (has data, per-capita speed in
+/// tenths of a Mbps). Integer tenths — no float comparison — so the
+/// order is exact and deterministic: `speed * 10 / sessions`
+/// (integer division), or `speed * 10` when sessions is zero (one
+/// user alone gets the whole line, so per-capita is the total
+/// speed). No-data nodes count as smallest, like `quality_key`, so
+/// they sort first in ascending order and last in descending order.
+fn per_capita_key(n: &vpngate::Node) -> (bool, u64) {
+    let has_data = has_listed_stats(n);
+    let tenths = if n.sessions == 0 {
+        n.speed_mbps.saturating_mul(10)
+    } else {
+        n.speed_mbps.saturating_mul(10) / n.sessions
+    };
+    (has_data, tenths)
+}
+
+/// 人均带宽 cell: total speed divided by current sessions, one
+/// decimal, e.g. "12.2M/人" for 572 Mbps shared by 47 users.
+/// "—" with no data; a node with data but zero sessions shows the
+/// total speed itself ("100.0M/人" — one user alone); speed zero
+/// with sessions present shows "0.0M/人", not "—".
+fn per_capita_cell(n: &vpngate::Node) -> String {
+    if !has_listed_stats(n) {
+        return "—".to_string();
+    }
+    if n.sessions == 0 {
+        format!("{:.1}M/人", n.speed_mbps as f64)
+    } else {
+        format!("{:.1}M/人", n.speed_mbps as f64 / n.sessions as f64)
+    }
+}
+
 impl Busy {
     fn label(self) -> &'static str {
         match self {
@@ -141,7 +176,6 @@ impl Busy {
             Busy::Probing => "正在探测节点…",
             Busy::ProbingAll => "正在探测全部节点…",
             Busy::Connecting => "正在连接…",
-            Busy::Testing => "正在测试隧道…",
             Busy::TestingFrontProxy => "正在测试前置代理…",
         }
     }
@@ -165,6 +199,11 @@ enum ProbeFailure {
 /// (0.0.0.0:local_port) instead of a second port; the task is
 /// aborted on disconnect.
 struct ActiveConnection {
+    /// Held for ownership: dropping the last tunnel Arc closes the
+    /// TLS stream. Nothing in the GUI reads it any more (the
+    /// tunnel-test button that did was removed in v3.13) — the
+    /// field is the connection, not a lookup.
+    #[allow(dead_code)]
     tunnel: Arc<SstpTunnel>,
     serve: Vec<tokio::task::JoinHandle<()>>,
     proxy_guard: Option<SystemProxyGuard>,
@@ -215,11 +254,6 @@ enum GuiEvent {
     /// `socks5.rs`). The UI writes it to the log panel + file log,
     /// so a LAN device that never reaches the proxy leaves no line.
     ConnLog(String),
-    TestResult {
-        gen204: bool,
-        google: bool,
-        detail: String,
-    },
     FrontProxyTest {
         /// Front-proxy address snapshotted when the test was clicked
         /// (the live field may have changed by the time the result
@@ -464,69 +498,6 @@ async fn connect_flow(
     })
 }
 
-/// End-to-end check through an established tunnel: generate_204 over
-/// plain HTTP, then HTTPS to Google (TLS inside the tunnel).
-async fn test_flow(tunnel: &Arc<SstpTunnel>, timeout: Duration) -> (bool, bool, String) {
-    let mut gen204 = false;
-    let mut google = false;
-    let mut detail = String::new();
-    match tunnel.open_stream("www.gstatic.com", 80, timeout).await {
-        Ok(mut s) => {
-            let req = b"GET http://www.gstatic.com/generate_204 HTTP/1.1\r\nHost: www.gstatic.com\r\nConnection: close\r\n\r\n";
-            if s.write_all(req).await.is_ok() {
-                let mut buf = vec![0u8; 4096];
-                match tokio::time::timeout(timeout, s.read(&mut buf)).await {
-                    Ok(Ok(n)) => {
-                        let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let first = head.lines().next().unwrap_or("").to_string();
-                        detail.push_str(&format!("generate_204：{}；", first));
-                        gen204 = head.contains("204");
-                    }
-                    Ok(Err(e)) => detail.push_str(&format!("generate_204 读取失败：{}；", e)),
-                    Err(_) => detail.push_str("generate_204 读取超时；"),
-                }
-            } else {
-                detail.push_str("generate_204 发送失败；");
-            }
-        }
-        Err(e) => detail.push_str(&format!("generate_204 建流失败：{}；", e)),
-    }
-    match tunnel.open_stream("www.google.com", 443, timeout).await {
-        Ok(stream) => {
-            match tokio::time::timeout(
-                timeout,
-                net::verified_tls_connect(stream, "www.google.com"),
-            )
-            .await {
-                Ok(Ok(mut tls)) => {
-                    let req = format!(
-                        "GET / HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\nUser-Agent: vpngate-client/{}\r\n\r\n",
-                        env!("CARGO_PKG_VERSION")
-                    );
-                    if tls.write_all(req.as_bytes()).await.is_ok() {
-                        let mut buf = vec![0u8; 4096];
-                        match tokio::time::timeout(timeout, tls.read(&mut buf)).await {
-                            Ok(Ok(n)) => {
-                                let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                                let first = head.lines().next().unwrap_or("").to_string();
-                                detail.push_str(&format!("Google：{}。", first));
-                                google = n > 0;
-                            }
-                            Ok(Err(e)) => detail.push_str(&format!("Google 读取失败：{}。", e)),
-                            Err(_) => detail.push_str("Google 读取超时。"),
-                        }
-                    } else {
-                        detail.push_str("Google 发送失败。");
-                    }
-                }
-                Ok(Err(e)) => detail.push_str(&format!("Google TLS 握手失败：{}。", e)),
-                Err(_) => detail.push_str("Google TLS 握手超时。"),
-            }
-        }
-        Err(e) => detail.push_str(&format!("Google 建流失败：{}。", e)),
-    }
-    (gen204, google, detail)
-}
 
 /// Place a truncating label at the left of an exact cell rect.
 /// (`Ui::put` centres the widget, which would centre every column's
@@ -540,6 +511,76 @@ fn put_cell_label(ui: &mut egui::Ui, rect: egui::Rect, text: impl Into<egui::Wid
             ui.add(egui::Label::new(text).truncate());
         },
     );
+}
+
+/// Scroll-bar style for every ScrollArea in the GUI (v3.13): the old
+/// `ScrollStyle::solid()` was only 6 px wide with the handle in the
+/// widgets' `bg_fill` (light theme: grey 230 on a warm-white panel —
+/// nearly invisible at rest). This keeps solid (non-floating, so the
+/// bars always occupy space and, per egui 0.36's scroll_area.rs, the
+/// handle/background opacity is 1.0 at rest — no hover needed) but
+/// widens the bar to 12 px, narrows the inner margin so the strip
+/// costs 14 px total, lengthens the minimum handle to 24 px, and
+/// switches the handle to the `foreground_color` (`fg_stroke`:
+/// grey 60 light / grey 180 dark) so it reads in both themes.
+/// Verified against egui 0.36.2 source (`style.rs` `ScrollStyle`,
+/// `scroll_area.rs` opacity branches) — the field names are
+/// `bar_width` / `bar_inner_margin` / `handle_min_length` /
+/// `foreground_color`, not the `scroll_bar_width` guesses.
+fn thick_scroll_style() -> egui::style::ScrollStyle {
+    let mut s = egui::style::ScrollStyle::solid();
+    s.bar_width = 12.0;
+    s.bar_inner_margin = 2.0;
+    s.handle_min_length = 24.0;
+    s.foreground_color = true;
+    s
+}
+
+/// A horizontal resize handle between two stacked boxes (v3.13):
+/// an 8 px tall grab strip spanning the available width. Dragging
+/// vertically moves `height` by the drag delta, clamped to
+/// `min..=max` (the caller passes the clamped bounds for the
+/// current panel). Returns the strip rect so tests can grab it.
+/// Paint: a faint strip in both themes, with a centred grip pill
+/// that turns indigo (the selection colour) on hover/drag, and a
+/// vertical-resize cursor. Same drag pattern as the column
+/// separators (apply the delta on `dragged()` and on
+/// `drag_stopped()`, so a kittest teleport-drag still lands).
+fn height_drag_handle(
+    ui: &mut egui::Ui,
+    id: impl Into<egui::Id>,
+    height: &mut f32,
+    min: f32,
+    max: f32,
+    hover_text: &str,
+) -> egui::Rect {
+    // Reserve the strip, then interact with a stable id (same
+    // pattern as the column separators: an auto id would work while
+    // the layout order is stable, but an explicit one survives
+    // reordering).
+    let (_alloc_id, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 8.0));
+    let resp = ui
+        .interact(rect, id.into(), egui::Sense::drag())
+        .on_hover_cursor(egui::CursorIcon::ResizeRow)
+        .on_hover_text(hover_text);
+    if resp.dragged() || resp.drag_stopped() {
+        *height = (*height + resp.drag_delta().y).clamp(min, max);
+    }
+    let active = resp.hovered() || resp.dragged();
+    let visuals = ui.visuals();
+    ui.painter().rect_filled(
+        rect,
+        4.0,
+        visuals.widgets.inactive.bg_fill,
+    );
+    let pill_color = if active {
+        visuals.selection.bg_fill
+    } else {
+        visuals.text_color().gamma_multiply(0.35)
+    };
+    let pill = egui::Rect::from_center_size(rect.center(), egui::vec2(48.0, 3.0));
+    ui.painter().rect_filled(pill, 1.5, pill_color);
+    rect
 }
 
 /// One line for one front-proxy test target: reachable + ms, or which
@@ -930,20 +971,43 @@ struct GuiApp {
     allow_lan: bool,
     system_proxy: bool,
     /// Node-list column widths in pixels, in display order: country,
-    /// ISP, 当前人数， 线路质量， host:port, latency/status. Draggable
-    /// at the header separators (every resizable column but the last
-    /// has one); persisted to config.toml with the rest of the
-    /// settings via auto-save. The status column (∞ for the connected
-    /// node) is a fixed 28 px and is NOT in this array — it has no
-    /// separator and is not resizable. Pre-v3.7 configs stored only
-    /// 4 widths; those migrate on load (see `de_col_widths` in
-    /// config.rs), so old config files keep loading as-is.
-    col_widths: [u16; 6],
+    /// ISP, 当前人数， 线路质量， 人均带宽， host:port, latency/status.
+    /// Draggable at the header separators (every resizable column
+    /// but the last has one); persisted to config.toml with the
+    /// rest of the settings via auto-save. The status column (∞ for
+    /// the connected node) is a fixed 28 px and is NOT in this
+    /// array — it has no separator and is not resizable. Pre-v3.7
+    /// configs stored only 4 widths and v3.12 configs 6; those
+    /// migrate on load (see `de_col_widths` in config.rs), so old
+    /// config files keep loading as-is.
+    col_widths: [u16; 7],
+    /// Node-list box height the user dragged to (v3.13 resize
+    /// handle). `None` = never dragged: the list uses its formula
+    /// height (`panel_h - 250`, at least 120 px) — see
+    /// `effective_list_height`. Persisted as whole pixels in
+    /// `config.ui.list_height`; `None` stays `None` on save, so a
+    /// user who never drags keeps the formula behaviour.
+    list_height: Option<f32>,
+    /// Advanced-settings box height in pixels (v3.13 resize handle):
+    /// the CollapsingHeader body scrolls inside it. Default 240 px.
+    advanced_height: f32,
+    /// Log box height in pixels (v3.13 resize handle). Default
+    /// 90 px (the old hard-coded value).
+    log_height: f32,
+    /// Last frame's resize-handle rects, for the kittest drag tests
+    /// (they need something to grab — the handles have no label).
+    /// Test-only: never read in production.
+    #[cfg(test)]
+    list_handle_rect: Option<egui::Rect>,
+    #[cfg(test)]
+    advanced_handle_rect: Option<egui::Rect>,
+    #[cfg(test)]
+    log_handle_rect: Option<egui::Rect>,
     /// List sort: `None` = fetch order (startup default), `Some`
     /// = (column, direction) the user picked by clicking a
-    /// sortable header （国家/地区 / 当前人数 / 线路质量 / 延迟/状态）.
-    /// Clicking a different column restarts at that column's
-    /// first-click direction (see `SortCol::default_dir`). Kept
+    /// sortable header （国家/地区 / 当前人数 / 线路质量 / 人均带宽 /
+    /// 延迟/状态）. Clicking a different column restarts at that
+    /// column's first-click direction (see `SortCol::default_dir`). Kept
     /// across refreshes; session-only, not persisted to config.toml.
     sort: Option<(SortCol, SortDir)>,
     /// Where the mouse was pressed while selecting a row (`None` when
@@ -1070,6 +1134,16 @@ impl Default for GuiApp {
             allow_lan: false,
             system_proxy: false,
             col_widths: vpngate_client::config::UiSettings::default().node_col_widths,
+            list_height: None,
+            advanced_height: vpngate_client::config::UiSettings::default().advanced_height
+                as f32,
+            log_height: vpngate_client::config::UiSettings::default().log_height as f32,
+            #[cfg(test)]
+            list_handle_rect: None,
+            #[cfg(test)]
+            advanced_handle_rect: None,
+            #[cfg(test)]
+            log_handle_rect: None,
             sort: None,
             row_press_pos: None,
             row_press_mods: None,
@@ -1099,8 +1173,9 @@ impl Default for GuiApp {
     }
 }
 
-/// Brand palette, coordinated with the app icon (indigo #1E40AF →
-/// cyan #0891B2). Restrained on purpose: one accent (indigo), one
+/// Brand palette, coordinated with the app icon (solid indigo #1E40AF
+/// + bold white V since v3.13; before that an indigo → cyan gradient).
+/// Restrained on purpose: one accent (indigo), one
 /// success accent (cyan/teal, used for the ∞ connected-node mark),
 /// muted amber for warnings, soft red for errors — no multi-colour
 /// mixing. Both themes follow the OS setting; these are per-theme
@@ -1312,6 +1387,20 @@ impl GuiApp {
         app
     }
 
+    /// Effective node-list box height for this frame (v3.13): the
+    /// user's dragged value wins (clamped to the current panel), and
+    /// until the first drag the old formula (`panel_h - 250`, at
+    /// least 120 px) is the default — so a fresh install and an old
+    /// config look exactly as before.
+    fn effective_list_height(&self, panel_h: f32) -> f32 {
+        match self.list_height {
+            Some(h) => {
+                vpngate_client::config::clamp_list_height(h, panel_h)
+            }
+            None => (panel_h - 250.0).max(120.0),
+        }
+    }
+
     fn apply_config(&mut self, cfg: &Config) {
         self.config = cfg.clone();
         self.front_enabled = cfg.front_proxy.enabled;
@@ -1322,6 +1411,15 @@ impl GuiApp {
         self.allow_lan = cfg.listen.allow_lan;
         self.system_proxy = cfg.system_proxy.enabled;
         self.col_widths = cfg.ui.node_col_widths;
+        self.list_height = cfg.ui.list_height.map(|h| h as f32);
+        // Clamp hand-edited values into range on load (a config
+        // file may carry anything); the list height is clamped per
+        // frame instead, since its ceiling depends on the panel.
+        self.advanced_height = vpngate_client::config::clamp_advanced_height(
+            cfg.ui.advanced_height as f32,
+        );
+        self.log_height =
+            vpngate_client::config::clamp_log_height(cfg.ui.log_height as f32);
         self.blocked_hosts = cfg.blocked_hosts.iter().cloned().collect();
     }
 
@@ -1344,6 +1442,11 @@ impl GuiApp {
         cfg.listen.allow_lan = self.allow_lan;
         cfg.system_proxy.enabled = self.system_proxy;
         cfg.ui.node_col_widths = self.col_widths;
+        // Whole pixels on save (config stores u16); `None` stays
+        // `None`, so the formula default survives until a drag.
+        cfg.ui.list_height = self.list_height.map(|h| h.round() as u16);
+        cfg.ui.advanced_height = self.advanced_height.round() as u16;
+        cfg.ui.log_height = self.log_height.round() as u16;
         // BTreeSet iteration is sorted, so the saved list is in a
         // stable order across runs.
         cfg.blocked_hosts = self.blocked_hosts.iter().cloned().collect();
@@ -1675,7 +1778,7 @@ impl GuiApp {
         let Some(node) = self.nodes.get(i) else {
             return;
         };
-        if self.busy.is_some() || self.conn.is_some() {
+        if self.busy.is_some() {
             return;
         }
         let target = match node.port {
@@ -1685,6 +1788,18 @@ impl GuiApp {
             Some(p) => format!("{}:{}", vpngate::complete_ddns_host(&node.host), p),
             None => vpngate::complete_ddns_host(&node.host),
         };
+        // v3.13 switch: already connected to another node? Disconnect
+        // first (sync: aborts the serve tasks, restores the system
+        // proxy, logs the 已断开 line), then fall through to the
+        // normal connect flow below, which logs the 开始连接 line.
+        // Connected to this very node: no-op — never a pointless
+        // disconnect-and-reconnect of the same node.
+        if self.conn.is_some() {
+            if self.selected_is_connected() {
+                return;
+            }
+            self.disconnect();
+        }
         let listen_addrs = self.listen_addrs();
         let listen_display = self.listen_display();
         self.busy = Some(Busy::Connecting);
@@ -1740,27 +1855,6 @@ impl GuiApp {
                     let _ = tx.send(GuiEvent::ConnectFailed(e));
                 }
             }
-            ctx.request_repaint();
-        });
-    }
-
-    fn start_test(&mut self, ctx: egui::Context) {
-        let Some(c) = &self.conn else { return };
-        if self.busy.is_some() {
-            return;
-        }
-        self.busy = Some(Busy::Testing);
-        self.status = "正在测试隧道（generate_204 与 Google）…".to_string();
-        let tx = self.event_tx.clone();
-        let tunnel = c.tunnel.clone();
-        let timeout = self.timeout();
-        tokio::spawn(async move {
-            let (gen204, google, detail) = test_flow(&tunnel, timeout).await;
-            let _ = tx.send(GuiEvent::TestResult {
-                gen204,
-                google,
-                detail,
-            });
             ctx.request_repaint();
         });
     }
@@ -2175,34 +2269,6 @@ impl GuiApp {
             GuiEvent::ConnLog(line) => {
                 self.log_line(line);
             }
-            GuiEvent::TestResult {
-                gen204,
-                google,
-                detail,
-            } => {
-                self.busy = None;
-                self.status = if gen204 && google {
-                    "测试通过：generate_204 与 Google 都通了。".to_string()
-                } else if gen204 {
-                    "测试部分通过：generate_204 通了，Google 不通。".to_string()
-                } else {
-                    "测试未通过：generate_204 不通。".to_string()
-                };
-                self.log_line(format!(
-                    "隧道测试：{}（generate_204 {}，Google {}）。",
-                    detail, gen204, google
-                ));
-                if !gen204 {
-                    self.set_error(format!("测试未通过：{} 换一个节点再试。", detail));
-                } else if !google {
-                    self.set_error(format!(
-                        "Google 不通：{} 可能是出口被挡，换一个节点再试。",
-                        detail
-                    ));
-                } else {
-                    self.error.clear();
-                }
-            }
             GuiEvent::FrontProxyTestProgress { site } => {
                 // Which site is being tested right now; the busy flag
                 // stays set until the FrontProxyTest result arrives.
@@ -2295,6 +2361,9 @@ impl GuiApp {
                     SortCol::Quality => quality_key(na)
                         .cmp(&quality_key(nb))
                         .then_with(|| na.host.cmp(&nb.host)),
+                    SortCol::PerCapita => per_capita_key(na)
+                        .cmp(&per_capita_key(nb))
+                        .then_with(|| na.host.cmp(&nb.host)),
                     SortCol::Latency => self
                         .latency_key(na)
                         .cmp(&self.latency_key(nb))
@@ -2356,6 +2425,29 @@ impl GuiApp {
     /// connected-node check compares like with like.
     fn blocked_key(host: &str) -> String {
         vpngate::complete_ddns_host(host)
+    }
+
+    /// Target string for the selected row, built exactly like
+    /// `start_connect` builds it (completed host + `:port` when the
+    /// port is known, bare completed host otherwise). `None` when
+    /// nothing is selected.
+    fn selected_target(&self) -> Option<String> {
+        let n = self.nodes.get(self.selected?)?;
+        Some(match n.port {
+            Some(p) => format!("{}:{}", vpngate::complete_ddns_host(&n.host), p),
+            None => vpngate::complete_ddns_host(&n.host),
+        })
+    }
+
+    /// Whether the selected row is the node already connected (same
+    /// target string as `conn.node_label`). Enter / the 连接 button
+    /// on it must be a no-op — never disconnect-and-reconnect the
+    /// same node for nothing (v3.13 switch rule).
+    fn selected_is_connected(&self) -> bool {
+        match (&self.conn, self.selected_target()) {
+            (Some(c), Some(t)) => t == c.node_label,
+            _ => false,
+        }
     }
 
     /// Host of the currently connected node, if any (the `node_label`
@@ -2932,16 +3024,30 @@ impl GuiApp {
     ) -> Option<ShortcutAction> {
         if text_edit_focused
             || self.show_about
-            || self.conn.is_some()
             || self.busy.is_some()
             || self.selected.is_none()
         {
             return None;
         }
         if enter {
-            Some(ShortcutAction::Connect)
+            // v3.13: Enter while connected switches to another
+            // selected node (start_connect disconnects first) — but
+            // Enter on the already-connected node is a no-op, never
+            // a reconnect.
+            if self.selected_is_connected() {
+                None
+            } else {
+                Some(ShortcutAction::Connect)
+            }
         } else if ctrl_r {
-            Some(ShortcutAction::Probe)
+            // Ctrl+R while connected stays blocked, as before — a
+            // probe opens a second tunnel, and the shortcut never
+            // did that (the 探测 button path is unchanged).
+            if self.conn.is_some() {
+                None
+            } else {
+                Some(ShortcutAction::Probe)
+            }
         } else {
             None
         }
@@ -3148,9 +3254,13 @@ impl eframe::App for GuiApp {
             // egui's default scroll style is "floating": the bar is fully
             // transparent (dormant opacity 0) until the mouse hovers the
             // list, so "always visible" alone still shows nothing at rest.
-            // Solid bars are always drawn (6 px, full opacity) in both
-            // themes, which is what the node list needs.
-            ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+            // v3.13 uses thick_scroll_style() instead of solid(): solid
+            // bars are always drawn at rest, but only 6 px wide with a
+            // low-contrast handle — the thick style is 12 px with a
+            // foreground-colour handle, visible in both themes without
+            // hovering. Set once here; every ScrollArea below (outer,
+            // node list, advanced, log) inherits it.
+            ui.style_mut().spacing.scroll = thick_scroll_style();
             // The panel is only 420 px tall at minimum size while the
             // content below the node list (advanced settings, log) needs
             // more room: one outer vertical scroll area wraps everything
@@ -3207,20 +3317,21 @@ impl eframe::App for GuiApp {
             });
             ui.separator();
 
-            // Node list (7 columns: a fixed 28 px status column with ∞
+            // Node list (8 columns: a fixed 28 px status column with ∞
             // for the connected node, then country / ISP / 当前人数 /
-            // 线路质量 / host:port / latency-status; host:port merged
-            // so the grid fits a 560 px window — hostnames alone are
-            // ~200 px wide).
+            // 线路质量 / 人均带宽 / host:port / latency-status;
+            // host:port merged so the grid fits a 560 px window —
+            // hostnames alone are ~200 px wide).
             // Each row: (node index, status icon, country, isp,
-            // sessions cell, quality cell, host:port shown, status,
-            // host:port full). Rows are built in display order (see
-            // display_indices): fetch order by default, or sorted by
-            // the column the user clicked. `selected` still stores a
-            // node index.
+            // sessions cell, quality cell, per-capita cell, host:port
+            // shown, status, host:port full). Rows are built in display
+            // order (see display_indices): fetch order by default, or
+            // sorted by the column the user clicked. `selected` still
+            // stores a node index.
             let connected_host = self.connected_node_host();
             let rows: Vec<(
                 usize,
+                String,
                 String,
                 String,
                 String,
@@ -3274,6 +3385,7 @@ impl eframe::App for GuiApp {
                             },
                             sessions_cell(n),
                             quality_cell(n),
+                            per_capita_cell(n),
                             // All curated hosts end in .opengw.net; drop
                             // the suffix for display (full host is in
                             // the tooltip).
@@ -3294,7 +3406,9 @@ impl eframe::App for GuiApp {
                         )
                     })
                     .collect();
-            let list_h = (panel_h - 250.0).max(120.0);
+            // v3.13: the dragged height wins; until the first drag the
+            // old formula is the default (see effective_list_height).
+            let list_h = self.effective_list_height(panel_h);
             // Recomputed in the row loop below; false when there is
             // no list or no selection (see the row loop).
             self.selected_row_in_view = false;
@@ -3316,12 +3430,13 @@ impl eframe::App for GuiApp {
                         // window at the default widths.
                         ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
                         // Status column (∞) is fixed 28 px and never
-                        // resizable; the other six columns （国家/地
-                        // 区、运营商、当前人数、线路质量、主机:端口、
-                        // 延迟/状态） all come from `col_widths`
-                        // (config `node_col_widths`, 6 elements).
+                        // resizable; the other seven columns （国家/地
+                        // 区、运营商、当前人数、线路质量、人均带宽、
+                        // 主机:端口、延迟/状态） all come from
+                        // `col_widths` (config `node_col_widths`,
+                        // 7 elements).
                         const STATUS_COL_W: f32 = 28.0;
-                        let widths: [f32; 7] = [
+                        let widths: [f32; 8] = [
                             STATUS_COL_W,
                             self.col_widths[0] as f32,
                             self.col_widths[1] as f32,
@@ -3329,20 +3444,21 @@ impl eframe::App for GuiApp {
                             self.col_widths[3] as f32,
                             self.col_widths[4] as f32,
                             self.col_widths[5] as f32,
+                            self.col_widths[6] as f32,
                         ];
                         // 30 px rows: 22 px was easy to miss, and a
                         // click that drifts a few pixels is lost to the
                         // scroll drag (see the tolerant-click note in
                         // the row loop below).
                         let row_h = 30.0;
-                        // One row is 7 cells + 6 six-pixel separators +
-                        // the 12 gaps between the 13 items. The status
+                        // One row is 8 cells + 7 six-pixel separators +
+                        // the 14 gaps between the 15 items. The status
                         // column has no separator (its gap is the same
                         // width, so the columns stay aligned).
                         let handle_w = 6.0f32;
                         let gap = ui.spacing().item_spacing.x;
                         let total_w =
-                            widths.iter().sum::<f32>() + 6.0 * handle_w + 12.0 * gap;
+                            widths.iter().sum::<f32>() + 7.0 * handle_w + 14.0 * gap;
                         // Rows span the full available width, not just
                         // the columns: at 800 px the old 554 px rows
                         // left ~200 px of dead space on the right of
@@ -3397,8 +3513,8 @@ impl eframe::App for GuiApp {
                         // auto-saved to config.toml. The status column
                         // (index 0) has an empty header and no
                         // separator; the country （当前人数 / 线路质量 /
-                        // 延迟/状态） columns (indices 1, 3, 4, 6) are
-                        // clickable to sort (see below).
+                        // 人均带宽 / 延迟/状态） columns (indices 1, 3,
+                        // 4, 5, 7) are clickable to sort (see below).
                         // NOTE: the cells are placed at exact rects (like
                         // the data rows below), not via
                         // allocate_ui_with_layout: that advances the parent
@@ -3423,6 +3539,8 @@ impl eframe::App for GuiApp {
                             format!("当前人数{}", sort_arrow(SortCol::Sessions));
                         let quality_label =
                             format!("线路质量{}", sort_arrow(SortCol::Quality));
+                        let per_capita_label =
+                            format!("人均带宽{}", sort_arrow(SortCol::PerCapita));
                         let latency_label =
                             format!("延迟/状态{}", sort_arrow(SortCol::Latency));
                         let header_labels = [
@@ -3431,6 +3549,7 @@ impl eframe::App for GuiApp {
                             "运营商",
                             sessions_label.as_str(),
                             quality_label.as_str(),
+                            per_capita_label.as_str(),
                             "主机:端口",
                             latency_label.as_str(),
                         ];
@@ -3446,18 +3565,19 @@ impl eframe::App for GuiApp {
                                 egui::RichText::new(*label).strong(),
                             );
                             // Sortable headers: country (1), 当前人数
-                            // (3), 线路质量 (4), 延迟/状态 (6). The
-                            // label is drawn first and the interact
-                            // sits on top of it (a Label has no sense,
-                            // so it cannot eat the click). Clicking a
-                            // header sorts by that column (first click
-                            // = that column's most useful order);
-                            // clicking it again reverses.
+                            // (3), 线路质量 (4), 人均带宽 (5), 延迟/状态
+                            // (7). The label is drawn first and the
+                            // interact sits on top of it (a Label has
+                            // no sense, so it cannot eat the click).
+                            // Clicking a header sorts by that column
+                            // (first click = that column's most useful
+                            // order); clicking it again reverses.
                             let sort_col = match i {
                                 1 => Some(SortCol::Country),
                                 3 => Some(SortCol::Sessions),
                                 4 => Some(SortCol::Quality),
-                                6 => Some(SortCol::Latency),
+                                5 => Some(SortCol::PerCapita),
+                                7 => Some(SortCol::Latency),
                                 _ => None,
                             };
                             if let Some(col) = sort_col {
@@ -3468,6 +3588,9 @@ impl eframe::App for GuiApp {
                                     SortCol::Sessions => "点击按连接人数排序",
                                     SortCol::Quality => {
                                         "点击按线路质量排序（速度优先）"
+                                    }
+                                    SortCol::PerCapita => {
+                                        "点击按人均带宽排序（人均速度从高到低）"
                                     }
                                     SortCol::Latency => {
                                         "点击按延迟排序：已测的按毫秒从小到大，未测的居中，失败的最后"
@@ -3486,27 +3609,29 @@ impl eframe::App for GuiApp {
                                 }
                             }
                             x += widths[i];
-                            if i < 6 {
+                            if i < 7 {
                                 x += gap;
                                 // Separator after a resizable column
                                 // only, and it resizes that column:
                                 // country (1) -> col_widths[0], ISP
                                 // (2) -> col_widths[1], 当前人数
                                 // (3) -> col_widths[2], 线路质量
-                                // (4) -> col_widths[3], host:port
-                                // (5) -> col_widths[4]. The status
+                                // (4) -> col_widths[3], 人均带宽
+                                // (5) -> col_widths[4], host:port
+                                // (6) -> col_widths[5]. The status
                                 // column keeps the same gap but no
                                 // handle, and the last column
-                                // (延迟/状态， 6) has none — so it is
+                                // (延迟/状态， 7) has none — so it is
                                 // the one resizable column that cannot
                                 // be dragged (its width is still
-                                // stored in col_widths[5]).
+                                // stored in col_widths[6]).
                                 let sep_col = match i {
                                     1 => Some(0usize),
                                     2 => Some(1usize),
                                     3 => Some(2usize),
                                     4 => Some(3usize),
                                     5 => Some(4usize),
+                                    6 => Some(5usize),
                                     _ => None,
                                 };
                                 if let Some(wi) = sep_col {
@@ -3562,7 +3687,7 @@ impl eframe::App for GuiApp {
                         let mut row_clicked = false;
                         for (
                             display_i,
-                            (node_idx, status_icon, country, isp, sessions, quality, hostport, status, full),
+                            (node_idx, status_icon, country, isp, sessions, quality, per_capita, hostport, status, full),
                         ) in rows.iter().enumerate()
                         {
                             let (row_rect, row_resp) = ui.allocate_exact_size(
@@ -3642,8 +3767,10 @@ impl eframe::App for GuiApp {
                             };
                             // Place each cell label at its exact rect
                             // (egui 0.36 has no allocate_ui_at_rect).
-                            let cells =
-                                [status_icon, country, isp, sessions, quality, hostport, status];
+                            let cells = [
+                                status_icon, country, isp, sessions, quality, per_capita,
+                                hostport, status,
+                            ];
                             let mut x = row_rect.left();
                             for (j, text) in cells.iter().enumerate() {
                                 let cell_rect = egui::Rect::from_min_size(
@@ -3675,7 +3802,7 @@ impl eframe::App for GuiApp {
                                     put_cell_label(ui, cell_rect, cell_text(text));
                                 }
                                 x += widths[j];
-                                if j < 6 {
+                                if j < 7 {
                                     // Gap, separator, gap — the same
                                     // symmetric spacing as the header row.
                                     x += gap + handle_w + gap;
@@ -3737,6 +3864,28 @@ impl eframe::App for GuiApp {
                 // The list's current scroll offset (the arrow-key
                 // test reads it to prove the list actually scrolled).
                 self.node_list_scroll_y = list_out.state.offset.y;
+                // v3.13 resize handle: drag to change the list height
+                // (120 px to panel minus 150 px). The dragged value
+                // is stored and auto-saved; until the first drag the
+                // formula height above is used.
+                let mut list_h_drag = list_h;
+                let list_rect = height_drag_handle(
+                    ui,
+                    "list_height_handle",
+                    &mut list_h_drag,
+                    120.0,
+                    (panel_h - 150.0).max(120.0),
+                    "拖动调整节点列表高度",
+                );
+                #[cfg(test)]
+                {
+                    self.list_handle_rect = Some(list_rect);
+                }
+                #[cfg(not(test))]
+                let _ = list_rect;
+                if list_h_drag != list_h {
+                    self.list_height = Some(list_h_drag);
+                }
             }
 
             // Primary action row (roomy buttons: 96x34).
@@ -3750,6 +3899,34 @@ impl eframe::App for GuiApp {
                         .clicked()
                     {
                         self.disconnect();
+                    }
+                    // v3.13: the same switch path as Enter — disconnect
+                    // the current node and connect the selected one
+                    // (one start_connect call does both). Only when
+                    // another node is selected; on the connected row
+                    // itself it is disabled, like Enter is a no-op
+                    // there. Before v3.13 this branch showed only
+                    // 断开连接, so switching needed a manual
+                    // disconnect first.
+                    let can_switch = self.busy.is_none()
+                        && self.selected.is_some()
+                        && !self.selected_is_connected();
+                    if ui
+                        .add_enabled(
+                            can_switch,
+                            egui::Button::new("连接").min_size(btn_size),
+                        )
+                        .on_hover_text("断开当前节点并连接选中节点（回车）")
+                        .on_disabled_hover_text(if self.selected.is_none() {
+                            "请先在上面选择一个节点"
+                        } else if self.selected_is_connected() {
+                            "已连接的就是选中节点"
+                        } else {
+                            "正在忙，请稍候"
+                        })
+                        .clicked()
+                    {
+                        self.start_connect(ui.ctx().clone());
                     }
                 } else {
                     let selection = ui.visuals().selection;
@@ -3818,16 +3995,6 @@ impl eframe::App for GuiApp {
                     {
                         self.start_probe_all(ui.ctx().clone());
                     }
-                }
-                if ui
-                    .add_enabled(
-                        connected && self.busy.is_none(),
-                        egui::Button::new("测试隧道").min_size(btn_size),
-                    )
-                    .on_disabled_hover_text("连接后才能测试隧道")
-                    .clicked()
-                {
-                    self.start_test(ui.ctx().clone());
                 }
                 match self.selected_node_label() {
                     Some(label) => ui.label(format!("已选：{}", label)),
@@ -3924,6 +4091,20 @@ impl eframe::App for GuiApp {
             egui::CollapsingHeader::new("高级设置")
                 .default_open(self.advanced_open)
                 .show(ui, |ui| {
+                    // v3.13: the body scrolls inside its own box, so a
+                    // tall advanced section never pushes the log off
+                    // the panel. Height = advanced_height (default
+                    // 240 px, draggable via the handle below, which
+                    // sits inside the header so it only shows while
+                    // open). The body keeps its original indentation.
+                    egui::ScrollArea::vertical()
+                        .id_salt("advanced")
+                        .max_height(self.advanced_height)
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
+                        .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("手动添加节点：");
                         let resp = ui.add(
@@ -4042,6 +4223,27 @@ impl eframe::App for GuiApp {
                             egui::RichText::new("日志文件：未开启").small(),
                         ),
                     };
+                        });
+                    // v3.13 resize handle for the advanced box
+                    // (120–600 px). Inside the header, after the
+                    // scroll area.
+                    let mut adv_h = self.advanced_height;
+                    let adv_rect = height_drag_handle(
+                        ui,
+                        "advanced_height_handle",
+                        &mut adv_h,
+                        120.0,
+                        600.0,
+                        "拖动调整高级设置高度",
+                    );
+                    #[cfg(test)]
+                    {
+                        self.advanced_handle_rect = Some(adv_rect);
+                    }
+                    #[cfg(not(test))]
+                    let _ = adv_rect;
+                    self.advanced_height =
+                        vpngate_client::config::clamp_advanced_height(adv_h);
                 });
             ui.separator();
 
@@ -4050,8 +4252,13 @@ impl eframe::App for GuiApp {
             let log_text = self.log.join("\n");
             egui::ScrollArea::vertical()
                 .id_salt("log")
-                .max_height(90.0)
+                .max_height(self.log_height)
                 .auto_shrink([false, false])
+                // v3.13: the log bar is always visible too (it was the
+                // only one left on the default floating style).
+                .scroll_bar_visibility(
+                    egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                )
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     ui.add(
@@ -4060,6 +4267,23 @@ impl eframe::App for GuiApp {
                             .desired_width(f32::INFINITY),
                     );
                 });
+            // v3.13 resize handle for the log box (60–400 px).
+            let mut log_h = self.log_height;
+            let log_rect = height_drag_handle(
+                ui,
+                "log_height_handle",
+                &mut log_h,
+                60.0,
+                400.0,
+                "拖动调整日志高度",
+            );
+            #[cfg(test)]
+            {
+                self.log_handle_rect = Some(log_rect);
+            }
+            #[cfg(not(test))]
+            let _ = log_rect;
+            self.log_height = vpngate_client::config::clamp_log_height(log_h);
             });
         });
 
@@ -4383,6 +4607,18 @@ mod tests {
             Some((SortCol::Quality, SortDir::Desc)),
             "switching to quality starts fastest-first"
         );
+        app.toggle_sort(SortCol::PerCapita);
+        assert_eq!(
+            app.sort,
+            Some((SortCol::PerCapita, SortDir::Desc)),
+            "switching to per-capita starts highest-first"
+        );
+        app.toggle_sort(SortCol::PerCapita);
+        assert_eq!(
+            app.sort,
+            Some((SortCol::PerCapita, SortDir::Asc)),
+            "same column again reverses"
+        );
         app.toggle_sort(SortCol::Latency);
         assert_eq!(
             app.sort,
@@ -4411,6 +4647,48 @@ mod tests {
         let n = node_stats("c.opengw.net", "日本", 0, 100, 5);
         assert_eq!(sessions_cell(&n), "0人");
         assert_eq!(quality_cell(&n), "100M@5ms");
+    }
+
+    #[test]
+    fn per_capita_cell_formats() {
+        // 572 / 47 = 12.17… -> "12.2M/人" (one decimal, rounded).
+        let n = node_stats("a.opengw.net", "日本", 47, 572, 3);
+        assert_eq!(per_capita_cell(&n), "12.2M/人");
+        // Zero sessions but data: one user alone gets the whole
+        // line — the total speed itself.
+        let n = node_stats("b.opengw.net", "日本", 0, 100, 5);
+        assert_eq!(per_capita_cell(&n), "100.0M/人");
+        // Curated node: all three zero -> "—".
+        let n = node_stats("c.opengw.net", "日本", 0, 0, 0);
+        assert_eq!(per_capita_cell(&n), "—");
+        // Speed zero but sessions present: "0.0M/人", not "—".
+        let n = node_stats("d.opengw.net", "日本", 10, 0, 5);
+        assert_eq!(per_capita_cell(&n), "0.0M/人");
+        // Exact division keeps one decimal: 100 / 4 = 25.0.
+        let n = node_stats("e.opengw.net", "日本", 4, 100, 5);
+        assert_eq!(per_capita_cell(&n), "25.0M/人");
+    }
+
+    #[test]
+    fn per_capita_sort_orders_high_first_with_no_data_last() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            // a: 500/10 = 50.0, b: 100/5 = 20.0, c: 200/1 = 200.0
+            // (few sessions, huge share), d: no data, e: 0/100 = 0.0
+            // (alone on the line — the whole 100 Mbps is theirs).
+            node_stats("a.opengw.net", "日本", 10, 500, 10),
+            node_stats("b.opengw.net", "日本", 5, 100, 5),
+            node_stats("c.opengw.net", "日本", 1, 200, 20),
+            node_stats("d.opengw.net", "日本", 0, 0, 0),
+            node_stats("e.opengw.net", "日本", 0, 100, 5),
+        ];
+        app.sort = Some((SortCol::PerCapita, SortDir::Desc));
+        // First click: highest per-capita first (c 200.0, e 100.0,
+        // a 50.0, b 20.0); the no-data node last.
+        assert_eq!(app.display_indices(), vec![2, 4, 0, 1, 3]);
+        app.sort = Some((SortCol::PerCapita, SortDir::Asc));
+        // Reversed: no-data first, then lowest first.
+        assert_eq!(app.display_indices(), vec![3, 1, 0, 4, 2]);
     }
 
     #[test]
@@ -5874,29 +6152,90 @@ mod tests {
     #[test]
     fn col_widths_roundtrip_through_config() {
         let mut app = GuiApp::for_tests();
-        assert_eq!(app.col_widths, [90, 130, 64, 88, 190, 90]);
-        app.col_widths = [120, 140, 70, 95, 200, 100];
+        assert_eq!(app.col_widths, [90, 130, 64, 88, 80, 190, 90]);
+        app.col_widths = [120, 140, 70, 95, 80, 200, 100];
         let cfg = app.current_config();
-        assert_eq!(cfg.ui.node_col_widths, [120, 140, 70, 95, 200, 100]);
+        assert_eq!(cfg.ui.node_col_widths, [120, 140, 70, 95, 80, 200, 100]);
         let mut app2 = GuiApp::for_tests();
         app2.apply_config(&cfg);
-        assert_eq!(app2.col_widths, [120, 140, 70, 95, 200, 100]);
+        assert_eq!(app2.col_widths, [120, 140, 70, 95, 80, 200, 100]);
     }
 
+    /// v3.13 scroll bars: 12 px solid, foreground-colour handle, 14 px
+    /// allocated in total — the numbers the screenshot test below is
+    /// the visual proof of. (Verified against egui 0.36.2 source, not
+    /// from memory: `bar_width` is the field; solid + AlwaysVisible
+    /// draws at opacity 1.0 at rest.)
     #[test]
-    fn connect_failure_and_test_result_paths() {
+    fn thick_scroll_style_is_12px_solid_foreground() {
+        let s = thick_scroll_style();
+        assert!(!s.floating, "solid bars allocate space, they do not float");
+        assert_eq!(s.bar_width, 12.0, "was 6.0 in ScrollStyle::solid()");
+        assert_eq!(s.bar_inner_margin, 2.0);
+        assert_eq!(s.handle_min_length, 24.0);
+        assert!(
+            s.foreground_color,
+            "the handle must use fg_stroke (grey 60 light / grey 180 dark), not bg_fill (grey 230 light — invisible)"
+        );
+        assert_eq!(s.allocated_width(), 14.0, "2 + 12 + 0");
+    }
+
+    /// v3.13 panel heights: defaults (list undragged, advanced 240,
+    /// log 90), drag values round-trip through config, the list
+    /// formula is the default until the first drag, and a dragged
+    /// list height is clamped to the current panel.
+    #[test]
+    fn panel_heights_roundtrip_through_config() {
+        let mut app = GuiApp::for_tests();
+        assert_eq!(app.list_height, None);
+        assert_eq!(app.advanced_height, 240.0);
+        assert_eq!(app.log_height, 90.0);
+        // Undragged: the old formula is the effective height.
+        assert_eq!(app.effective_list_height(600.0), 350.0);
+        assert_eq!(app.effective_list_height(420.0), 170.0);
+        assert_eq!(app.effective_list_height(300.0), 120.0);
+        // Dragged values round-trip through config (whole pixels).
+        app.list_height = Some(300.0);
+        app.advanced_height = 200.0;
+        app.log_height = 120.0;
+        let cfg = app.current_config();
+        assert_eq!(cfg.ui.list_height, Some(300));
+        assert_eq!(cfg.ui.advanced_height, 200);
+        assert_eq!(cfg.ui.log_height, 120);
+        let mut app2 = GuiApp::for_tests();
+        app2.apply_config(&cfg);
+        assert_eq!(app2.list_height, Some(300.0));
+        assert_eq!(app2.advanced_height, 200.0);
+        assert_eq!(app2.log_height, 120.0);
+        // A dragged list height wins over the formula, clamped to
+        // the panel (120 px to panel minus 150 px).
+        assert_eq!(app2.effective_list_height(600.0), 300.0);
+        assert_eq!(app2.effective_list_height(420.0), 270.0);
+        // Tiny panel: the ceiling (panel minus 150 px) is 150 px,
+        // so a dragged 300 px clamps to 150, not to the 120 floor.
+        assert_eq!(app2.effective_list_height(300.0), 150.0);
+        // Old config without the keys loads the defaults.
+        let old: Config =
+            toml::from_str("[ui]\nnode_col_widths = [90, 130, 64, 88, 80, 190, 90]\n")
+                .unwrap();
+        let mut app3 = GuiApp::for_tests();
+        app3.apply_config(&old);
+        assert_eq!(app3.list_height, None);
+        assert_eq!(app3.advanced_height, 240.0);
+        assert_eq!(app3.log_height, 90.0);
+    }
+
+    /// A failed connect clears the busy flag and names the fix
+    /// (v3.13: the tunnel-test event arm this test used to drive was
+    /// removed with the tunnel-test button — the connect path is all
+    /// that is left to assert here).
+    #[test]
+    fn connect_failure_path() {
         let mut app = GuiApp::for_tests();
         app.busy = Some(Busy::Connecting);
         app.apply_event(GuiEvent::ConnectFailed("all candidates failed".to_string()));
         assert!(app.busy.is_none());
         assert!(app.conn.is_none());
-        assert!(app.error.contains("换一个节点"));
-        app.apply_event(GuiEvent::TestResult {
-            gen204: true,
-            google: false,
-            detail: "generate_204：HTTP/1.1 204；Google TLS 握手失败。".to_string(),
-        });
-        assert!(app.status.contains("部分通过"));
         assert!(app.error.contains("换一个节点"));
     }
 
@@ -6162,6 +6501,373 @@ mod tests {
         assert_eq!(app.status, "未连接");
     }
 
+    /// Mock SSTP server handle (tests/mock_sstp.py, stdlib Python).
+    /// Dropping it kills the server it started — unless it only
+    /// reused one that was already listening (`None` child).
+    struct MockServer(Option<std::process::Child>);
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.0.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    /// The mock-using switch tests must serialize: a `start` in one
+    /// test can pkill the mock another test is mid-handshake with
+    /// (same pattern as the integration tests' MOCK_LOCK).
+    static MOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn tool_exists(name: &str) -> bool {
+        std::process::Command::new("which")
+            .arg(name)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn ensure_mock_cert() {
+        let cert = "/tmp/mock_sstp_cert.pem";
+        let key = "/tmp/mock_sstp_key.pem";
+        if std::path::Path::new(cert).exists() && std::path::Path::new(key).exists() {
+            return;
+        }
+        let _ = std::process::Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-keyout", key, "-out", cert,
+                "-days", "1", "-nodes", "-subj", "/CN=localhost",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    fn start_mock_server() -> Option<MockServer> {
+        // Reuse a mock that is already listening.
+        if std::net::TcpStream::connect_timeout(
+            &"127.0.0.1:8443".parse().unwrap(),
+            Duration::from_millis(300),
+        )
+        .is_ok()
+        {
+            return Some(MockServer(None));
+        }
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "mock_sstp.py"])
+            .output();
+        std::thread::sleep(Duration::from_millis(300));
+        ensure_mock_cert();
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let script = format!("{}/tests/mock_sstp.py", manifest);
+        let child = std::process::Command::new("python3")
+            .arg(script)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        Some(MockServer(Some(child)))
+    }
+
+    fn wait_for_mock_port() -> bool {
+        for _ in 0..50 {
+            if std::net::TcpStream::connect("127.0.0.1:8443").is_ok() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// Open one real tunnel to the mock SSTP server, for tests that
+    /// need a live `conn` without a real node. Returns the server
+    /// handle (keep it alive for the test) and the tunnel. The
+    /// runtime used for the handshake is dropped before returning —
+    /// the tunnel is only ever disconnected afterwards, never used
+    /// for traffic. `None` (with a SKIP note) when the mock cannot
+    /// run — same skip policy as the integration tests.
+    fn mock_tunnel() -> Option<(MockServer, Arc<SstpTunnel>)> {
+        if !tool_exists("python3") || !tool_exists("openssl") {
+            eprintln!("SKIP: python3/openssl not available; mock SSTP server cannot run");
+            return None;
+        }
+        let mock = start_mock_server()?;
+        if !wait_for_mock_port() {
+            eprintln!("SKIP: mock SSTP server did not listen on 8443");
+            return None;
+        }
+        let rt = tokio::runtime::Runtime::new().ok()?;
+        let tunnel = rt
+            .block_on(async {
+                SstpTunnel::connect(
+                    &Connector::new(None),
+                    "127.0.0.1",
+                    8443,
+                    Duration::from_secs(10),
+                )
+                .await
+            })
+            .ok()?;
+        Some((mock, tunnel))
+    }
+
+    /// An app "connected" to A (a.opengw.net:992) through the mock
+    /// tunnel, with B as the other row. `node_in` gives both rows
+    /// port 992, so the targets are `a.opengw.net:992` /
+    /// `b.opengw.net:992`.
+    fn connected_test_app(tunnel: Arc<SstpTunnel>) -> GuiApp {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "美国"),
+        ];
+        let vip = tunnel.vip;
+        app.conn = Some(ActiveConnection {
+            tunnel,
+            serve: Vec::new(),
+            proxy_guard: None,
+            listen_addr: "127.0.0.1:10818".to_string(),
+            node_label: "a.opengw.net:992".to_string(),
+            vip,
+        });
+        app
+    }
+
+    #[test]
+    fn selected_target_builds_completed_host_port() {
+        let mut app = GuiApp::for_tests();
+        app.nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node("public-vpn-192"),
+        ];
+        // Port known: host:port, DDNS suffix already complete.
+        app.selected = Some(0);
+        assert_eq!(
+            app.selected_target().as_deref(),
+            Some("a.opengw.net:992")
+        );
+        // Bare DDNS label, no port: completed to the full FQDN.
+        app.nodes[1].port = None;
+        app.selected = Some(1);
+        assert_eq!(
+            app.selected_target().as_deref(),
+            Some("public-vpn-192.opengw.net")
+        );
+        // Nothing selected: no target.
+        app.selected = None;
+        assert_eq!(app.selected_target(), None);
+    }
+
+    /// v3.13 switch, mock-backed: connected to A, B selected, Enter
+    /// (via shortcut_action + start_connect) disconnects A and
+    /// starts connecting B; Enter on A itself is a no-op; Enter while
+    /// busy, with a text field focused, or with About open stays
+    /// blocked; Ctrl+R while connected stays blocked too.
+    #[test]
+    fn enter_switches_to_another_node_while_connected() {
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        // --- Switch: connected A, B selected, Enter. ---
+        let mut app = connected_test_app(tunnel.clone());
+        app.selected = Some(1);
+        assert!(
+            !app.selected_is_connected(),
+            "B is not the connected node"
+        );
+        assert_eq!(
+            app.shortcut_action(true, false, false),
+            Some(ShortcutAction::Connect),
+            "Enter on another node must offer Connect even while connected"
+        );
+        assert_eq!(
+            app.shortcut_action(false, true, false),
+            None,
+            "Ctrl+R while connected stays blocked"
+        );
+        app.start_connect(ctx.clone());
+        assert!(app.conn.is_none(), "the old connection must be gone");
+        assert_eq!(
+            app.busy,
+            Some(Busy::Connecting),
+            "the new connect must have started"
+        );
+        assert_eq!(app.status, "正在连接 b.opengw.net:992…");
+        assert!(
+            app.log.iter().any(|l| l.contains("已断开 a.opengw.net:992")),
+            "log must name the disconnected old node: {:?}",
+            app.log
+        );
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.contains("开始连接 b.opengw.net:992")),
+            "log must name the new connect: {:?}",
+            app.log
+        );
+        // --- Same node: Enter is a no-op. ---
+        let mut app = connected_test_app(tunnel);
+        app.selected = Some(0);
+        assert!(app.selected_is_connected(), "A is the connected node");
+        assert_eq!(
+            app.shortcut_action(true, false, false),
+            None,
+            "Enter on the connected node must offer nothing"
+        );
+        let log_len = app.log.len();
+        let status = app.status.clone();
+        app.start_connect(ctx.clone());
+        assert!(app.conn.is_some(), "same-node Enter must not disconnect");
+        assert!(app.busy.is_none(), "same-node Enter must not start anything");
+        assert_eq!(app.log.len(), log_len, "no log lines for a no-op");
+        assert_eq!(app.status, status, "no status change for a no-op");
+        // --- Busy / text focus / About: still blocked. ---
+        app.selected = Some(1);
+        app.busy = Some(Busy::Probing);
+        assert_eq!(
+            app.shortcut_action(true, false, false),
+            None,
+            "Enter while busy stays blocked"
+        );
+        let log_len = app.log.len();
+        app.start_connect(ctx.clone());
+        assert!(app.conn.is_some(), "busy Enter must not disconnect");
+        assert_eq!(app.busy, Some(Busy::Probing));
+        assert_eq!(app.log.len(), log_len);
+        app.busy = None;
+        assert_eq!(
+            app.shortcut_action(true, false, true),
+            None,
+            "Enter with a text field focused stays blocked"
+        );
+        app.show_about = true;
+        assert_eq!(
+            app.shortcut_action(true, false, false),
+            None,
+            "Enter with About open stays blocked"
+        );
+    }
+
+    /// v3.13 switch through the real UI (kittest): connected to A,
+    /// click row B, press Enter — the old connection is dropped and
+    /// a connect to B starts. Needs a graphics adapter + the mock
+    /// server (same skip as the unit test above).
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn enter_key_switches_node_while_connected() {
+        use egui_kittest::Harness;
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 420.0))
+            .build_eframe(|cc| GuiApp::for_render_tests(cc));
+        harness.run_steps(10);
+        harness.state_mut().nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "美国"),
+        ];
+        let vip = tunnel.vip;
+        harness.state_mut().conn = Some(ActiveConnection {
+            tunnel,
+            serve: Vec::new(),
+            proxy_guard: None,
+            listen_addr: "127.0.0.1:10818".to_string(),
+            node_label: "a.opengw.net:992".to_string(),
+            vip,
+        });
+        harness.run_steps(3);
+        // Click row B, then Enter.
+        click_row_label(&mut harness, "美国");
+        assert_eq!(harness.state().selected, Some(1));
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(3);
+        assert!(
+            harness.state().conn.is_none(),
+            "Enter must drop the old connection"
+        );
+        assert_eq!(
+            harness.state().busy,
+            Some(Busy::Connecting),
+            "Enter must start connecting B, busy={:?}",
+            harness.state().busy
+        );
+        assert!(
+            harness
+                .state()
+                .log
+                .iter()
+                .any(|l| l.contains("已断开 a.opengw.net:992")),
+            "log must name the disconnected old node: {:?}",
+            harness.state().log
+        );
+        assert!(
+            harness
+                .state()
+                .log
+                .iter()
+                .any(|l| l.contains("开始连接 b.opengw.net:992")),
+            "log must name the new connect: {:?}",
+            harness.state().log
+        );
+    }
+
+    /// v3.13 switch through the 连接 button (kittest): while
+    /// connected to A with B selected, the 连接 button next to
+    /// 断开连接 disconnects A and starts connecting B — the same
+    /// path as Enter. Needs a graphics adapter + the mock server.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn connect_button_switches_node_while_connected() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let _mock_guard = MOCK_LOCK.lock().unwrap();
+        let Some((_mock, tunnel)) = mock_tunnel() else {
+            return;
+        };
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 420.0))
+            .build_eframe(|cc| GuiApp::for_render_tests(cc));
+        harness.run_steps(10);
+        harness.state_mut().nodes = vec![
+            node_in("a.opengw.net", "日本"),
+            node_in("b.opengw.net", "美国"),
+        ];
+        let vip = tunnel.vip;
+        harness.state_mut().conn = Some(ActiveConnection {
+            tunnel,
+            serve: Vec::new(),
+            proxy_guard: None,
+            listen_addr: "127.0.0.1:10818".to_string(),
+            node_label: "a.opengw.net:992".to_string(),
+            vip,
+        });
+        harness.state_mut().selected = Some(1);
+        harness.run_steps(3);
+        // The switch 连接 button must exist next to 断开连接 while
+        // another node is selected (before v3.13 only 断开连接 was
+        // shown when connected).
+        let btn = harness.get_by_label("连接");
+        let center = btn.rect().center();
+        harness.drag_at(center);
+        harness.run_steps(3);
+        harness.drop_at(center);
+        harness.run_steps(3);
+        assert!(
+            harness.state().conn.is_none(),
+            "the switch button must drop the old connection"
+        );
+        assert_eq!(
+            harness.state().busy,
+            Some(Busy::Connecting),
+            "the switch button must start connecting B, busy={:?}",
+            harness.state().busy
+        );
+    }
+
     /// v3.12: hiding to the tray sets the flag and writes the
     /// one-time hint (status + log); a second hide does not repeat
     /// it. A Quit decision changes nothing here.
@@ -6358,7 +7064,7 @@ mod tests {
         label: &str,
         wi: usize,
         delta: f32,
-    ) -> [u16; 6] {
+    ) -> [u16; 7] {
         use egui_kittest::kittest::Queryable;
         let w = harness.state().col_widths[wi];
         let header = harness.get_by_label(label);
@@ -6382,30 +7088,34 @@ mod tests {
     /// Dragging a header separator widens that column (needs a graphics
     /// adapter, like the render test). Every resizable column but the
     /// last has a separator: 国家/地区， 运营商， 当前人数， 线路质量，
-    /// 主机:端口 — dragging one widens exactly that column and leaves
-    /// the other five alone, and the widths persist through the
-    /// config round-trip.
+    /// 人均带宽， 主机:端口 — dragging one widens exactly that column
+    /// and leaves the other six alone, and the widths persist through
+    /// the config round-trip.
     #[test]
     #[ignore = "drives the UI with kittest; needs a graphics adapter"]
     fn column_separator_drag_widens_column() {
         use egui_kittest::Harness;
         // 800 px, not the 560 px minimum: at the default widths the
-        // row is 788 px wide, so the 主机:端口 separator (x ≈ 689)
+        // row is 886 px wide, so the 主机:端口 separator (x ≈ 787)
         // is off-screen at 560 px and cannot be grabbed. Dragging
         // right-to-left keeps the not-yet-dragged separators at
         // their initial positions (a drag only shifts columns to
-        // its right).
+        // its right). The drags run on narrowed widths (total
+        // ≈ 524 px) so every separator is inside the 800 px window.
         let mut harness = Harness::builder()
             .with_size(egui::vec2(800.0, 420.0))
             .build_eframe(|cc| GuiApp::for_render_tests(cc));
         harness.run_steps(10);
         assert_eq!(
             harness.state().col_widths,
-            [90, 130, 64, 88, 190, 90],
+            [90, 130, 64, 88, 80, 190, 90],
             "defaults before any drag"
         );
+        harness.state_mut().col_widths = [50, 60, 40, 50, 40, 80, 50];
+        harness.run_steps(5);
         for (label, wi) in [
-            ("主机:端口", 4usize),
+            ("主机:端口", 5usize),
+            ("人均带宽", 4usize),
             ("线路质量", 3usize),
             ("当前人数", 2usize),
             ("运营商", 1usize),
@@ -6439,6 +7149,149 @@ mod tests {
         let mut app2 = GuiApp::for_tests();
         app2.apply_config(&cfg);
         assert_eq!(app2.col_widths, harness.state().col_widths);
+    }
+
+    /// Drag a height-handle rect straight down by `delta` px (same
+    /// kittest sequence as the column-separator drag: hover, press,
+    /// move while held, release).
+    fn drag_handle_down(
+        harness: &mut egui_kittest::Harness<GuiApp>,
+        rect: egui::Rect,
+        delta: f32,
+    ) {
+        let start = rect.center();
+        harness.hover_at(start);
+        harness.run();
+        harness.drag_at(start);
+        harness.run();
+        let target = egui::pos2(start.x, start.y + delta);
+        harness.hover_at(target);
+        harness.run();
+        harness.drop_at(target);
+        harness.run();
+    }
+
+    /// v3.13: dragging each of the three height handles (node list,
+    /// advanced settings, log) grows that box, and the dragged
+    /// heights persist through the config round-trip. Dragged
+    /// bottom-up (log, advanced, list) so a taller box above never
+    /// pushes a not-yet-dragged handle off-screen mid-test. Needs a
+    /// graphics adapter, like the render test.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn height_handles_drag_and_persist() {
+        use egui_kittest::Harness;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 800.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                // Compact starting heights so all three handles fit
+                // in the window at once (no outer scroll needed to
+                // reach them). Advanced is open in render tests.
+                app.list_height = Some(150.0);
+                app.advanced_height = 120.0;
+                app.log_height = 60.0;
+                app.log = (0..30).map(|i| format!("日志行 {i}")).collect();
+                app
+            });
+        harness.run_steps(10);
+        // Log handle first (bottom-up).
+        let rect = harness
+            .state()
+            .log_handle_rect
+            .expect("log handle must be laid out");
+        drag_handle_down(&mut harness, rect, 40.0);
+        let log_h = harness.state().log_height;
+        assert!(
+            (85.0..=120.0).contains(&log_h),
+            "log height after a +40 drag: {log_h} (was 60)"
+        );
+        // Advanced handle.
+        harness.run_steps(3);
+        let rect = harness
+            .state()
+            .advanced_handle_rect
+            .expect("advanced handle must be laid out");
+        drag_handle_down(&mut harness, rect, 40.0);
+        let adv_h = harness.state().advanced_height;
+        assert!(
+            (145.0..=180.0).contains(&adv_h),
+            "advanced height after a +40 drag: {adv_h} (was 120)"
+        );
+        // List handle.
+        harness.run_steps(3);
+        let rect = harness
+            .state()
+            .list_handle_rect
+            .expect("list handle must be laid out");
+        drag_handle_down(&mut harness, rect, 40.0);
+        let list_h = harness
+            .state()
+            .list_height
+            .expect("dragging the list handle must set list_height");
+        assert!(
+            (175.0..=210.0).contains(&list_h),
+            "list height after a +40 drag: {list_h} (was 150)"
+        );
+        // The dragged heights persist: current_config carries them
+        // (whole pixels), and a fresh app built from that config
+        // shows the same heights.
+        let cfg = harness.state().current_config();
+        assert!(
+            (cfg.ui.list_height.unwrap() as f32 - list_h).abs() <= 1.0,
+            "saved list_height {:?} vs dragged {list_h}",
+            cfg.ui.list_height
+        );
+        assert!(
+            (cfg.ui.advanced_height as f32 - adv_h).abs() <= 1.0,
+            "saved advanced_height {} vs dragged {adv_h}",
+            cfg.ui.advanced_height
+        );
+        assert!(
+            (cfg.ui.log_height as f32 - log_h).abs() <= 1.0,
+            "saved log_height {} vs dragged {log_h}",
+            cfg.ui.log_height
+        );
+        let mut app2 = GuiApp::for_tests();
+        app2.apply_config(&cfg);
+        assert_eq!(app2.list_height, Some(list_h.round()));
+        assert!((app2.advanced_height - adv_h).abs() <= 1.0);
+        assert!((app2.log_height - log_h).abs() <= 1.0);
+    }
+
+    /// v3.13 scroll bars, both themes: the 28 curated nodes overflow
+    /// the ~170 px list, 30 log lines overflow the 90 px log box, and
+    /// the whole content overflows the panel — all three bars must
+    /// have something to show. The PNGs are the proof — check them,
+    /// don't trust this test alone (it only asserts the render
+    /// pipeline ran); the 12 px width is asserted in
+    /// `thick_scroll_style_is_12px_solid_foreground`.
+    #[test]
+    #[ignore = "renders PNGs for review; needs a graphics adapter"]
+    fn scrollbars_visible_in_both_themes() {
+        use egui_kittest::Harness;
+        for (theme, name) in [
+            (egui::Theme::Dark, "dark"),
+            (egui::Theme::Light, "light"),
+        ] {
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(560.0, 420.0))
+                .with_theme(theme)
+                .build_eframe(|cc| {
+                    let mut app = GuiApp::for_render_tests(cc);
+                    app.log = (0..30).map(|i| format!("日志行 {i}")).collect();
+                    app
+                });
+            harness.run_steps(30);
+            let path = std::env::temp_dir()
+                .join(format!("ui-review-v313-scrollbars-{name}.png"));
+            harness
+                .render()
+                .expect("needs a graphics adapter")
+                .save(&path)
+                .unwrap();
+            eprintln!("{}", path.display());
+        }
     }
 
     /// A plain click selects the row, and a press that drifts 8 px
@@ -7311,7 +8164,7 @@ mod tests {
                     node_stats("b.opengw.net", "日本", 10, 100, 5),
                     node_stats("c.opengw.net", "日本", 10, 200, 20),
                 ];
-                app.col_widths = [50, 60, 40, 50, 80, 50];
+                app.col_widths = [50, 60, 40, 50, 40, 80, 50];
                 app
             });
         harness.run_steps(10);
@@ -7351,6 +8204,57 @@ mod tests {
             "second latency click reverses the whole order"
         );
         assert_eq!(harness.state().display_indices(), vec![2, 1, 0]);
+    }
+
+    /// Clicking the 人均带宽 header sorts by per-capita bandwidth
+    /// (first click = highest first, second click = reversed), and
+    /// the arrow moves with it. The header sits past the right edge
+    /// at 560 px with the default column widths, so the test narrows
+    /// the resizable columns to bring it into view. Needs a graphics
+    /// adapter.
+    #[test]
+    #[ignore = "drives the UI with kittest; needs a graphics adapter"]
+    fn per_capita_header_click_toggles_sort() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 420.0))
+            .build_eframe(|cc| {
+                let mut app = GuiApp::for_render_tests(cc);
+                app.nodes = vec![
+                    // a: 572/47 = 12.2, b: 100/5 = 20.0,
+                    // c: 200/1 = 200.0.
+                    node_stats("a.opengw.net", "日本", 47, 572, 3),
+                    node_stats("b.opengw.net", "日本", 5, 100, 5),
+                    node_stats("c.opengw.net", "日本", 1, 200, 20),
+                ];
+                app.col_widths = [50, 60, 40, 50, 40, 80, 50];
+                app
+            });
+        harness.run_steps(10);
+        assert_eq!(harness.state().sort, None);
+        let header = harness.get_by_label("人均带宽");
+        let center = header.rect().center();
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(
+            harness.state().sort,
+            Some((SortCol::PerCapita, SortDir::Desc)),
+            "first per-capita click: highest first"
+        );
+        assert_eq!(harness.state().display_indices(), vec![2, 1, 0]);
+        harness.get_by_label("人均带宽 ▼");
+        harness.drag_at(center);
+        harness.run();
+        harness.drop_at(center);
+        harness.run();
+        assert_eq!(
+            harness.state().sort,
+            Some((SortCol::PerCapita, SortDir::Asc)),
+            "second per-capita click reverses the whole order"
+        );
+        assert_eq!(harness.state().display_indices(), vec![0, 1, 2]);
     }
 
     /// Enter connects the selected node and Ctrl+R probes it (the

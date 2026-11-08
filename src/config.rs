@@ -28,7 +28,7 @@
 //! timeout_secs = 10
 //!
 //! [ui]
-//! node_col_widths = [90, 130, 64, 88, 190, 90]
+//! node_col_widths = [90, 130, 64, 88, 80, 190, 90]
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -158,48 +158,114 @@ fn default_timeout() -> u64 {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct UiSettings {
     /// Node-list column widths in pixels, in display order: country,
-    /// ISP, 当前人数， 线路质量， host:port, latency/status. Draggable
-    /// at the header separators in the GUI (every resizable column
-    /// but the last has one); persisted with the rest of the settings
-    /// via auto-save. Pre-v3.7 configs stored only 4 widths
-    /// (country, ISP, host:port, latency/status) — those load too,
-    /// with the two new columns taking their defaults (see
-    /// `de_col_widths`).
+    /// ISP, 当前人数， 线路质量， 人均带宽， host:port, latency/status.
+    /// Draggable at the header separators in the GUI (every resizable
+    /// column but the last has one); persisted with the rest of the
+    /// settings via auto-save. Pre-v3.7 configs stored only 4 widths
+    /// (country, ISP, host:port, latency/status) and v3.12 configs
+    /// stored 6 — those load too, with the newer columns taking
+    /// their defaults (see `de_col_widths`).
     #[serde(default = "default_col_widths", deserialize_with = "de_col_widths")]
-    pub node_col_widths: [u16; 6],
+    pub node_col_widths: [u16; 7],
+    /// Node-list box height in pixels, once the user has dragged its
+    /// resize handle (v3.13). `None` = never dragged: the GUI uses
+    /// its formula default (`panel_h - 250`, at least 120 px) instead,
+    /// so old configs (no such key) and fresh installs behave exactly
+    /// as before until the user drags. Whole pixels (`u16`, like
+    /// `node_col_widths` — `UiSettings` derives `Eq`, which `f32`
+    /// cannot satisfy); the GUI keeps the live value as `f32` and
+    /// rounds on save. A dragged value is clamped on use (see
+    /// `clamp_list_height`): at least 120 px, at most the panel
+    /// height minus room for the rest of the UI.
+    #[serde(default)]
+    pub list_height: Option<u16>,
+    /// Advanced-settings box height in pixels (the CollapsingHeader
+    /// body scrolls inside it, v3.13). Default 240 px; clamped to
+    /// 120–600 px on use (see `clamp_advanced_height`).
+    #[serde(default = "default_advanced_height")]
+    pub advanced_height: u16,
+    /// Log box height in pixels (v3.13). Default 90 px (the old
+    /// hard-coded value); clamped to 60–400 px on use (see
+    /// `clamp_log_height`).
+    #[serde(default = "default_log_height")]
+    pub log_height: u16,
 }
 
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
             node_col_widths: default_col_widths(),
+            list_height: None,
+            advanced_height: default_advanced_height(),
+            log_height: default_log_height(),
         }
     }
 }
 
-fn default_col_widths() -> [u16; 6] {
-    [90, 130, 64, 88, 190, 90]
+/// Default advanced-settings box height (v3.13): the body holds the
+/// manual-add row, front-proxy grid, test button, save row and log
+/// path — about 280 px of content, so 240 px shows most of it with
+/// the rest one scroll away.
+fn default_advanced_height() -> u16 {
+    240
 }
 
-/// Accept both the current 6-element `node_col_widths` and the
-/// pre-v3.7 4-element form. The old order was (country, ISP,
-/// host:port, latency/status); the new columns （当前人数 at index 2,
-/// 线路质量 at index 3) take their defaults, and the old host:port
-/// and latency/status values move to indices 4 and 5. Any other
-/// length (a hand-edited file, a future shape) falls back to the
-/// defaults rather than failing the whole config load.
-fn de_col_widths<'de, D>(deserializer: D) -> Result<[u16; 6], D::Error>
+/// Default log box height: the pre-v3.13 hard-coded value.
+fn default_log_height() -> u16 {
+    90
+}
+
+/// Clamp a dragged node-list height to its sane range for the current
+/// panel height: never below 120 px, never so tall the buttons /
+/// advanced section / log below it have no room (panel minus 150 px).
+pub fn clamp_list_height(h: f32, panel_h: f32) -> f32 {
+    h.clamp(120.0, (panel_h - 150.0).max(120.0))
+}
+
+/// Clamp a dragged advanced-settings height: 120–600 px.
+pub fn clamp_advanced_height(h: f32) -> f32 {
+    h.clamp(120.0, 600.0)
+}
+
+/// Clamp a dragged log height: 60–400 px.
+pub fn clamp_log_height(h: f32) -> f32 {
+    h.clamp(60.0, 400.0)
+}
+
+fn default_col_widths() -> [u16; 7] {
+    [90, 130, 64, 88, 80, 190, 90]
+}
+
+/// Accept the current 7-element `node_col_widths`, the v3.12
+/// 6-element form, and the pre-v3.7 4-element form. The 6-element
+/// order was (country, ISP, 当前人数， 线路质量， host:port,
+/// latency/status); the new 人均带宽 column (index 4) takes its
+/// default and the old host:port and latency/status values move to
+/// indices 5 and 6. The 4-element order was (country, ISP,
+/// host:port, latency/status); the three newer columns （当前人数 at
+/// index 2, 线路质量 at index 3, 人均带宽 at index 4) take their
+/// defaults, and the old host:port and latency/status values move
+/// to indices 5 and 6. Any other length (a hand-edited file, a
+/// future shape) falls back to the defaults rather than failing the
+/// whole config load.
+fn de_col_widths<'de, D>(deserializer: D) -> Result<[u16; 7], D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let widths = Vec::<u16>::deserialize(deserializer)?;
     Ok(match widths.len() {
-        6 => [
-            widths[0], widths[1], widths[2], widths[3], widths[4], widths[5],
+        7 => [
+            widths[0], widths[1], widths[2], widths[3], widths[4], widths[5], widths[6],
         ],
+        6 => {
+            let d = default_col_widths();
+            [
+                widths[0], widths[1], widths[2], widths[3], d[4], widths[4], widths[5],
+            ]
+        }
         4 => {
             let d = default_col_widths();
-            [widths[0], widths[1], d[2], d[3], widths[2], widths[3]]
+            [widths[0], widths[1], d[2], d[3], d[4], widths[2], widths[3]]
         }
         _ => default_col_widths(),
     })
@@ -402,20 +468,51 @@ mod tests {
     #[test]
     fn ui_col_widths_default_and_roundtrip() {
         let cfg = Config::default();
-        assert_eq!(cfg.ui.node_col_widths, [90, 130, 64, 88, 190, 90]);
+        assert_eq!(cfg.ui.node_col_widths, [90, 130, 64, 88, 80, 190, 90]);
         let parsed: Config = toml::from_str(
-            "[ui]\nnode_col_widths = [120, 140, 70, 95, 200, 100]\n",
+            "[ui]\nnode_col_widths = [120, 140, 70, 95, 80, 200, 100]\n",
         )
         .unwrap();
-        assert_eq!(parsed.ui.node_col_widths, [120, 140, 70, 95, 200, 100]);
+        assert_eq!(parsed.ui.node_col_widths, [120, 140, 70, 95, 80, 200, 100]);
         // A config file without [ui] keeps the defaults.
         let parsed2: Config = toml::from_str("[listen]\nlocal_port = 10818\n").unwrap();
-        assert_eq!(parsed2.ui.node_col_widths, [90, 130, 64, 88, 190, 90]);
+        assert_eq!(parsed2.ui.node_col_widths, [90, 130, 64, 88, 80, 190, 90]);
         assert_eq!(parsed2.listen.local_port, 10818);
         let path = tmp_path("ui-widths");
         parsed.save(&path).expect("save works");
         let back = Config::load(Some(&path)).expect("load works");
-        assert_eq!(back.ui.node_col_widths, [120, 140, 70, 95, 200, 100]);
+        assert_eq!(back.ui.node_col_widths, [120, 140, 70, 95, 80, 200, 100]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ui_col_widths_migrates_old_6_element_config() {
+        // A v3.12 config stored 6 widths (country, ISP, 当前人数,
+        // 线路质量, host:port, latency/status). Loading it keeps
+        // those six values in place and inserts the new 人均带宽
+        // column (default 80) at index 4, shifting host:port and
+        // latency/status to indices 5 and 6 — no error, no lost
+        // settings.
+        let parsed: Config = toml::from_str(
+            "[ui]\nnode_col_widths = [120, 140, 70, 95, 200, 100]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.ui.node_col_widths,
+            [120, 140, 70, 95, 80, 200, 100]
+        );
+        // Saving writes the new 7-element form, which loads back
+        // unchanged.
+        let path = tmp_path("ui-widths-migrate-6");
+        parsed.save(&path).expect("save works");
+        let text = std::fs::read_to_string(&path).expect("saved file readable");
+        assert!(
+            text.contains("node_col_widths = [120, 140, 70, 95, 80, 200, 100]"),
+            "saved as 7 elements: {}",
+            text
+        );
+        let back = Config::load(Some(&path)).expect("load works");
+        assert_eq!(back.ui.node_col_widths, [120, 140, 70, 95, 80, 200, 100]);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -423,26 +520,27 @@ mod tests {
     fn ui_col_widths_migrates_old_4_element_config() {
         // A pre-v3.7 config stored [country, ISP, host:port,
         // latency/status]. Loading it keeps those four values in
-        // place and fills the two new columns （当前人数 / 线路质量）
-        // with their defaults — no error, no lost settings.
+        // place and fills the three newer columns （当前人数 /
+        // 线路质量 / 人均带宽） with their defaults — no error, no
+        // lost settings.
         let parsed: Config =
             toml::from_str("[ui]\nnode_col_widths = [120, 140, 200, 100]\n").unwrap();
         assert_eq!(
             parsed.ui.node_col_widths,
-            [120, 140, 64, 88, 200, 100]
+            [120, 140, 64, 88, 80, 200, 100]
         );
-        // Saving writes the new 6-element form, which loads back
+        // Saving writes the new 7-element form, which loads back
         // unchanged.
         let path = tmp_path("ui-widths-migrate");
         parsed.save(&path).expect("save works");
         let text = std::fs::read_to_string(&path).expect("saved file readable");
         assert!(
-            text.contains("node_col_widths = [120, 140, 64, 88, 200, 100]"),
-            "saved as 6 elements: {}",
+            text.contains("node_col_widths = [120, 140, 64, 88, 80, 200, 100]"),
+            "saved as 7 elements: {}",
             text
         );
         let back = Config::load(Some(&path)).expect("load works");
-        assert_eq!(back.ui.node_col_widths, [120, 140, 64, 88, 200, 100]);
+        assert_eq!(back.ui.node_col_widths, [120, 140, 64, 88, 80, 200, 100]);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -450,7 +548,7 @@ mod tests {
     fn ui_col_widths_unexpected_length_falls_back_to_default() {
         // A hand-edited array of any other length must not fail the
         // whole config load — it falls back to the defaults.
-        for n in [1, 3, 5, 7] {
+        for n in [1, 3, 5, 8] {
             let widths: Vec<u16> = (0..n).map(|i| 50 + i as u16).collect();
             let text = format!(
                 "[ui]\nnode_col_widths = [{}]\n",
@@ -463,11 +561,61 @@ mod tests {
             let parsed: Config = toml::from_str(&text).unwrap();
             assert_eq!(
                 parsed.ui.node_col_widths,
-                [90, 130, 64, 88, 190, 90],
+                [90, 130, 64, 88, 80, 190, 90],
                 "{}-element array should fall back to defaults",
                 n
             );
         }
+    }
+
+    #[test]
+    fn ui_panel_heights_default_roundtrip_and_old_config() {
+        // v3.13: fresh defaults — list undragged (None = formula),
+        // advanced 240 px, log 90 px (the old hard-coded value).
+        let cfg = Config::default();
+        assert_eq!(cfg.ui.list_height, None);
+        assert_eq!(cfg.ui.advanced_height, 240);
+        assert_eq!(cfg.ui.log_height, 90);
+        // Explicit values round-trip through save/load.
+        let parsed: Config = toml::from_str(
+            "[ui]\nlist_height = 300\nadvanced_height = 200\nlog_height = 120\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.ui.list_height, Some(300));
+        assert_eq!(parsed.ui.advanced_height, 200);
+        assert_eq!(parsed.ui.log_height, 120);
+        let path = tmp_path("ui-heights");
+        parsed.save(&path).expect("save works");
+        let back = Config::load(Some(&path)).expect("load works");
+        assert_eq!(back.ui.list_height, Some(300));
+        assert_eq!(back.ui.advanced_height, 200);
+        assert_eq!(back.ui.log_height, 120);
+        let _ = std::fs::remove_file(&path);
+        // Old config files carry none of the three keys: they load
+        // with the defaults, not an error.
+        let old: Config =
+            toml::from_str("[ui]\nnode_col_widths = [90, 130, 64, 88, 80, 190, 90]\n").unwrap();
+        assert_eq!(old.ui.list_height, None);
+        assert_eq!(old.ui.advanced_height, 240);
+        assert_eq!(old.ui.log_height, 90);
+    }
+
+    #[test]
+    fn panel_height_clamps() {
+        // List: at least 120 px; at most panel minus 150 px (and
+        // never below 120 even on a tiny panel).
+        assert_eq!(clamp_list_height(50.0, 600.0), 120.0);
+        assert_eq!(clamp_list_height(500.0, 600.0), 450.0);
+        assert_eq!(clamp_list_height(300.0, 600.0), 300.0);
+        assert_eq!(clamp_list_height(500.0, 420.0), 270.0);
+        assert_eq!(clamp_list_height(500.0, 200.0), 120.0);
+        // Advanced: 120–600 px. Log: 60–400 px.
+        assert_eq!(clamp_advanced_height(50.0), 120.0);
+        assert_eq!(clamp_advanced_height(900.0), 600.0);
+        assert_eq!(clamp_advanced_height(240.0), 240.0);
+        assert_eq!(clamp_log_height(10.0), 60.0);
+        assert_eq!(clamp_log_height(900.0), 400.0);
+        assert_eq!(clamp_log_height(90.0), 90.0);
     }
 
     #[test]

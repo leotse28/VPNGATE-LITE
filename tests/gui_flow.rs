@@ -135,7 +135,9 @@ async fn gui_connect_flow_against_mock() {
         .expect("tunnel connect to mock");
     assert_eq!(tunnel.vip.to_string(), "10.0.0.2", "mock assigns 10.0.0.2");
 
-    // generate_204 through the tunnel (the GUI's "测试隧道" step).
+    // generate_204 through the tunnel (the same check the CLI `test`
+    // subcommand runs; the GUI's own tunnel-test button was removed
+    // in v3.13).
     let mut s = tunnel
         .open_stream("www.gstatic.com", 80, timeout)
         .await

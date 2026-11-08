@@ -268,8 +268,9 @@ mod tests {
         let ico = include_bytes!("../assets/icon.ico");
         let png = largest_png_in_ico(ico).expect("icon.ico must hold a PNG");
         assert_eq!(&png[..8], PNG_MAGIC);
-        // The 256 px entry is the largest of the four.
-        assert_eq!(png.len(), 3902);
+        // The 256 px entry is the largest of the four (v3.13 bold-V
+        // icon; was 3902 bytes for the old globe + swoosh).
+        assert_eq!(png.len(), 2266);
     }
 
     #[test]
